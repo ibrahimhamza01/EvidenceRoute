@@ -63,3 +63,32 @@ The CSVs are **inputs** and may be tracked in Git. Ignore `data/raw/` and `data/
 ## What this does not do
 
 It does **not** select filings from the SEC submissions API, parse or chunk HTML, generate Parquet, or validate fiscal-year metadata inside the HTML. The pilot is based on the reviewed frozen manifest. Those are separate stages after the downloader succeeds.
+
+## Question routing baselines (issue #6)
+
+Classical routers that predict a question's scope (`simple`, `multi_source` or `corpus_wide`) and return a `RouterResult`.
+
+| File | Purpose |
+| --- | --- |
+| `data/questions/LABELING.md` | Labeling rules, edge cases and split method |
+| `data/questions/questions.csv` | 63 pilot questions with labels, evidence and train/eval split |
+| `data/questions/labeling_log.md` | Ambiguous questions and labeling decisions |
+| `Code/scripts/make_splits.py` | Assigns train/eval by `template_id` (seed 42) |
+| `Code/src/evidenceroute/routing/baselines.py` | TF-IDF + Logistic Regression and TF-IDF + Multinomial Naive Bayes |
+| `Code/scripts/train_routers.py` | Trains both routers and saves evaluation results |
+| `Code/tests/test_routing_baselines.py` | Offline tests for the routers |
+| `Code/results/routing_pilot/` | Pilot metrics and confusion matrices |
+
+Run from the repository root:
+
+```bash
+python -m pip install -r Code/requirements-routing.txt
+PYTHONPATH=Code/src python -m pytest Code/tests/test_routing_baselines.py -q
+PYTHONPATH=Code/src python Code/scripts/train_routers.py
+```
+
+`make_splits.py` only needs to be rerun if questions are added or changed:
+
+```bash
+python Code/scripts/make_splits.py
+```
