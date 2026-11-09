@@ -32,7 +32,7 @@ The set of relevant filings is **not named in the question**. Answering it compl
 Apply in order and stop at the first match:
 
 1. Is the set of relevant companies left open ("which companies", "any company", "how many companies", "across the collection")? Label it **corpus_wide**.
-2. Does the question name or clearly imply **more than one** company, fiscal year, or section? Label it **multi_source**.
+2. Does the question need **more than one** filing or section to answer (several companies, several fiscal years reported in different filings, or several sections)? Label it **multi_source**.
 3. Otherwise (one company, one fiscal year), label it **simple**.
 
 ## Edge cases
@@ -43,6 +43,7 @@ Apply in order and stop at the first match:
 | "Which company spent more on R&D in FY2024?" | corpus_wide | The candidate companies are not named. With only 2 companies this is small, but the label must still hold on the full 25-company corpus. |
 | "...in NVIDIA's latest 10-K" | simple | Resolves to one filing. |
 | One filing, two sections (risk factors and MD&A) | multi_source | Two separate retrievals are needed. |
+| A change from the prior year that one filing already reports ("revenue was $60.9 billion, up 126% from a year ago") | simple | The comparison is stated inside one filing, so one retrieval answers it. If the answer needs the older filing itself, it is multi_source. |
 | A list question inside one filing ("List all risks in Item 1A of AMD FY2024") | simple | Long answer, but still one document and one section. |
 | Question the corpus cannot answer (e.g. FY2022 data, or Intel) | Label scope as usual | Set `answerable = false`. Scope and answerability are separate. |
 
