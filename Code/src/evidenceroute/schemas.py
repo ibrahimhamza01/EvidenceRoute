@@ -19,6 +19,14 @@ class Filing(BaseModel):
     raw_sha256: str | None = None
 
 
+class Section(BaseModel):
+    document_id: str
+    section_id: str
+    section_name: str
+    text: str = Field(min_length=1)
+    source_url: str
+    
+
 class Chunk(BaseModel):
     chunk_id: str
     document_id: str
