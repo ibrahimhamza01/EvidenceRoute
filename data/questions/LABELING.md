@@ -77,6 +77,12 @@ A classifier should learn scope, not keywords. When writing questions:
 | `ambiguous` | `true` if the label was hard to decide |
 | `notes` | Reasoning for ambiguous labels or other comments |
 
+## Train/eval split
+
+Splits are assigned by `Code/scripts/make_splits.py` (seed 42, about 25% eval per scope). Questions with the same `template_id` always land in the same split, so the classifier is never tested on a rewording of a training question. Each scope gets roughly the same eval share, so all three labels appear in eval.
+
+Pilot result: 16 train and 5 eval questions per scope (48 train, 15 eval).
+
 ## Pilot limitations
 
 - Only 2 companies and 2 years, so `corpus_wide` questions cover a small collection and are easier than they will be at full scale.
