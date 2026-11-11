@@ -1,0 +1,103 @@
+{
+  "note": "Pilot results on 4 filings (NVIDIA and AMD, FY2023-FY2024). Not final conclusions.",
+  "seed": 42,
+  "n_train": 48,
+  "n_eval": 15,
+  "labels": [
+    "simple",
+    "multi_source",
+    "corpus_wide"
+  ],
+  "models": {
+    "logreg": {
+      "accuracy": 0.6666666666666666,
+      "macro_f1": 0.6336996336996337,
+      "per_class": {
+        "simple": {
+          "precision": 0.5,
+          "recall": 0.2,
+          "f1": 0.2857142857142857,
+          "support": 5
+        },
+        "multi_source": {
+          "precision": 0.5,
+          "recall": 0.8,
+          "f1": 0.6153846153846154,
+          "support": 5
+        },
+        "corpus_wide": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 5
+        }
+      },
+      "confusion_matrix": [
+        [
+          1,
+          4,
+          0
+        ],
+        [
+          1,
+          4,
+          0
+        ],
+        [
+          0,
+          0,
+          5
+        ]
+      ],
+      "config": {
+        "tfidf": "TfidfVectorizer(ngram_range=(1, 2))",
+        "clf": "LogisticRegression(max_iter=1000, random_state=42)"
+      }
+    },
+    "naive_bayes": {
+      "accuracy": 0.6666666666666666,
+      "macro_f1": 0.6336996336996337,
+      "per_class": {
+        "simple": {
+          "precision": 0.5,
+          "recall": 0.2,
+          "f1": 0.2857142857142857,
+          "support": 5
+        },
+        "multi_source": {
+          "precision": 0.5,
+          "recall": 0.8,
+          "f1": 0.6153846153846154,
+          "support": 5
+        },
+        "corpus_wide": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 5
+        }
+      },
+      "confusion_matrix": [
+        [
+          1,
+          4,
+          0
+        ],
+        [
+          1,
+          4,
+          0
+        ],
+        [
+          0,
+          0,
+          5
+        ]
+      ],
+      "config": {
+        "tfidf": "TfidfVectorizer(ngram_range=(1, 2))",
+        "clf": "MultinomialNB()"
+      }
+    }
+  }
+}
