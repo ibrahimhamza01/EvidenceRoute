@@ -1,4 +1,4 @@
-# EvidenceRoute — 10-K acquisition patch
+# EvidenceRoute — Code and Pipelines
 
 This patch adds a manifest-driven raw HTML downloader. It does not include or overwrite `Code/src/evidenceroute/schemas.py` or existing Git history. The two `data/*.csv` files are copies of the four-row pilot manifest previously provided.
 
@@ -11,7 +11,7 @@ This patch adds a manifest-driven raw HTML downloader. It does not include or ov
 ## Install and test
 
 ```bash
-python -m pip install -r Code/requirements-acquisition.txt
+python -m pip install -r Code/requirements.txt
 PYTHONPATH=Code/src python -m pytest Code/tests/test_downloader.py -q
 ```
 
@@ -82,7 +82,7 @@ Classical routers that predict a question's scope (`simple`, `multi_source` or `
 Run from the repository root:
 
 ```bash
-python -m pip install -r Code/requirements-routing.txt
+python -m pip install -r Code/requirements.txt
 PYTHONPATH=Code/src python -m pytest Code/tests/test_routing_baselines.py -q
 PYTHONPATH=Code/src python Code/scripts/train_routers.py
 ```
@@ -92,3 +92,108 @@ PYTHONPATH=Code/src python Code/scripts/train_routers.py
 ```bash
 python Code/scripts/make_splits.py
 ```
+
+## SEC 10-K processing (Issue #3)
+
+The processing pipeline converts downloaded SEC Form 10-K HTML filings into structured sections and citation-ready chunks.
+
+Run commands from the repository root with `PYTHONPATH=Code/src`.
+
+### Processing
+
+The pipeline reads `data/filings_manifest.csv` and the original HTML files under `data/raw/sec-filings/`.
+
+It extracts Items 1, 1A, 7, 8, and 15, preserves financial statement tables as normalized text, and generates Parquet datasets with source metadata and exact character offsets.
+
+NVIDIA's pilot filings contain their consolidated financial statements under Item 15. AMD's pilot filings contain them under Item 8. Both Items are retained without relocating content between sections.
+
+### Pilot dataset
+
+The four-filing pilot consists of NVIDIA and AMD FY2023 and FY2024.
+
+```bash
+PYTHONPATH=Code/src python Code/scripts/process_filings.py --dataset pilot
+```
+
+Outputs:
+
+```text
+data/processed/pilot-v1/
+├── sections.parquet
+├── chunks.parquet
+└── dataset_manifest.json
+```
+
+The validated pilot contains 4 filings, 20 sections, and 994 chunks with the default chunking configuration.
+
+`dataset_manifest.json` is generated automatically by the processing script. It records dataset identity, input SHA-256 hashes, output SHA-256 hashes, processing parameters, and record counts. It is not maintained manually or committed to Git.
+
+### Full dataset
+
+`pilot-v1` is a temporary validation dataset name, not a permanent production directory.
+
+When the full filing collection is ready, run:
+
+```bash
+PYTHONPATH=Code/src python Code/scripts/process_filings.py \
+  --dataset full \
+  --manifest data/full_filings_manifest.csv
+```
+
+The full manifest path above is illustrative; the complete manifest must exist before running this command.
+
+Full dataset outputs are written directly under `data/processed/`:
+
+```text
+data/processed/
+├── sections.parquet
+├── chunks.parquet
+└── dataset_manifest.json
+```
+
+The full dataset does not use pilot-specific output directories. The dataset manifest records `dataset_type: "full"`.
+
+### S3 storage
+
+The project uses the existing S3 bucket and prefix:
+
+```text
+s3://dats-nlp/syedibrahim.hamza@gwu.edu/EvidenceRoute/
+```
+
+Raw SEC filings are stored under `raw/sec-filings/`.
+
+Processed pilot data is published under `processed/pilot-v1/`. Full dataset outputs are published directly under `processed/`.
+
+Publish the pilot after validation:
+
+```bash
+PYTHONPATH=Code/src python Code/scripts/process_filings.py \
+  --dataset pilot --s3
+```
+
+Publishing is opt-in. The script writes the local dataset first, verifies checksums, and publishes `sections.parquet`, `chunks.parquet`, and `dataset_manifest.json`. Existing S3 objects with different contents are not overwritten.
+
+Team members can download the published pilot dataset using:
+
+```bash
+aws s3 sync \
+  's3://dats-nlp/syedibrahim.hamza@gwu.edu/EvidenceRoute/processed/pilot-v1/' \
+  data/processed/pilot-v1/
+```
+
+The original HTML and generated datasets remain excluded from Git. S3 provides shared storage; the processing script supports local regeneration.
+
+### Tests
+
+```bash
+PYTHONPATH=Code/src python -m pytest \
+  Code/tests/test_filing_processing.py \
+  Code/tests/test_pilot_regression.py -v
+```
+
+`test_filing_processing.py` covers unit-level parsing, chunking, and serialization behavior.
+
+`test_pilot_regression.py` covers the four real SEC filings, financial statement extraction, exact chunk offsets, automatic dataset manifest generation, and S3 publishing behavior using a fake S3 client.
+
+Real-filing tests require the downloaded pilot HTML files. S3 publishing tests do not require AWS credentials.
