@@ -1,3 +1,4 @@
 scikit-learn
 pydantic>=2
 pytest
+google-genai>=1,<2
