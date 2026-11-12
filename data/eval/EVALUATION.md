@@ -162,7 +162,7 @@ Latency is reported as p50 and p95 per strategy and scope.
 
 ## Review coverage
 
-`validate_benchmark.py` prints the current coverage. At the time of writing, all 15 issue #6 held-out questions are verified; new questions need review. Rerun the script for current numbers.
+`validate_benchmark.py` prints the current coverage. At the time of writing, all 27 held-out pilot questions (100%) have been checked against the original filings by a person. 16 of 54 dev questions are verified. Rerun the script for current numbers.
 
 ## Known limitations
 
