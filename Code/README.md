@@ -197,3 +197,18 @@ PYTHONPATH=Code/src python -m pytest \
 `test_pilot_regression.py` covers the four real SEC filings, financial statement extraction, exact chunk offsets, automatic dataset manifest generation, and S3 publishing behavior using a fake S3 client.
 
 Real-filing tests require the downloaded pilot HTML files. S3 publishing tests do not require AWS credentials.
+
+## Evaluation benchmark (Issue #10)
+
+87 evaluation questions with expected answers, gold evidence chunk IDs and a dev/held-out split. Field definitions, metrics and scoring rules are in `data/eval/EVALUATION.md`.
+
+```bash
+# Validate the benchmark (add --processed-dir to also check chunk IDs)
+PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py --processed-dir data/processed/pilot-v1
+
+# Recompute gold chunk IDs after reprocessing filings
+PYTHONPATH=Code/src python Code/scripts/remap_gold_evidence.py --processed-dir data/processed/pilot-v1
+
+# Tests
+PYTHONPATH=Code/src python -m pytest Code/tests/test_benchmark.py -q
+```
