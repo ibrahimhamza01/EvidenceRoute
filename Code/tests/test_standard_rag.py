@@ -48,9 +48,10 @@ def make_evidence():
     return [RetrievalResult(chunk=chunk, score=0.95)]
 
 
+
 def test_returns_research_response():
     client = MockLLMClient(
-        "The supplied evidence describes a risk."
+        "The supplied evidence describes a risk [chunk:test-risk-001]."
     )
 
     result = generate_rag_answer(
@@ -63,8 +64,11 @@ def test_returns_research_response():
     assert result.strategy == "rag"
     assert result.question == "What risks were reported?"
     assert result.answer == (
-        "The supplied evidence describes a risk."
+        "The supplied evidence describes a risk [chunk:test-risk-001]."
     )
+    assert len(result.citations) == 1
+    assert result.citations[0].chunk_id == "test-risk-001"
+    assert result.verification_status == "not_checked"
 
 
 def test_empty_evidence_abstains():

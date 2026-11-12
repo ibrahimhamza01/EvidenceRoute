@@ -1,6 +1,6 @@
 
 """Standard RAG answer generation for SEC filings."""
-
+from evidenceroute.research.citations import validate_citations
 from collections.abc import Sequence
 
 from evidenceroute.schemas import (
@@ -43,15 +43,42 @@ def generate_rag_answer(
 
     result: LLMResult = llm_client.generate(prompt)
 
+
     answer = result.text.strip()
 
     if not answer:
         answer = ABSTENTION_MESSAGE
 
+    citations, invalid_ids = validate_citations(
+        answer,
+        evidence,
+    )
+
+    if invalid_ids:
+        # Do not expose fabricated citation references.
+        return ResearchResponse(
+            question=question,
+            answer=ABSTENTION_MESSAGE,
+            strategy="rag",
+            citations=[],
+            verification_status="unsupported",
+        )
+
+    if not citations:
+        # An uncited answer cannot be treated as verified.
+        return ResearchResponse(
+            question=question,
+            answer=ABSTENTION_MESSAGE,
+            strategy="rag",
+            citations=[],
+            verification_status="not_checked",
+        )
+
     return ResearchResponse(
         question=question,
         answer=answer,
         strategy="rag",
-        citations=[],
+        citations=citations,
         verification_status="not_checked",
     )
+
