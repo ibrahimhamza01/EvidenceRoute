@@ -1,3 +1,8 @@
 scikit-learn
 pydantic>=2
 pytest
+numpy
+qdrant-client>=1.16
+sentence-transformers
+beautifulsoup4
+lxml

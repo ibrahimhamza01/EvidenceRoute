@@ -197,3 +197,82 @@ PYTHONPATH=Code/src python -m pytest \
 `test_pilot_regression.py` covers the four real SEC filings, financial statement extraction, exact chunk offsets, automatic dataset manifest generation, and S3 publishing behavior using a fake S3 client.
 
 Real-filing tests require the downloaded pilot HTML files. S3 publishing tests do not require AWS credentials.
+
+## Hybrid retrieval (Issue #4)
+
+BM25 lexical search, dense semantic search (SentenceTransformer embeddings stored in Qdrant), and Reciprocal Rank Fusion over validated `Chunk` records. Retrieval consumes `Chunk` objects only. It does not import the HTML parser or depend on the Parquet export.
+
+| File | Purpose |
+| --- | --- |
+| `Code/src/evidenceroute/retrieval/corpus.py` | `ChunkCorpus`: validation, duplicate handling, `chunk_id` ordering, fingerprint; JSONL and Parquet loaders |
+| `Code/src/evidenceroute/retrieval/filters.py` | `ChunkFilter` by ticker, fiscal year, document ID and section ID |
+| `Code/src/evidenceroute/retrieval/bm25.py` | `BM25Retriever` (Okapi BM25, non-negative IDF) |
+| `Code/src/evidenceroute/retrieval/dense.py` | `DenseRetriever`, `SentenceTransformerEmbedder`, Qdrant index build and staleness checks |
+| `Code/src/evidenceroute/retrieval/hybrid.py` | `reciprocal_rank_fusion`, `HybridRetriever` |
+| `Code/src/evidenceroute/retrieval/factory.py` | `build_hybrid_retriever` wiring all three from one corpus |
+| `Code/scripts/build_retrieval_dev_chunks.py` | Builds and verifies the development passages from the raw filings |
+| `Code/scripts/demo_retrieval.py` | Command-line search demo |
+| `Code/tests/fixtures/retrieval_dev_chunks.jsonl` | 32 verified passages (8 per pilot filing) |
+
+### Usage
+
+```python
+from evidenceroute.retrieval import ChunkFilter, load_chunks
+from evidenceroute.retrieval.dense import SentenceTransformerEmbedder
+from evidenceroute.retrieval.factory import build_hybrid_retriever
+
+chunks = load_chunks("Code/tests/fixtures/retrieval_dev_chunks.jsonl")  # or data/processed/.../chunks.parquet
+retriever = build_hybrid_retriever(chunks, SentenceTransformerEmbedder(), index_path="data/indexes/dev")
+results = retriever.search("export restrictions on AI GPUs", top_k=5,
+                           filters=ChunkFilter(tickers="NVDA", fiscal_years=2024, section_ids="item_1a"))
+# -> list[RetrievalResult]; result.chunk is the original Chunk (chunk_id, text, source_url preserved)
+```
+
+All three retrievers expose `search(query, top_k, filters) -> list[RetrievalResult]`. `HybridRetriever.search_with_details` also returns each chunk's BM25 and dense ranks for analysis.
+
+### Demo
+
+```bash
+python -m pip install -r Code/requirements.txt
+PYTHONPATH=Code/src python Code/scripts/demo_retrieval.py "H100 export license" --mode bm25
+PYTHONPATH=Code/src python Code/scripts/demo_retrieval.py \
+  "reliance on outside chip manufacturers" --ticker AMD --year 2024 --show-ranks
+PYTHONPATH=Code/src python Code/scripts/demo_retrieval.py "data center revenue growth" --section item_7 --top-k 3
+```
+
+The first dense or hybrid run downloads the embedding model (`BAAI/bge-small-en-v1.5` by default; change with `--embedder`). `--embedder hashing` runs the Qdrant path offline with a non-semantic hashing embedder, for smoke tests only. Other options: `--document-id`, repeatable `--ticker/--year/--section`, `--json`, `--rebuild`, `--chunks`.
+
+### Design notes
+
+- **Filters**: `None` means no constraint; values within a field are ORed, fields are ANDed. Tickers are case-insensitive, section IDs are lower-cased (`item_1a`). BM25 applies filters before scoring; dense search applies them inside Qdrant.
+- **BM25**: Lucene-style IDF `ln(1 + (N - df + 0.5)/(df + 0.5))`, which stays positive in small corpora. IDF is computed over the full corpus, so filtering never changes a chunk's score. Chunks with zero score are not returned.
+- **RRF**: `score = Σ 1/(60 + rank)` over the BM25 and dense rankings, each fetched with `candidate_k = max(50, top_k)`. Duplicates are removed by `chunk_id`. Identical text in different filings (for example NVIDIA's FY2023 and FY2024 revenue recognition policy) remains as separate evidence.
+- **Deterministic ordering**: ties are broken by `chunk_id` (BM25, dense) or by best single rank and then `chunk_id` (RRF). Dense search widens the Qdrant fetch when a tie group crosses the top-k cutoff.
+- **Reproducible indexes**: chunks are sorted by `chunk_id`, Qdrant point IDs are UUIDv5 of `chunk_id`, and the collection metadata stores the embedding model, dimension and a SHA-256 fingerprint of the chunks. `ensure_index()` reuses a persisted index only when that manifest matches; otherwise it rebuilds.
+- **Qdrant**: local development uses embedded mode (`:memory:` in tests, `data/indexes/` for the demo), so no server is needed. Pass a `QdrantClient(url=...)` to `DenseRetriever` or `build_hybrid_retriever` for a server or Qdrant Cloud. Payload indexes for the filter fields are created on servers and ignored in embedded mode.
+
+### Development passages
+
+The fixture contains 32 genuine passages, 8 from each pilot filing, chosen to exercise exact terms (H100, MI300X, TSMC, ECCN 3A090, Silo AI), paraphrases (foundry dependence, headcount), filters, and duplicate text across years. Each passage is a complete paragraph of the parsed section (cut at a sentence boundary when longer than 1,500 characters) and is verified twice: exact offsets in the section text, and presence in the original HTML. Chunk IDs use a `dev-` prefix so they never collide with pipeline chunk IDs.
+
+Rebuild or verify after downloading the pilot filings:
+
+```bash
+PYTHONPATH=Code/src python Code/scripts/build_retrieval_dev_chunks.py          # rewrite fixture
+PYTHONPATH=Code/src python Code/scripts/build_retrieval_dev_chunks.py --check  # fail if it differs
+```
+
+### Tests
+
+```bash
+PYTHONPATH=Code/src python -m pytest Code/tests/test_retrieval_*.py -v
+```
+
+| Test file | Covers |
+| --- | --- |
+| `test_retrieval_fixture.py` | Fixture schema, metadata against the manifest, corpus duplicate rules, rebuild from raw HTML (skipped without filings) |
+| `test_retrieval_bm25.py` | Exact-term ranking, each filter, empty results, `top_k` validation, tie-breaking, reproducibility |
+| `test_retrieval_dense.py` | Qdrant build, filters, empty results, stale-index detection, persistence, tie-breaking; two real SentenceTransformer tests (skipped when the model cannot be loaded) |
+| `test_retrieval_hybrid.py` | RRF formula, deduplication, tie-breaking, filters, empty results, rebuild reproducibility |
+
+Generated Qdrant indexes under `data/indexes/` are ignored by Git.
