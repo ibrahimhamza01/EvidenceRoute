@@ -218,3 +218,6 @@ __marimo__/
 /data/raw/
 /data/processed/
 /data/indexes/
+
+.DS_Store
+.Rhistory

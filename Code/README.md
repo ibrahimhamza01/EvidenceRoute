@@ -276,3 +276,18 @@ PYTHONPATH=Code/src python -m pytest Code/tests/test_retrieval_*.py -v
 | `test_retrieval_hybrid.py` | RRF formula, deduplication, tie-breaking, filters, empty results, rebuild reproducibility |
 
 Generated Qdrant indexes under `data/indexes/` are ignored by Git.
+
+## Evaluation benchmark (Issue #10)
+
+87 evaluation questions with expected answers, gold evidence chunk IDs and a dev/held-out split. Field definitions, metrics and scoring rules are in `data/eval/EVALUATION.md`.
+
+```bash
+# Validate the benchmark (add --processed-dir to also check chunk IDs)
+PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py --processed-dir data/processed/pilot-v1
+
+# Recompute gold chunk IDs after reprocessing filings
+PYTHONPATH=Code/src python Code/scripts/remap_gold_evidence.py --processed-dir data/processed/pilot-v1
+
+# Tests
+PYTHONPATH=Code/src python -m pytest Code/tests/test_benchmark.py -q
+```
