@@ -217,3 +217,7 @@ __marimo__/
 # EvidenceRoute generated data
 /data/raw/
 /data/processed/
+/data/indexes/
+
+.DS_Store
+.Rhistory
