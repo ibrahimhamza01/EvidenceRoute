@@ -20,10 +20,9 @@ from evidenceroute.ingestion.downloader import MANIFEST_COLUMNS, load_manifest, 
 from evidenceroute.schemas import Filing
 
 ROOT = Path("data")
-SELECTION = ROOT / "full_company_selection.csv"
+SELECTION = ROOT / "companies.csv"
 PILOT = ROOT / "filings_manifest.csv"
 OUTPUT = ROOT / "full_filings_manifest.csv"
-YEARS = (2022, 2023, 2024)
 
 
 class SECClient:
@@ -82,39 +81,48 @@ def submissions_rows(columns: dict):
         }
 
 
-def read_selection() -> list[str]:
+def read_selection() -> list[tuple[str, str, str, tuple[int, ...]]]:
+    """Read frozen company identifiers and fiscal years."""
     with SELECTION.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
-        if not reader.fieldnames or "ticker" not in reader.fieldnames:
-            raise ValueError("Selection must have a ticker column")
-        names = [row["ticker"].strip().upper() for row in reader]
-    if len(names) != 25 or len(set(names)) != 25:
-        raise ValueError("Expected exactly 25 distinct selected tickers")
-    return names
+        required = {"ticker", "company_name", "cik", "fiscal_years"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"Missing company columns: {required}")
+
+        companies = []
+        for row in reader:
+            ticker = row["ticker"].strip().upper()
+            name = row["company_name"].strip()
+            cik = row["cik"].strip()
+            years = tuple(
+                int(year.strip())
+                for year in row["fiscal_years"].split(";")
+            )
+
+            if (
+                not ticker or not name
+                or len(cik) != 10 or not cik.isdigit()
+                or len(years) != 3 or len(set(years)) != 3
+            ):
+                raise ValueError(f"Invalid company selection: {row}")
+
+            companies.append((ticker, cik, name, years))
+
+    if len(companies) != 25 or len({c[0] for c in companies}) != 25:
+        raise ValueError("Expected 25 distinct companies")
+
+    return companies
 
 
 def main() -> int:
     sec = SECClient(os.getenv("SEC_USER_AGENT", ""))
-    tickers = read_selection()
-    listing = sec.json("https://www.sec.gov/files/company_tickers.json")
-    ticker_map = {
-        record["ticker"].upper(): (str(record["cik_str"]).zfill(10), record["title"])
-        for record in listing.values()
-    }
-    # Historical FY2022-2024 XOM filings belong to Exxon Mobil Corp.
-    # The current SEC ticker lookup points to a different entity.
-    ticker_map["XOM"] = ("0000034088", "EXXON MOBIL CORP")
-
+    companies = read_selection()
     pilot = {(row.ticker, row.fiscal_year): row for row in load_manifest(PILOT)}
     selected: list[Filing] = []
     problems: list[str] = []
 
-    for ticker in tickers:
-        if ticker not in ticker_map:
-            problems.append(f"{ticker}: not found in SEC ticker-to-CIK listing")
-            continue
-        cik, listing_name = ticker_map[ticker]
-        for y in YEARS:
+    for ticker, cik, company_name, years in companies:
+        for y in years:
             if (ticker, y) in pilot and pilot[ticker, y].cik != cik:
                 problems.append(f"{ticker} FY{y}: CIK disagrees with validated pilot")
         try:
@@ -122,13 +130,13 @@ def main() -> int:
             filing_data = payload["filings"]
             rows = list(submissions_rows(filing_data["recent"]))
             available = {row["fiscal_year"] for row in rows}
-            needed = set(YEARS) - available
+            needed = set(years) - available
             if needed:
                 for extra in filing_data.get("files", []):
                     older = sec.json(f'https://data.sec.gov/submissions/{extra["name"]}')
                     rows.extend(submissions_rows(older))
                     available.update(row["fiscal_year"] for row in rows)
-                    if set(YEARS) <= available:
+                    if set(years) <= available:
                         break
         except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
             problems.append(f"{ticker}: SEC metadata lookup failed: {exc}")
@@ -136,10 +144,10 @@ def main() -> int:
 
         by_year: dict[int, dict[str, dict]] = defaultdict(dict)
         for row in rows:
-            if row["fiscal_year"] in YEARS:
+            if row["fiscal_year"] in years:
                 by_year[row["fiscal_year"]][row["accession_number"]] = row
 
-        for year in YEARS:
+        for year in years:
             if (ticker, year) in pilot:
                 selected.append(pilot[ticker, year])
                 print(f"{ticker} FY{year}: preserved original pilot record")
@@ -153,7 +161,7 @@ def main() -> int:
             document = filing["primary_document"]
             fields = {
                 "document_id": f"{cik}_{accession}",
-                "company_name": payload.get("name") or listing_name,
+                "company_name": company_name,
                 "ticker": ticker,
                 "cik": cik,
                 "accession_number": accession,
