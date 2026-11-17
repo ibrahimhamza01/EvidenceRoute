@@ -13,7 +13,7 @@ from evidenceroute.ingestion.parser import extract_sections
 from evidenceroute.ingestion.processor import chunk_sections
 
 
-MANIFEST = Path("data/full_filings_manifest.csv")
+MANIFEST = Path("data/filings_manifest.csv")
 
 
 @pytest.mark.parametrize("ticker", ["NVDA", "JPM", "CVX"])

@@ -21,8 +21,8 @@ from evidenceroute.schemas import Filing
 
 ROOT = Path("data")
 SELECTION = ROOT / "companies.csv"
-PILOT = ROOT / "filings_manifest.csv"
-OUTPUT = ROOT / "full_filings_manifest.csv"
+EXISTING = ROOT / "filings_manifest.csv"
+OUTPUT = ROOT / "filings_manifest.csv"
 
 
 class SECClient:
@@ -117,13 +117,13 @@ def read_selection() -> list[tuple[str, str, str, tuple[int, ...]]]:
 def main() -> int:
     sec = SECClient(os.getenv("SEC_USER_AGENT", ""))
     companies = read_selection()
-    pilot = {(row.ticker, row.fiscal_year): row for row in load_manifest(PILOT)}
+    existing = {(row.ticker, row.fiscal_year): row for row in load_manifest(EXISTING)}
     selected: list[Filing] = []
     problems: list[str] = []
 
     for ticker, cik, company_name, years in companies:
         for y in years:
-            if (ticker, y) in pilot and pilot[ticker, y].cik != cik:
+            if (ticker, y) in existing and existing[ticker, y].cik != cik:
                 problems.append(f"{ticker} FY{y}: CIK disagrees with validated pilot")
         try:
             payload = sec.json(f"https://data.sec.gov/submissions/CIK{cik}.json")
@@ -148,9 +148,9 @@ def main() -> int:
                 by_year[row["fiscal_year"]][row["accession_number"]] = row
 
         for year in years:
-            if (ticker, year) in pilot:
-                selected.append(pilot[ticker, year])
-                print(f"{ticker} FY{year}: preserved original pilot record")
+            if (ticker, year) in existing:
+                selected.append(existing[ticker, year])
+                print(f"{ticker} FY{year}: preserved existing frozen record")
                 continue
             options = list(by_year[year].values())
             if len(options) != 1:

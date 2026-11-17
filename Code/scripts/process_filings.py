@@ -137,8 +137,17 @@ def process(*, manifest: Path, raw_dir: Path, output_dir: Path,
     filings = list(load_manifest(manifest))
     if not filings:
         raise ValueError("Refusing to process an empty filing manifest")
-    if dataset == "pilot" and len(filings) != 4:
-        raise ValueError("Pilot mode requires the four-filing pilot manifest")
+    if dataset == "pilot":
+        pilot_keys = {
+            ("NVDA", 2023), ("NVDA", 2024),
+            ("AMD", 2023), ("AMD", 2024),
+        }
+        filings = [
+            filing for filing in filings
+            if (filing.ticker, filing.fiscal_year) in pilot_keys
+        ]
+        if len(filings) != 4:
+            raise ValueError("Pilot mode requires all four original pilot filings")
 
     sections, chunks, inputs, failures = [], [], [], []
     for filing in filings:
@@ -204,7 +213,7 @@ def process(*, manifest: Path, raw_dir: Path, output_dir: Path,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=("pilot", "full"), default="pilot")
-    ap.add_argument("--manifest", type=Path, default=Path("data/filings_manifest.csv"))
+    ap.add_argument("--manifest", type=Path, default=None)
     ap.add_argument("--raw-dir", type=Path, default=Path("data/raw"))
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--max-chars", type=int, default=1800)
@@ -223,10 +232,12 @@ def main() -> None:
         default="syedibrahim.hamza@gwu.edu/EvidenceRoute",
     )
     args = ap.parse_args()
-    output_dir = args.output_dir or (Path("data/processed/pilot-v1")
-                                     if args.dataset == "pilot"
-                                     else Path("data/processed"))
-    result = process(manifest=args.manifest, raw_dir=args.raw_dir,
+    manifest = args.manifest or Path("data/filings_manifest.csv")
+    output_dir = args.output_dir or (
+        Path("data/processed/pilot-v1") if args.dataset == "pilot"
+        else Path("data/processed/full-v1")
+    )
+    result = process(manifest=manifest, raw_dir=args.raw_dir,
                      output_dir=output_dir, dataset=args.dataset,
                      max_chars=args.max_chars, overlap_chars=args.overlap_chars)
     print(json.dumps({"output_dir": str(output_dir), "filings": result["filing_count"],

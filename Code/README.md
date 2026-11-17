@@ -132,20 +132,19 @@ The validated pilot contains 4 filings, 20 sections, and 994 chunks with the def
 
 `pilot-v1` is a temporary validation dataset name, not a permanent production directory.
 
-When the full filing collection is ready, run:
+To process the validated 75-filing corpus, run:
 
 ```bash
 PYTHONPATH=Code/src python Code/scripts/process_filings.py \
-  --dataset full \
-  --manifest data/full_filings_manifest.csv
+  --dataset full
 ```
 
-The full manifest path above is illustrative; the complete manifest must exist before running this command.
+Both processing modes use `data/filings_manifest.csv`. Full mode processes all 75 filings; pilot mode selects the original four.
 
-Full dataset outputs are written directly under `data/processed/`:
+Full dataset outputs are written under `data/processed/full-v1/`:
 
 ```text
-data/processed/
+data/processed/full-v1/
 ├── sections.parquet
 ├── chunks.parquet
 └── dataset_manifest.json
@@ -163,7 +162,7 @@ s3://dats-nlp/syedibrahim.hamza@gwu.edu/EvidenceRoute/
 
 Raw SEC filings are stored under `raw/sec-filings/`.
 
-Processed pilot data is published under `processed/pilot-v1/`. Full dataset outputs are published directly under `processed/`.
+Processed pilot data is published under `processed/pilot-v1/`. Full dataset outputs are published under `processed/full-v1/`.
 
 Publish the pilot after validation:
 

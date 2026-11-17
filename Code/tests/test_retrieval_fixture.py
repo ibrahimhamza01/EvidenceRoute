@@ -22,7 +22,9 @@ def load_manifest_rows():
 def test_fixture_is_valid_and_matches_filing_metadata(dev_corpus):
     manifest = load_manifest_rows()
     assert len(dev_corpus) == 32
-    assert {c.document_id for c in dev_corpus} == set(manifest)
+    fixture_ids = {c.document_id for c in dev_corpus}
+    assert len(fixture_ids) == 4
+    assert fixture_ids <= set(manifest)
     for chunk in dev_corpus:
         Chunk.model_validate(chunk.model_dump())
         assert chunk.chunk_id.startswith("dev-")

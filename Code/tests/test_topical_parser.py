@@ -17,7 +17,7 @@ from evidenceroute.ingestion.topical_parser import (
 )
 
 
-MANIFEST = Path("data/full_filings_manifest.csv")
+MANIFEST = Path("data/filings_manifest.csv")
 REQUIRED = {"item_1", "item_1a", "item_7", "item_8", "item_15"}
 
 

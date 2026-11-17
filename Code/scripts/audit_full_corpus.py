@@ -13,7 +13,7 @@ from evidenceroute.ingestion.processor import chunk_sections
 
 
 def main():
-    manifest = Path("data/full_filings_manifest.csv")
+    manifest = Path("data/filings_manifest.csv")
     output = Path("data/processed/full_parsing_audit_v3.csv")
 
     filings = load_manifest(manifest)

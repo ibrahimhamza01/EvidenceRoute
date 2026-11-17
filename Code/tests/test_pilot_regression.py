@@ -35,10 +35,16 @@ def pilot_data():
     if not MANIFEST.is_file():
         pytest.skip("Pilot filing manifest is unavailable")
 
-    filings = list(load_manifest(MANIFEST))
+    pilot_keys = {
+        ("NVDA", 2023), ("NVDA", 2024),
+        ("AMD", 2023), ("AMD", 2024),
+    }
+    filings = [
+        filing for filing in load_manifest(MANIFEST)
+        if (filing.ticker, filing.fiscal_year) in pilot_keys
+    ]
 
-    if len(filings) != 4:
-        pytest.skip("The four-filing pilot manifest is unavailable")
+    assert len(filings) == 4, "Missing original pilot filings"
 
     if any(
         not (RAW_DIR / relative_filing_path(f)).is_file()
@@ -47,6 +53,23 @@ def pilot_data():
         pytest.skip("Pilot raw SEC filings are unavailable")
 
     return filings
+
+
+@pytest.fixture
+def pilot_manifest(pilot_data, tmp_path):
+    import csv
+    from evidenceroute.ingestion.downloader import MANIFEST_COLUMNS
+
+    path = tmp_path / "pilot_manifest.csv"
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=MANIFEST_COLUMNS)
+        writer.writeheader()
+        for filing in pilot_data:
+            values = filing.model_dump(mode="json")
+            writer.writerow({
+                column: values[column] for column in MANIFEST_COLUMNS
+            })
+    return path
 
 
 @pytest.mark.parametrize(
@@ -172,7 +195,7 @@ def test_exported_parquet_integrity():
             == chunk["text"]
         )
 
-def test_processor_generates_dataset_manifest(pilot_data, tmp_path):
+def test_processor_generates_dataset_manifest(pilot_data, pilot_manifest, tmp_path):
     import hashlib
     import json
 
@@ -190,7 +213,7 @@ def test_processor_generates_dataset_manifest(pilot_data, tmp_path):
     output = tmp_path / "pilot-v1"
 
     metadata = module.process(
-        manifest=MANIFEST,
+        manifest=pilot_manifest,
         raw_dir=RAW_DIR,
         output_dir=output,
         dataset="pilot",
@@ -221,7 +244,7 @@ def test_processor_generates_dataset_manifest(pilot_data, tmp_path):
 
 
 def test_s3_publish_is_idempotent_and_rejects_conflicts(
-    pilot_data, tmp_path, monkeypatch
+    pilot_data, pilot_manifest, tmp_path, monkeypatch
 ):
     import importlib.util
     import io
@@ -237,7 +260,7 @@ def test_s3_publish_is_idempotent_and_rejects_conflicts(
 
     output = tmp_path / "pilot-v1"
     module.process(
-        manifest=MANIFEST,
+        manifest=pilot_manifest,
         raw_dir=RAW_DIR,
         output_dir=output,
         dataset="pilot",

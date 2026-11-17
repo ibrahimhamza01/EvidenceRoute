@@ -75,14 +75,23 @@ def first_filing():
     return load_manifest(MANIFEST)[0]
 
 
-def test_pilot_manifest_exactly_four_filings():
+def test_manifest_contains_original_pilot_filings():
     filings = load_manifest(MANIFEST)
-    assert len(filings) == 4
-    assert {(f.ticker, f.fiscal_year) for f in filings} == {
-        ("NVDA", 2023), ("NVDA", 2024), ("AMD", 2023), ("AMD", 2024)
+    by_key = {(f.ticker, f.fiscal_year): f for f in filings}
+
+    expected = {
+        ("NVDA", 2023), ("NVDA", 2024),
+        ("AMD", 2023), ("AMD", 2024),
     }
-    assert filings[0].cik == "0001045810"
-    assert relative_filing_path(filings[0]).parts[0] == "sec-filings"
+
+    assert expected <= set(by_key)
+    assert len(by_key) == len(filings)
+    assert by_key["NVDA", 2023].cik == "0001045810"
+    assert by_key["AMD", 2023].cik == "0000002488"
+    assert all(
+        relative_filing_path(f).parts[0] == "sec-filings"
+        for f in filings
+    )
 
 
 def test_bad_manifest_document_id_is_rejected(tmp_path):
