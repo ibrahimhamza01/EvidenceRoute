@@ -2,8 +2,8 @@
 """Validate the evaluation benchmark and print review coverage.
 
 Run from the repository root:
-    PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py
-    PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py --processed-dir data/processed/pilot-v1
+    PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py --benchmark <questions.csv> --gold <evidence.csv>
+    PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py --benchmark <questions.csv> --gold <evidence.csv> --processed-dir data/processed/full-v1
 
 Exits with status 1 if any check fails.
 """
@@ -20,16 +20,16 @@ from evidenceroute.evaluation.benchmark import read_csv, review_coverage, valida
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate benchmark.csv and gold_evidence.csv.")
-    parser.add_argument("--benchmark", type=Path, default=Path("data/eval/benchmark.csv"))
-    parser.add_argument("--gold", type=Path, default=Path("data/eval/gold_evidence.csv"))
-    parser.add_argument("--manifest", type=Path, default=Path("data/filings_manifest.csv"))
+    parser.add_argument("--benchmark", type=Path, required=True)
+    parser.add_argument("--gold", type=Path, required=True)
     parser.add_argument("--processed-dir", type=Path, default=None,
                         help="Optional: also check that gold chunk IDs exist in chunks.parquet")
     args = parser.parse_args()
 
     benchmark = read_csv(args.benchmark)
     gold = read_csv(args.gold)
-    manifest = read_csv(args.manifest)
+    from evidenceroute.ingestion.downloader import load_canonical_manifest
+    manifest = [f.model_dump(mode="json") for f in load_canonical_manifest()]
 
     chunk_ids = None
     if args.processed_dir is not None:
@@ -47,7 +47,7 @@ def main() -> int:
         print(f"  {split:8} {counts}")
     print("Gold evidence status:", dict(Counter(row["gold_evidence_status"] for row in benchmark)))
     print("Answerable:", dict(Counter(row["answerable"] for row in benchmark)))
-    print("Review coverage (pilot questions with quotes checked by a person):")
+    print("Review coverage (questions with completed annotations):")
     for split, (verified, total) in review_coverage(benchmark).items():
         print(f"  {split:8} {verified}/{total}")
     print("Chunk IDs checked against processed data:", "yes" if chunk_ids is not None else "no")

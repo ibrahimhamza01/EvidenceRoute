@@ -2,7 +2,7 @@
 """Assign each routing question to the train or eval split.
 
 Run from the repository root:
-    python Code/scripts/make_splits.py
+    python Code/scripts/make_splits.py --questions <annotations.csv>
 
 Questions that share a template_id always go to the same split, so the
 classifier is never evaluated on a rewording of a question it trained on.
@@ -50,7 +50,7 @@ def assign_splits(rows: list[dict], eval_fraction: float, seed: int) -> list[dic
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Assign train/eval splits by template_id.")
-    parser.add_argument("--questions", type=Path, default=Path("data/questions/questions.csv"))
+    parser.add_argument("--questions", type=Path, required=True)
     parser.add_argument("--eval-fraction", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

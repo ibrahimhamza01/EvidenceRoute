@@ -6,7 +6,7 @@ The quotes are the source of truth. Run this after reprocessing the filings
 validate_benchmark.py.
 
 Run from the repository root:
-    PYTHONPATH=Code/src python Code/scripts/remap_gold_evidence.py --processed-dir data/processed/pilot-v1
+    PYTHONPATH=Code/src python Code/scripts/remap_gold_evidence.py --gold <evidence.csv> --processed-dir data/processed/full-v1
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from evidenceroute.evaluation.gold import containing_chunks, locate_quote
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Remap gold evidence quotes to processed chunks.")
-    parser.add_argument("--gold", type=Path, default=Path("data/eval/gold_evidence.csv"))
+    parser.add_argument("--gold", type=Path, required=True)
     parser.add_argument("--processed-dir", type=Path, required=True)
     args = parser.parse_args()
 

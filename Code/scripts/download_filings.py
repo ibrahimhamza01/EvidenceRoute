@@ -11,18 +11,15 @@ from pathlib import Path
 from evidenceroute.ingestion.downloader import (
     AcquisitionError,
     FilingDownloader,
-    load_manifest,
+    load_canonical_manifest,
     relative_filing_path,
 )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Acquire exact SEC 10-K HTML files in a frozen CSV manifest.")
-    parser.add_argument("--manifest", type=Path, default=Path("data/filings_manifest.csv"))
     parser.add_argument("--raw-dir", type=Path, default=Path("data/raw"))
     parser.add_argument("--results", type=Path, default=Path("data/raw/acquisition_results.jsonl"))
-    parser.add_argument("--ticker", action="append", help="Optional ticker filter (repeatable)")
-    parser.add_argument("--year", type=int, action="append", help="Optional fiscal year filter (repeatable)")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print plan without network or writes")
     parser.add_argument("--s3", action="store_true", help="Publish into your allocated S3 prefix")
     parser.add_argument("--s3-bucket", default=os.environ.get("EVIDENCEROUTE_S3_BUCKET", "dats-nlp"))
@@ -34,15 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        filings = load_manifest(args.manifest)
-        if args.ticker:
-            wanted = {t.upper().strip() for t in args.ticker}
-            filings = [f for f in filings if f.ticker.upper() in wanted]
-        if args.year:
-            filings = [f for f in filings if f.fiscal_year in args.year]
-        if not filings:
-            raise AcquisitionError("Filters matched zero filings")
-        print(f"Validated {len(filings)} filing(s) from {args.manifest}")
+        filings = load_canonical_manifest()
+        print(f"Validated {len(filings)} filings from data/filings_manifest.csv")
         if args.dry_run:
             for filing in filings:
                 relative = relative_filing_path(filing).as_posix()

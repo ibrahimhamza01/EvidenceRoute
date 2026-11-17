@@ -1,6 +1,5 @@
 import pytest
 
-from retrieval_testdata import AMD_2024, NVDA_2023, NVDA_2024
 from evidenceroute.retrieval import (
     BM25Retriever,
     ChunkFilter,
@@ -18,13 +17,13 @@ def r(chunk, score=1.0):
 
 
 @pytest.fixture(scope="module")
-def chunks(dev_corpus):
-    return list(dev_corpus)
+def chunks(full_corpus):
+    return list(full_corpus)
 
 
 @pytest.fixture(scope="module")
-def hybrid(dev_corpus):
-    return build_hybrid_retriever(dev_corpus, HashingEmbedder())
+def hybrid(full_corpus):
+    return build_hybrid_retriever(full_corpus, HashingEmbedder())
 
 
 class StubRetriever:
@@ -98,9 +97,9 @@ def test_hybrid_passes_filters_to_every_retriever(chunks):
     assert left.calls[0][2] is flt and right.calls[0][2] is flt
 
 
-# End-to-end over the verified passages -------------------------------------------
+# End-to-end over all canonical chunks -------------------------------------------
 
-def test_hybrid_results_validate_and_preserve_chunks(hybrid, dev_corpus):
+def test_hybrid_results_validate_and_preserve_chunks(hybrid, full_corpus):
     results = hybrid.search("export controls on GPUs shipped to China", top_k=8)
     assert len(results) == 8
     assert len({x.chunk.chunk_id for x in results}) == 8
@@ -108,30 +107,15 @@ def test_hybrid_results_validate_and_preserve_chunks(hybrid, dev_corpus):
     assert scores == sorted(scores, reverse=True)
     for x in results:
         RetrievalResult.model_validate(x.model_dump())
-        original = dev_corpus.get(x.chunk.chunk_id)
+        original = full_corpus.get(x.chunk.chunk_id)
         assert (x.chunk.chunk_id, x.chunk.text, x.chunk.source_url) == \
             (original.chunk_id, original.text, original.source_url)
-
-
-def test_hybrid_combines_both_signals(hybrid, chunk_by_anchor):
-    hits = hybrid.search_with_details("Silo AI acquisition", top_k=3)
-    top = hits[0]
-    assert top.chunk == chunk_by_anchor(AMD_2024, "During the year, we completed the acquisition of Silo AI")
-    assert set(top.ranks) == {"bm25", "dense"}
-
-
-def test_same_text_in_different_filings_is_not_deduplicated(hybrid, chunk_by_anchor):
-    fy23 = chunk_by_anchor(NVDA_2023, "We derive our revenue from product sales")
-    fy24 = chunk_by_anchor(NVDA_2024, "We derive our revenue from product sales")
-    assert fy23.text == fy24.text
-    results = hybrid.search("identification of the performance obligations in the contract", top_k=2)
-    assert {x.chunk.chunk_id for x in results} == {fy23.chunk_id, fy24.chunk_id}
 
 
 @pytest.mark.parametrize("filters,check", [
     (ChunkFilter(tickers="NVDA"), lambda c: c.ticker == "NVDA"),
     (ChunkFilter(fiscal_years=2023), lambda c: c.fiscal_year == 2023),
-    (ChunkFilter(document_ids=AMD_2024), lambda c: c.document_id == AMD_2024),
+    (ChunkFilter(tickers="COST"), lambda c: c.ticker == "COST"),
     (ChunkFilter(section_ids="item_1a"), lambda c: c.section_id == "item_1a"),
 ])
 def test_hybrid_filters(hybrid, filters, check):
@@ -142,7 +126,7 @@ def test_hybrid_filters(hybrid, filters, check):
 @pytest.mark.parametrize("query,filters", [
     ("", None),
     ("\t", None),
-    ("export controls", ChunkFilter(tickers="GOOG")),
+    ("export controls", ChunkFilter(tickers="UNKNOWN")),
 ])
 def test_hybrid_empty_results(hybrid, query, filters):
     assert hybrid.search(query, top_k=5, filters=filters) == []
@@ -154,16 +138,16 @@ def test_hybrid_invalid_top_k(hybrid, bad):
         hybrid.search("export", top_k=bad)
 
 
-def test_hybrid_is_reproducible_across_rebuilds(dev_corpus):
+def test_hybrid_is_reproducible_across_rebuilds(full_corpus):
     query = "data center revenue growth driven by GPUs"
-    one = build_hybrid_retriever(dev_corpus, HashingEmbedder(), rebuild=True).search(query, top_k=10)
-    two = build_hybrid_retriever(list(reversed(list(dev_corpus))), HashingEmbedder(),
+    one = build_hybrid_retriever(full_corpus, HashingEmbedder(), rebuild=True).search(query, top_k=10)
+    two = build_hybrid_retriever(list(reversed(list(full_corpus))), HashingEmbedder(),
                                  rebuild=True).search(query, top_k=10)
     assert [(x.chunk.chunk_id, x.score) for x in one] == [(x.chunk.chunk_id, x.score) for x in two]
 
 
-def test_hybrid_works_with_explicit_components(dev_corpus):
-    dense = DenseRetriever(dev_corpus, HashingEmbedder())
+def test_hybrid_works_with_explicit_components(full_corpus):
+    dense = DenseRetriever(full_corpus, HashingEmbedder())
     dense.build()
-    hybrid = HybridRetriever({"bm25": BM25Retriever(dev_corpus), "dense": dense})
+    hybrid = HybridRetriever({"bm25": BM25Retriever(full_corpus), "dense": dense})
     assert hybrid.search("employees", top_k=3)

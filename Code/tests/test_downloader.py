@@ -75,14 +75,20 @@ def first_filing():
     return load_manifest(MANIFEST)[0]
 
 
-def test_pilot_manifest_exactly_four_filings():
+def test_canonical_manifest_covers_all_companies_and_years():
     filings = load_manifest(MANIFEST)
-    assert len(filings) == 4
-    assert {(f.ticker, f.fiscal_year) for f in filings} == {
-        ("NVDA", 2023), ("NVDA", 2024), ("AMD", 2023), ("AMD", 2024)
-    }
-    assert filings[0].cik == "0001045810"
-    assert relative_filing_path(filings[0]).parts[0] == "sec-filings"
+    by_key = {(f.ticker, f.fiscal_year): f for f in filings}
+
+    assert len(filings) == 75
+    assert len({f.ticker for f in filings}) == 25
+    assert {f.fiscal_year for f in filings} == {2022, 2023, 2024}
+    assert len(by_key) == len(filings)
+    assert by_key["NVDA", 2023].cik == "0001045810"
+    assert by_key["AMD", 2023].cik == "0000002488"
+    assert all(
+        relative_filing_path(f).parts[0] == "sec-filings"
+        for f in filings
+    )
 
 
 def test_bad_manifest_document_id_is_rejected(tmp_path):
@@ -181,3 +187,28 @@ def test_s3_mismatched_existing_key_refuses_overwrite(tmp_path):
     with pytest.raises(AcquisitionError, match="Refusing overwrite"):
         publish_s3(s3, "test", "raw/doc", path, sha, size, "doc")
     assert s3.put_calls == 0
+
+
+def test_filing_agent_accession_prefix_can_differ_from_issuer_cik():
+    """Microsoft FY2024 was submitted using a different EDGAR CIK."""
+    from evidenceroute.schemas import Filing
+    from evidenceroute.ingestion.downloader import validate_filing
+
+    filing = Filing(
+        document_id="0000789019_0000950170-24-087843",
+        company_name="MICROSOFT CORP",
+        ticker="MSFT",
+        cik="0000789019",
+        accession_number="0000950170-24-087843",
+        form_type="10-K",
+        fiscal_year=2024,
+        report_period_end="2024-06-30",
+        filing_date="2024-07-30",
+        primary_document="msft-20240630.htm",
+        source_url=(
+            "https://www.sec.gov/Archives/edgar/data/"
+            "789019/000095017024087843/msft-20240630.htm"
+        ),
+    )
+
+    validate_filing(filing)

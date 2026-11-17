@@ -68,7 +68,7 @@ def test_containing_chunks_requires_full_containment():
 
 def make_question(**overrides):
     row = {
-        "question_id": "q1", "scope": "simple", "answerable": "true", "corpus": "pilot",
+        "question_id": "q1", "scope": "simple", "answerable": "true",
         "eval_split": "dev", "router_split": "", "template_id": "t1", "document_ids": "d1",
         "expected_answer": "42", "gold_evidence_status": "complete", "quote_verified": "true",
     }
@@ -114,12 +114,3 @@ def test_multi_source_needs_two_evidence_groups():
 def test_gold_groups_ignore_related_passages():
     evidence = [make_evidence(), make_evidence(evidence_group="g2", chunk_ids="c2", relevance="related")]
     assert gold_groups(evidence, "q1") == {"g1": {"c1"}}
-
-
-# --- The committed benchmark files ---------------------------------------------------
-
-def test_committed_benchmark_is_valid():
-    benchmark = read_csv(ROOT / "data/eval/benchmark.csv")
-    gold = read_csv(ROOT / "data/eval/gold_evidence.csv")
-    manifest = read_csv(ROOT / "data/filings_manifest.csv")
-    assert validate(benchmark, gold, manifest) == []

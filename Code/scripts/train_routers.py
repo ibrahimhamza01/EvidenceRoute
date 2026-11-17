@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Train and evaluate the baseline scope routers on the pilot question set.
+"""Train and evaluate the baseline scope routers on an explicitly supplied annotated question set.
 
 Run from the repository root:
-    PYTHONPATH=Code/src python Code/scripts/train_routers.py
+    PYTHONPATH=Code/src python Code/scripts/train_routers.py --questions <annotations.csv> --out-dir <results-dir>
 """
 
 from __future__ import annotations
@@ -45,8 +45,8 @@ def evaluate(router: BaselineRouter, questions: list[str], gold: list[str]) -> d
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train and evaluate baseline routers.")
-    parser.add_argument("--questions", type=Path, default=Path("data/questions/questions.csv"))
-    parser.add_argument("--out-dir", type=Path, default=Path("Code/results/routing_pilot"))
+    parser.add_argument("--questions", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
 
@@ -54,7 +54,7 @@ def main() -> None:
     eval_q, eval_y = load_split(args.questions, "eval")
 
     report = {
-        "note": "Pilot results on 4 filings (NVIDIA and AMD, FY2023-FY2024). Not final conclusions.",
+        "questions_path": str(args.questions),
         "seed": args.seed,
         "n_train": len(train_q),
         "n_eval": len(eval_q),

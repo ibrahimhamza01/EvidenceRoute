@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from evidenceroute.ingestion.downloader import load_manifest, relative_filing_path
+from evidenceroute.ingestion.downloader import load_canonical_manifest, relative_filing_path
 from evidenceroute.ingestion.parser import extract_sections
 from evidenceroute.ingestion.processor import chunk_sections, write_parquet
 
@@ -22,30 +22,23 @@ def sha256_file(path: Path) -> str:
 def publish_to_s3(
     *,
     output_dir: Path,
-    dataset: str,
-    bucket: str,
-    prefix: str,
 ) -> list[str]:
     """Publish verified dataset artifacts without overwriting S3 objects."""
     import boto3
     from botocore.exceptions import ClientError
 
-    if dataset not in ("pilot", "full"):
-        raise ValueError(f"Unsupported dataset: {dataset}")
-
-    dataset_prefix = (
-        "processed/pilot-v1/" if dataset == "pilot"
-        else "processed/"
-    )
+    bucket = "dats-nlp"
+    prefix = "syedibrahim.hamza@gwu.edu/EvidenceRoute"
+    dataset_prefix = "processed/full-v1/"
     base_key = f"{prefix.strip('/')}/{dataset_prefix}".lstrip("/")
 
     manifest_path = output_dir / "dataset_manifest.json"
     metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    if metadata["dataset_type"] != dataset:
-        raise ValueError("Dataset mode does not match generated manifest")
+    if metadata["dataset_type"] != "full":
+        raise ValueError("Expected full-corpus manifest")
     if metadata["storage_prefix"] != dataset_prefix:
-        raise ValueError("Manifest S3 prefix does not match dataset mode")
+        raise ValueError("Manifest S3 prefix does not match canonical destination")
 
     filenames = (
         "sections.parquet",
@@ -130,23 +123,22 @@ def publish_to_s3(
     return published
 
 
-def process(*, manifest: Path, raw_dir: Path, output_dir: Path,
-            dataset: str, max_chars: int, overlap_chars: int) -> dict:
+def process(*, raw_dir: Path, output_dir: Path) -> dict:
+    max_chars, overlap_chars = 1800, 200
     if max_chars <= 0 or not 0 <= overlap_chars < max_chars:
         raise ValueError("Require max_chars > 0 and 0 <= overlap_chars < max_chars")
-    filings = list(load_manifest(manifest))
+    filings = load_canonical_manifest()
     if not filings:
         raise ValueError("Refusing to process an empty filing manifest")
-    if dataset == "pilot" and len(filings) != 4:
-        raise ValueError("Pilot mode requires the four-filing pilot manifest")
-
     sections, chunks, inputs, failures = [], [], [], []
     for filing in filings:
         path = raw_dir / relative_filing_path(filing)
         try:
             if not path.is_file():
                 raise FileNotFoundError(path)
-            extracted = extract_sections(path, filing.document_id, filing.source_url)
+            extracted = extract_sections(
+                path, filing.document_id, filing.source_url,
+            )
             generated = chunk_sections(extracted, filing, max_chars=max_chars,
                                        overlap_chars=overlap_chars)
             sections.extend(extracted)
@@ -176,14 +168,14 @@ def process(*, manifest: Path, raw_dir: Path, output_dir: Path,
         files[name] = {"records": count, "sha256": sha256_file(output_dir / name)}
 
     metadata = {
-        "dataset_name": "pilot-v1" if dataset == "pilot" else "full",
-        "dataset_type": dataset,
-        "storage_prefix": "processed/pilot-v1/" if dataset == "pilot" else "processed/",
+        "dataset_name": "full",
+        "dataset_type": "full",
+        "storage_prefix": "processed/full-v1/",
         "production_storage_prefix": "processed/",
         "filing_count": len(filings),
         "section_count": len(sections),
         "chunk_count": len(chunks),
-        "extracted_items": ["1", "1A", "7", "8", "15"],
+        "extracted_items": ["1", "1A", "1C", "7", "8", "15"],
         "chunking": {"max_chars": max_chars, "overlap_chars": overlap_chars},
         "inputs": inputs,
         "files": files,
@@ -196,32 +188,17 @@ def process(*, manifest: Path, raw_dir: Path, output_dir: Path,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", choices=("pilot", "full"), default="pilot")
-    ap.add_argument("--manifest", type=Path, default=Path("data/filings_manifest.csv"))
     ap.add_argument("--raw-dir", type=Path, default=Path("data/raw"))
     ap.add_argument("--output-dir", type=Path, default=None)
-    ap.add_argument("--max-chars", type=int, default=1800)
-    ap.add_argument("--overlap-chars", type=int, default=200)
     ap.add_argument(
         "--s3",
         action="store_true",
         help="Publish validated output to S3",
     )
-    ap.add_argument(
-        "--s3-bucket",
-        default="dats-nlp",
-    )
-    ap.add_argument(
-        "--s3-prefix",
-        default="syedibrahim.hamza@gwu.edu/EvidenceRoute",
-    )
     args = ap.parse_args()
-    output_dir = args.output_dir or (Path("data/processed/pilot-v1")
-                                     if args.dataset == "pilot"
-                                     else Path("data/processed"))
-    result = process(manifest=args.manifest, raw_dir=args.raw_dir,
-                     output_dir=output_dir, dataset=args.dataset,
-                     max_chars=args.max_chars, overlap_chars=args.overlap_chars)
+    output_dir = args.output_dir or Path("data/processed/full-v1")
+    result = process(raw_dir=args.raw_dir,
+                     output_dir=output_dir)
     print(json.dumps({"output_dir": str(output_dir), "filings": result["filing_count"],
                       "sections": result["section_count"],
                       "chunks": result["chunk_count"],
@@ -232,9 +209,6 @@ def main() -> None:
     if args.s3:
         published = publish_to_s3(
             output_dir=output_dir,
-            dataset=args.dataset,
-            bucket=args.s3_bucket,
-            prefix=args.s3_prefix,
         )
         print("S3 publication verified:")
         for uri in published:
