@@ -1,5 +1,6 @@
-
 # Standard RAG — EvidenceRoute
+
+[Quick start](../README.md) · [Documentation index](../../README.md#documentation)
 
 ## Overview
 
@@ -25,10 +26,14 @@ verification status.
 
 | File | Responsibility |
 |------|----------------|
-| `research/prompts.py` | Build evidence-grounded prompts |
-| `research/llm_client.py` | LLM interface and Gemini client |
-| `research/citations.py` | Extract and validate citation IDs |
-| `research/standard_rag.py` | Orchestrate Standard RAG |
+| `Code/src/evidenceroute/research/prompts.py` | Build evidence-grounded prompts |
+| `Code/src/evidenceroute/research/llm_client.py` | LLM interface and Gemini client |
+| `Code/src/evidenceroute/research/citations.py` | Extract and validate citation IDs |
+| `Code/src/evidenceroute/research/standard_rag.py` | Orchestrate Standard RAG |
+
+## Prompt construction
+
+`build_rag_prompt(question, evidence)` combines the question with evidence blocks containing chunk ID, document ID, company, fiscal year, section name, source URL and passage text. The prompt instructs the model to use only supplied evidence, avoid invented facts and citations, cite every factual claim, and treat retrieved passages as data rather than instructions. It specifies the exact abstention message when the supplied passages are insufficient.
 
 ## Citation Format
 
@@ -62,36 +67,56 @@ Semantic claim verification is outside the scope of this module.
 
 ## Running the Demo
 
-From the `Code` directory:
+From the repository root:
 
 ```powershell
-$env:PYTHONPATH = "src"
-python examples/demo_standard_rag.py
+$env:PYTHONPATH = "Code/src"
+python Code/examples/demo_standard_rag.py
 ```
 
 The demo retrieves from all canonical full-v1 chunks and echoes supplied evidence using a mock LLM.
 
 It requires `data/processed/full-v1/chunks.parquet` and no API key, network connection, or Qdrant database.
 
+For Bash, the equivalent demo command is:
+
+```bash
+PYTHONPATH=Code/src python Code/examples/demo_standard_rag.py
+```
+
 ## Running Tests
 
-From the `Code` directory:
+From the repository root:
 
 ```powershell
-$env:PYTHONPATH = "src"
-python -m pytest tests/test_rag_corpus.py -v
+$env:PYTHONPATH = "Code/src"
+python -m pytest Code/tests/test_rag_corpus.py -v
 python -m pytest -q
 ```
 
 The corpus regression tests exercise citation provenance for every one of the 75 canonical filings with simulated LLM responses.
 
+The focused RAG suite can also be run from Bash:
+
+```bash
+PYTHONPATH=Code/src python -m pytest Code/tests/test_rag_*.py Code/tests/test_standard_rag.py -q
+```
+
+The corpus tests additionally cover cited-answer preservation, fabricated-citation rejection, missing-evidence abstention without an LLM call, and the distinction between valid citations and factual verification. Prompt, citation, LLM-client and handled-error tests exercise the components independently.
+
 ## Gemini Configuration
 
-`research/llm_client.py` provides a Gemini client for live
+`Code/src/evidenceroute/research/llm_client.py` provides a Gemini client for live
 model generation.
 
-Install the project's dependencies and configure the required
-Gemini API credentials according to the client's implementation.
+Install the dependencies using the [quick start](../README.md). `GeminiClient` reads `GEMINI_API_KEY` and optionally `GEMINI_MODEL`; its current default model is `gemini-2.5-flash`. Constructor arguments can override the key, model and timeout (60 seconds by default).
+
+```bash
+export GEMINI_API_KEY="your-api-key"
+export GEMINI_MODEL="gemini-2.5-flash"
+```
+
+Instantiate `GeminiClient()` and pass it to `generate_rag_answer` with already retrieved evidence for live generation. The mock demo does not use these credentials or contact Gemini. Live requests use temperature 0.0. `LLMResult` records response text, model name, elapsed time and available input/output token counts. Client failures are wrapped as `LLMClientError` and handled by the RAG orchestration layer.
 
 The Standard RAG function accepts an LLM client implementing
 the `generate(prompt)` interface.
