@@ -22,6 +22,7 @@ ITEM_ORDER = (
 ITEM_NAMES = {
     "1": "Business",
     "1A": "Risk Factors",
+    "1C": "Cybersecurity",
     "7": "Management's Discussion and Analysis",
     "8": "Financial Statements and Supplementary Data",
     "15": "Exhibits and Financial Statement Schedules",
@@ -116,27 +117,90 @@ def _blocks(root: Tag) -> list[str]:
 
 
 def _item_heading(text: str) -> str | None:
-    # A heading is a short standalone block; no TOC page number or paragraph.
-    if len(text) > 220 or "\n" in text or " | " in text:
+    """Recognize SEC headings despite table cells and split words."""
+    if len(text) > 220:
         return None
+
+    # Some 10-Ks place the Item 7 or Item 8 heading across
+    # multiple lines, ending in "Table of Contents".
+    # Only flatten this verified structural pattern.
+    if "\n" in text:
+        lines = [
+            clean_line(line)
+            for line in text.splitlines()
+            if clean_line(line)
+        ]
+
+        is_financial_contents_heading = (
+            len(lines) in (2, 3)
+            and lines[-1].casefold() == "table of contents"
+            and re.match(r"^item\s+(?:7|8)\.", lines[0], re.I)
+            is not None
+        )
+
+        if not is_financial_contents_heading:
+            return None
+
+        text = " ".join(lines)
+
+    # Some 10-Ks combine Items 1 and 2 into one body heading.
+    # Normalize punctuation and whitespace before checking.
+    combined = re.sub(r"[^a-z0-9]", "", text.casefold())
+
+    if combined == "items1and2businessandproperties":
+        return "1"
+
     match = ITEM_RE.match(text)
     if not match:
         return None
+
     item = match.group(1) + (match.group(2) or "").upper()
-    title = clean_line(match.group(3)).lower().strip(" .:–—\"'“”")
-    # Normalize odd SEC inline spacing and apostrophes.
-    title = title.replace("’", "'")
     if item not in HEADING_TITLES:
         return None
-    if re.search(r"\s+\d{1,3}$", title):  # table-of-contents page number
+
+    title = clean_line(match.group(3))
+
+    # Reject common table-of-contents page-number suffixes.
+    if re.search(r"\s+\d{1,3}\s*$", title):
         return None
-    prefixes = tuple(t.replace("’", "'") for t in HEADING_TITLES[item])
-    if not any(title.startswith(p) for p in prefixes):
+
+    # Compare only letters/digits. This handles:
+    # B USINESS, FINANC IAL, and table-cell separators (|).
+    def signature(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", value.lower())
+
+    normalized = signature(title)
+    prefixes = tuple(signature(t) for t in HEADING_TITLES[item])
+
+    # Some reports prefix Item 7's title with the registrant name
+    # and append "Table of Contents" to the actual body heading.
+    if item == "7":
+        md_title = signature("management's discussion and analysis")
+        position = normalized.find(md_title)
+        if (
+            0 < position <= 80
+            and normalized[:position].endswith("andsubsidiaries")
+            and normalized.endswith("tableofcontents")
+        ):
+            return item
+
+    # An Item 8 body may begin with a financial-section contents page.
+    if item == "8" and any(
+        normalized == prefix + "tableofcontents"
+        for prefix in prefixes
+    ):
+        return item
+
+    if not any(normalized.startswith(prefix) for prefix in prefixes):
         return None
-    # A title is not a paragraph. Only permit modest continuation of long headings.
-    if item in {"1", "1A", "1B", "1C", "2", "3", "4", "6", "8", "9A", "9B", "11", "14", "16"}:
-        if not any(title == p for p in prefixes):
-            return None
+
+    strict_items = {
+        "1", "1A", "1B", "1C", "2", "3", "4",
+        "6", "8", "9A", "9B", "11", "14", "16",
+    }
+    if item in strict_items and normalized not in prefixes:
+        return None
+
     return item
 
 
@@ -167,7 +231,10 @@ def detect_item_boundaries(blocks: list[str]) -> list[Boundary]:
             if candidate.item == "16":
                 break
         found = {b.item for b in run}
-        if {"1", "1A", "1B", "7", "7A", "8", "9"}.issubset(found):
+        if (
+            {"1", "1A", "7", "7A", "8"}.issubset(found)
+            and bool({"9", "9A"} & found)
+        ):
             runs.append(run)
     if not runs:
         raise ParsingError("Could not identify an ordered SEC Item 1–9 body heading sequence")
@@ -179,7 +246,172 @@ def detect_item_boundaries(blocks: list[str]) -> list[Boundary]:
     return run
 
 
-def extract_sections(html_path: Path, document_id: str, source_url: str) -> list[Section]:
+
+
+def _standalone_heading_key(text: str) -> str | None:
+    """Normalize short standalone headings, excluding tables and paragraphs."""
+    if len(text) > 160 or "\n" in text or "|" in text:
+        return None
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+def _short_financial_reference(text: str) -> bool:
+    """Identify short Item 7/8 sections that defer to another section."""
+    return (
+        len(text) < 2000
+        and re.search(r"\b(?:see|reference is made)\b", text, re.I) is not None
+        and ("financial" in text.casefold() or "management" in text.casefold())
+    )
+
+
+def _resolve_referenced_financial_sections(
+    blocks: list[str],
+    boundaries: list[Boundary],
+    sections: list[Section],
+) -> list[Section]:
+    """Recover substantive Items 7/8 from a financial section after Item 16.
+
+    Only resolves filings where BOTH Items 7 and 8 contain short references.
+    Otherwise preserves normal extraction or fails for unsupported layouts.
+    """
+    from evidenceroute.ingestion.financial_attribution import (
+        resolve_special_financial_references,
+    )
+
+    resolved = resolve_special_financial_references(
+        blocks, boundaries, sections
+    )
+    if resolved is not None:
+        return resolved
+
+    by_id = {section.section_id: section for section in sections}
+    needs_7 = _short_financial_reference(by_id["item_7"].text)
+    needs_8 = _short_financial_reference(by_id["item_8"].text)
+
+    if not needs_7 and not needs_8:
+        return sections
+
+    if needs_7 != needs_8:
+        raise ParsingError(
+            "Only one of Items 7/8 is a short reference; manual review required"
+        )
+
+    item_16 = next((b for b in boundaries if b.item == "16"), None)
+    if item_16 is None:
+        raise ParsingError(
+            "Cannot resolve referenced financial section without Item 16"
+        )
+
+    first = item_16.block_index + 1
+    keys = {
+        i: _standalone_heading_key(blocks[i])
+        for i in range(first, len(blocks))
+    }
+
+    md_titles = {
+        "managementsdiscussionandanalysis",
+        "managementsdiscussionandanalysisoffinancialconditionandresultsofoperations",
+    }
+
+    financial_starts = {
+        "managementsreportoninternalcontroloverfinancialreporting",
+        "reportofindependentregisteredpublicaccountingfirm",
+        "financialstatements",
+        "consolidatedstatementofincome",
+        "statementsofconsolidatedincome",
+    }
+
+    md_start = next(
+        (i for i in range(first, len(blocks)) if keys[i] in md_titles),
+        None,
+    )
+    if md_start is None:
+        raise ParsingError("Substantive MD&A heading not found after Item 16")
+
+    financial_start = next(
+        (
+            i for i in range(md_start + 21, len(blocks))
+            if keys[i] in financial_starts
+        ),
+        None,
+    )
+    if financial_start is None:
+        raise ParsingError("Financial statement start not found after MD&A")
+
+    # An explicit exhibit/signature section ends the financial material.
+    # Otherwise the remaining tail is provisionally retained for manual QA.
+    ending_titles = {"indextoexhibits", "exhibitindex", "signatures"}
+    financial_end = next(
+        (
+            i for i in range(financial_start + 1, len(blocks))
+            if keys[i] in ending_titles
+        ),
+        len(blocks),
+    )
+
+    # Do not accept a financial section without all three core statements.
+    financial_keys = {
+        keys[i] for i in range(financial_start, financial_end)
+    }
+    required = {
+        "income statement": {
+            "consolidatedstatementofincome",
+            "statementsofconsolidatedincome",
+        },
+        "balance sheet": {
+            "consolidatedbalancesheet",
+            "consolidatedbalancesheets",
+        },
+        "cash flow statement": {
+            "consolidatedstatementofcashflows",
+            "statementsofconsolidatedcashflows",
+        },
+    }
+    missing = [
+        label for label, headings in required.items()
+        if not (financial_keys & headings)
+    ]
+    if missing:
+        raise ParsingError(
+            f"Referenced financial section missing statements: {missing}"
+        )
+
+    spans = {
+        "item_7": (md_start, financial_start),
+        "item_8": (financial_start, financial_end),
+    }
+    resolved = []
+
+    for section in sections:
+        if section.section_id not in spans:
+            resolved.append(section)
+            continue
+
+        start, end = spans[section.section_id]
+
+        # Retain the original numbered Item heading, but replace the
+        # cross-reference paragraph with actual text from the same filing.
+        item_heading = section.text.splitlines()[0]
+        text = normalize_text(
+            item_heading + "\n" + "\n".join(blocks[start:end])
+        )
+
+        if len(text) < 10000:
+            raise ParsingError(
+                f"Resolved {section.section_id} suspiciously short"
+            )
+
+        resolved.append(
+            Section.model_validate({
+                **section.model_dump(),
+                "text": text,
+            })
+        )
+
+    return resolved
+
+
+def extract_sections(html_path: Path, document_id: str, source_url: str, *, include_item_1c: bool = False, resolve_financial_references: bool = False) -> list[Section]:
     """Return four pilot Sections. Fail closed if any target is empty or misbounded."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
@@ -188,10 +420,47 @@ def extract_sections(html_path: Path, document_id: str, source_url: str) -> list
     for tag in list(root.find_all(["script", "style", "noscript", "svg", "ix:header", "nav"])):
         tag.decompose()
     blocks = _blocks(root)
+
+    if resolve_financial_references:
+        from evidenceroute.ingestion.topical_parser import (
+            is_topical_form10k,
+            extract_topical_sections,
+        )
+
+        if is_topical_form10k(blocks):
+            return extract_topical_sections(
+                blocks,
+                document_id,
+                source_url,
+                include_item_1c=include_item_1c,
+            )
+
     boundaries = detect_item_boundaries(blocks)
+
+    # Some filings have Item 15 but no Item 16.
+    # Stop before the standalone SIGNATURES section.
+    if boundaries[-1].item == "15":
+        start_index = boundaries[-1].block_index
+        signatures = [
+            i for i in range(start_index + 1, len(blocks))
+            if re.fullmatch(r"signatures?", blocks[i].strip(), re.I)
+        ]
+        if len(signatures) != 1:
+            raise ParsingError(
+                "Cannot safely terminate Item 15: "
+                f"found {len(signatures)} SIGNATURES headings"
+            )
+        end_index = signatures[0]
+        boundaries.append(
+            Boundary("END", end_index, blocks[end_index])
+        )
+
     by_item = {b.item: i for i, b in enumerate(boundaries)}
     sections: list[Section] = []
-    for item in TARGET_ITEMS:
+    targets = ("1", "1A", "1C", "7", "8", "15") if include_item_1c else TARGET_ITEMS
+    for item in targets:
+        if item == "1C" and item not in by_item:
+            continue
         if item not in by_item or by_item[item] + 1 >= len(boundaries):
             raise ParsingError(f"Missing start/end boundary for Item {item}")
         start = boundaries[by_item[item]]
@@ -199,8 +468,19 @@ def extract_sections(html_path: Path, document_id: str, source_url: str) -> list
         if end.block_index <= start.block_index:
             raise ParsingError(f"Invalid Item {item} boundaries")
         text = normalize_text("\n".join(blocks[start.block_index:end.block_index]))
-        if len(text) < 100:
+        short_but_valid = (
+            item == "1C"
+            and any(
+                clean_line(line).lower().rstrip(".") == "not applicable"
+                for line in text.splitlines()[1:]
+            )
+        )
+        if len(text) < 100 and not short_but_valid:
             raise ParsingError(f"Item {item} suspiciously short ({len(text)} chars)")
         sections.append(Section(document_id=document_id, section_id=f"item_{item.lower()}",
                                 section_name=ITEM_NAMES[item], text=text, source_url=source_url))
+    if resolve_financial_references:
+        sections = _resolve_referenced_financial_sections(
+            blocks, boundaries, sections
+        )
     return sections

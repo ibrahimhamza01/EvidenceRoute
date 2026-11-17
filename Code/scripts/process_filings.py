@@ -35,7 +35,7 @@ def publish_to_s3(
 
     dataset_prefix = (
         "processed/pilot-v1/" if dataset == "pilot"
-        else "processed/"
+        else "processed/full-v1/"
     )
     base_key = f"{prefix.strip('/')}/{dataset_prefix}".lstrip("/")
 
@@ -146,7 +146,11 @@ def process(*, manifest: Path, raw_dir: Path, output_dir: Path,
         try:
             if not path.is_file():
                 raise FileNotFoundError(path)
-            extracted = extract_sections(path, filing.document_id, filing.source_url)
+            extracted = extract_sections(
+                path, filing.document_id, filing.source_url,
+                include_item_1c=(dataset == "full"),
+                resolve_financial_references=(dataset == "full"),
+            )
             generated = chunk_sections(extracted, filing, max_chars=max_chars,
                                        overlap_chars=overlap_chars)
             sections.extend(extracted)
@@ -178,12 +182,15 @@ def process(*, manifest: Path, raw_dir: Path, output_dir: Path,
     metadata = {
         "dataset_name": "pilot-v1" if dataset == "pilot" else "full",
         "dataset_type": dataset,
-        "storage_prefix": "processed/pilot-v1/" if dataset == "pilot" else "processed/",
+        "storage_prefix": "processed/pilot-v1/" if dataset == "pilot" else "processed/full-v1/",
         "production_storage_prefix": "processed/",
         "filing_count": len(filings),
         "section_count": len(sections),
         "chunk_count": len(chunks),
-        "extracted_items": ["1", "1A", "7", "8", "15"],
+        "extracted_items": (
+            ["1", "1A", "1C", "7", "8", "15"]
+            if dataset == "full" else ["1", "1A", "7", "8", "15"]
+        ),
         "chunking": {"max_chars": max_chars, "overlap_chars": overlap_chars},
         "inputs": inputs,
         "files": files,

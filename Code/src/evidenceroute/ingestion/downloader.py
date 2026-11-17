@@ -46,8 +46,10 @@ def validate_filing(filing: Filing) -> None:
         raise AcquisitionError(f"{filing.ticker}: CIK must contain exactly ten digits")
     if not ACCESSION.fullmatch(filing.accession_number):
         raise AcquisitionError(f"{filing.ticker}: malformed accession number")
-    if filing.accession_number[:10] != filing.cik:
-        raise AcquisitionError(f"{filing.ticker}: accession CIK does not match filing CIK")
+    # The accession prefix identifies the submitting EDGAR account.
+    # It may be a filing agent rather than the issuer.
+    # Keep validating the accession format, issuer CIK,
+    # deterministic document_id, and canonical SEC URL.
     if filing.document_id != f"{filing.cik}_{filing.accession_number}":
         raise AcquisitionError(f"{filing.ticker}: incorrect deterministic document_id")
     if filing.form_type != "10-K":

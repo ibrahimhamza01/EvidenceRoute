@@ -181,3 +181,28 @@ def test_s3_mismatched_existing_key_refuses_overwrite(tmp_path):
     with pytest.raises(AcquisitionError, match="Refusing overwrite"):
         publish_s3(s3, "test", "raw/doc", path, sha, size, "doc")
     assert s3.put_calls == 0
+
+
+def test_filing_agent_accession_prefix_can_differ_from_issuer_cik():
+    """Microsoft FY2024 was submitted using a different EDGAR CIK."""
+    from evidenceroute.schemas import Filing
+    from evidenceroute.ingestion.downloader import validate_filing
+
+    filing = Filing(
+        document_id="0000789019_0000950170-24-087843",
+        company_name="MICROSOFT CORP",
+        ticker="MSFT",
+        cik="0000789019",
+        accession_number="0000950170-24-087843",
+        form_type="10-K",
+        fiscal_year=2024,
+        report_period_end="2024-06-30",
+        filing_date="2024-07-30",
+        primary_document="msft-20240630.htm",
+        source_url=(
+            "https://www.sec.gov/Archives/edgar/data/"
+            "789019/000095017024087843/msft-20240630.htm"
+        ),
+    )
+
+    validate_filing(filing)
