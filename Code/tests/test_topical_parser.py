@@ -48,7 +48,6 @@ def test_topical_parser_rejects_ambiguous_headings():
             blocks,
             "test_document",
             "https://www.sec.gov/",
-            include_item_1c=True,
         )
 
 
@@ -73,8 +72,6 @@ def test_intel_real_filing_topical_extraction(year, has_cybersecurity):
         path,
         filing.document_id,
         filing.source_url,
-        include_item_1c=True,
-        resolve_financial_references=True,
     )
 
     by_id = {s.section_id: s for s in sections}

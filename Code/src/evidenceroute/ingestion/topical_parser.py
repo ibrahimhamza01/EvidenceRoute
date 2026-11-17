@@ -62,8 +62,6 @@ def extract_topical_sections(
     blocks: list[str],
     document_id: str,
     source_url: str,
-    *,
-    include_item_1c: bool,
 ) -> list[Section]:
     """Extract verified primary spans without overlapping their text."""
     if not is_topical_form10k(blocks):
@@ -141,7 +139,7 @@ def extract_topical_sections(
         ("1A", risks, cyber if cyber is not None else finance),
     ]
 
-    if include_item_1c and cyber is not None:
+    if cyber is not None:
         spans.append(("1C", cyber, finance))
 
     spans.extend([

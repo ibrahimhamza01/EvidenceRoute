@@ -50,8 +50,6 @@ def test_referenced_financial_sections(
         path,
         filing.document_id,
         filing.source_url,
-        include_item_1c=True,
-        resolve_financial_references=True,
     )
 
     by_id = {s.section_id: s for s in sections}

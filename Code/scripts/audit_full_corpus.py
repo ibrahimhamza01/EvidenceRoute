@@ -1,11 +1,12 @@
 """Audit the 75-filing EvidenceRoute full SEC corpus."""
 
+import argparse
 from collections import Counter
 from pathlib import Path
 import csv
 
 from evidenceroute.ingestion.downloader import (
-    load_manifest,
+    load_canonical_manifest,
     relative_filing_path,
 )
 from evidenceroute.ingestion.parser import extract_sections
@@ -13,10 +14,11 @@ from evidenceroute.ingestion.processor import chunk_sections
 
 
 def main():
-    manifest = Path("data/filings_manifest.csv")
-    output = Path("data/processed/full_parsing_audit_v3.csv")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("data/processed/full-v1/parsing_audit.csv"))
+    output = parser.parse_args().output
 
-    filings = load_manifest(manifest)
+    filings = load_canonical_manifest()
     assert len(filings) == 75, (
         f"Expected 75 filings, found {len(filings)}"
     )
@@ -54,8 +56,6 @@ def main():
                 path,
                 filing.document_id,
                 filing.source_url,
-                include_item_1c=True,
-                resolve_financial_references=True,
             )
 
             by_id = {

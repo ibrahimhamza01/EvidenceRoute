@@ -39,7 +39,7 @@ Answers must cite supplied evidence using:
 Example:
 
 NVIDIA reported approximately 29,600 employees in
-36 countries. [chunk:8b7deb3e2b688baf905dd233]
+36 countries. [chunk:CHUNK_ID]
 
 The citation must refer to a chunk included in the retrieved evidence.
 
@@ -69,9 +69,9 @@ $env:PYTHONPATH = "src"
 python examples/demo_standard_rag.py
 ```
 
-The demo uses a verified NVIDIA SEC filing excerpt and a mock LLM.
+The demo retrieves from all canonical full-v1 chunks and echoes supplied evidence using a mock LLM.
 
-It requires no API key, network connection, or Qdrant database.
+It requires `data/processed/full-v1/chunks.parquet` and no API key, network connection, or Qdrant database.
 
 ## Running Tests
 
@@ -79,12 +79,11 @@ From the `Code` directory:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m pytest tests/test_rag_sec_regression.py -v
+python -m pytest tests/test_rag_corpus.py -v
 python -m pytest -q
 ```
 
-The SEC regression tests use verified NVIDIA and AMD filing
-excerpts with simulated LLM responses.
+The corpus regression tests exercise citation provenance for every one of the 75 canonical filings with simulated LLM responses.
 
 ## Gemini Configuration
 
@@ -117,7 +116,6 @@ SEC filing chunks.
 
 - Citation validation checks chunk identifiers, not factual support.
 - The demo uses a mock LLM rather than live Gemini.
-- The regression fixtures contain verified excerpts, not full
-  processed filing chunks.
+- Corpus regressions consume actual processed chunks; mock responses do not verify factual answers.
 - Retrieval integration and end-to-end live evaluation must be
   tested separately.

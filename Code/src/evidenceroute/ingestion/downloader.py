@@ -104,6 +104,31 @@ def load_manifest(path: Path) -> list[Filing]:
     return filings
 
 
+# Resolve against the repository so callers cannot select a different manifest via cwd.
+DATA_DIR = Path(__file__).resolve().parents[4] / "data"
+
+
+def load_canonical_manifest() -> list[Filing]:
+    """Load the single production corpus and reject incomplete registries/manifests."""
+    filings = load_manifest(DATA_DIR / "filings_manifest.csv")
+    with (DATA_DIR / "companies.csv").open(encoding="utf-8-sig", newline="") as handle:
+        companies = list(csv.DictReader(handle))
+    tickers = {row["ticker"] for row in companies}
+    registry = {row["ticker"]: row for row in companies}
+    expected = {(ticker, year) for ticker in tickers for year in (2022, 2023, 2024)}
+    if len(companies) != 25 or len(tickers) != 25 or len(filings) != 75:
+        raise AcquisitionError("Canonical corpus requires 25 companies and 75 filings")
+    if {(f.ticker, f.fiscal_year) for f in filings} != expected:
+        raise AcquisitionError("Canonical manifest must cover every company in FY2022–2024")
+    for filing in filings:
+        company = registry[filing.ticker]
+        if filing.cik != company["cik"].zfill(10):
+            raise AcquisitionError(f"{filing.ticker}: manifest CIK differs from company registry")
+        if set(company["fiscal_years"].split(";")) != {"2022", "2023", "2024"}:
+            raise AcquisitionError(f"{filing.ticker}: registry must cover FY2022–2024")
+    return filings
+
+
 def relative_filing_path(filing: Filing) -> Path:
     return Path("sec-filings") / filing.cik / filing.accession_number.replace("-", "") / filing.primary_document
 

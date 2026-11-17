@@ -1,22 +1,15 @@
+from pathlib import Path
 import pytest
 
-from retrieval_testdata import FIXTURE_PATH
-
 
 @pytest.fixture(scope="session")
-def dev_corpus():
-    from evidenceroute.retrieval import load_chunks_jsonl
-
-    return load_chunks_jsonl(FIXTURE_PATH)
-
-
-@pytest.fixture(scope="session")
-def chunk_by_anchor(dev_corpus):
-    """Find the unique fixture chunk for (document_id, text prefix)."""
-
-    def find(document_id: str, prefix: str):
-        hits = [c for c in dev_corpus if c.document_id == document_id and c.text.startswith(prefix)]
-        assert len(hits) == 1, (document_id, prefix, len(hits))
-        return hits[0]
-
-    return find
+def full_corpus():
+    from evidenceroute.retrieval import load_chunks
+    path = Path(__file__).resolve().parents[2] / "data/processed/full-v1/chunks.parquet"
+    if not path.is_file():
+        pytest.skip("Canonical processed corpus unavailable")
+    corpus = load_chunks(path)
+    assert len(corpus) == 24766
+    assert len({c.document_id for c in corpus}) == 75
+    assert len({c.ticker for c in corpus}) == 25
+    return corpus

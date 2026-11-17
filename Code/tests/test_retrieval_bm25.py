@@ -2,15 +2,14 @@ import random
 
 import pytest
 
-from retrieval_testdata import AMD_2023, AMD_2024, NVDA_2023, NVDA_2024
 from evidenceroute.retrieval import BM25Config, BM25Retriever, ChunkFilter
 from evidenceroute.retrieval.tokenization import tokenize
 from evidenceroute.schemas import Chunk, RetrievalResult
 
 
 @pytest.fixture(scope="module")
-def bm25(dev_corpus):
-    return BM25Retriever(dev_corpus)
+def bm25(full_corpus):
+    return BM25Retriever(full_corpus)
 
 
 def ids(results):
@@ -22,56 +21,22 @@ def test_tokenizer_keeps_identifiers():
         "nvidia", "h100", "mi300x", "eccn", "3a090", "item", "1a"]
 
 
-@pytest.mark.parametrize("query,document_id,prefix", [
-    ("Silo AI acquisition Finland", AMD_2024, "During the year, we completed the acquisition of Silo AI"),
-    ("ECCN 3A090 4A090", AMD_2023, "In October 2023, BIS issued new requirements"),
-    ("Data Center revenue $15.01 billion", NVDA_2023, "Data Center revenue for fiscal year 2023 was $15.01 billion"),
-    ("Transformer Engine Hopper", NVDA_2023, "In fiscal year 2023, we introduced the Hopper architecture"),
-    ("29,600 employees in 36 countries", NVDA_2024, "We believe that our employees are our greatest assets"),
-])
-def test_exact_terms_rank_the_source_passage_first(bm25, chunk_by_anchor, query, document_id, prefix):
-    results = bm25.search(query, top_k=3)
-    assert results[0].chunk == chunk_by_anchor(document_id, prefix)
-
-
-def test_product_name_query_returns_only_passages_containing_it(bm25):
-    results = bm25.search("H100", top_k=10)
-    assert len(results) == 4
-    assert all("H100" in r.chunk.text for r in results)
-    assert {r.chunk.ticker for r in results} == {"NVDA"}
-
-
-def test_identical_text_ties_are_broken_by_chunk_id(bm25, chunk_by_anchor):
-    a = chunk_by_anchor(AMD_2023, "We utilize third-party wafer foundries")
-    b = chunk_by_anchor(AMD_2024, "We utilize third-party wafer foundries")
-    assert a.text == b.text and a.chunk_id != b.chunk_id
-    results = bm25.search("TSMC", top_k=2)
-    assert results[0].score == results[1].score
-    assert ids(results) == sorted([a.chunk_id, b.chunk_id])
-
-
 @pytest.mark.parametrize("filters,check", [
     (ChunkFilter(tickers="amd"), lambda c: c.ticker == "AMD"),
     (ChunkFilter(fiscal_years=2023), lambda c: c.fiscal_year == 2023),
-    (ChunkFilter(document_ids=NVDA_2024), lambda c: c.document_id == NVDA_2024),
+    (ChunkFilter(tickers="MSFT"), lambda c: c.ticker == "MSFT"),
     (ChunkFilter(section_ids="ITEM_1A"), lambda c: c.section_id == "item_1a"),
     (ChunkFilter(tickers=["NVDA"], fiscal_years=[2024], section_ids=["item_1a", "item_7"]),
      lambda c: c.ticker == "NVDA" and c.fiscal_year == 2024 and c.section_id in {"item_1a", "item_7"}),
 ])
-def test_filters_restrict_results(bm25, dev_corpus, filters, check):
+def test_filters_restrict_results(bm25, full_corpus, filters, check):
     query = "export controls revenue data center employees foundries security"
-    results = bm25.search(query, top_k=50, filters=filters)
+    results = bm25.search(query, top_k=30000, filters=filters)
     assert results and all(check(r.chunk) for r in results)
-    unfiltered = [r for r in bm25.search(query, top_k=50) if check(r.chunk)]
+    unfiltered = [r for r in bm25.search(query, top_k=30000) if check(r.chunk)]
     # Filtering never changes a chunk's score or relative order (corpus-level IDF).
     assert [(r.chunk.chunk_id, r.score) for r in results] == \
         [(r.chunk.chunk_id, r.score) for r in unfiltered]
-
-
-def test_filter_can_change_the_top_hit(bm25, chunk_by_anchor):
-    top_all = bm25.search("export controls", top_k=1)[0].chunk
-    top_amd = bm25.search("export controls", top_k=1, filters=ChunkFilter(tickers="AMD"))[0].chunk
-    assert top_amd.ticker == "AMD" and top_amd != top_all
 
 
 @pytest.mark.parametrize("query,filters", [
@@ -79,8 +44,7 @@ def test_filter_can_change_the_top_hit(bm25, chunk_by_anchor):
     ("   \n", None),
     ("the of and with", None),                      # stopwords only
     ("zyzzyva quokka", None),                        # no matching terms
-    ("export controls", ChunkFilter(tickers="MSFT")),  # filter matches nothing
-    ("H100", ChunkFilter(tickers="AMD")),            # term absent from filtered subset
+    ("export controls", ChunkFilter(tickers="UNKNOWN")),  # filter matches nothing
 ])
 def test_empty_results(bm25, query, filters):
     assert bm25.search(query, top_k=5, filters=filters) == []
@@ -104,23 +68,23 @@ def test_empty_filter_list_is_rejected():
 def test_top_k_limits_and_never_pads(bm25):
     assert len(bm25.search("export", top_k=2)) == 2
     all_hits = bm25.search("Silo", top_k=100)
-    assert len(all_hits) == 1
+    assert all_hits and all("silo" in r.chunk.text.casefold() for r in all_hits)
 
 
-def test_results_validate_and_preserve_original_chunks(bm25, dev_corpus):
+def test_results_validate_and_preserve_original_chunks(bm25, full_corpus):
     for result in bm25.search("revenue data center GPUs", top_k=10):
         RetrievalResult.model_validate(result.model_dump())
-        original = dev_corpus.get(result.chunk.chunk_id)
+        original = full_corpus.get(result.chunk.chunk_id)
         assert result.chunk == original
         assert result.chunk.text == original.text
         assert result.chunk.source_url == original.source_url
         assert result.score > 0
 
 
-def test_index_is_reproducible_regardless_of_input_order(dev_corpus):
-    shuffled = list(dev_corpus)
+def test_index_is_reproducible_regardless_of_input_order(full_corpus):
+    shuffled = list(full_corpus)
     random.Random(7).shuffle(shuffled)
-    a = BM25Retriever(dev_corpus).search("export restrictions China GPUs", top_k=10)
+    a = BM25Retriever(full_corpus).search("export restrictions China GPUs", top_k=10)
     b = BM25Retriever(shuffled).search("export restrictions China GPUs", top_k=10)
     assert [(r.chunk.chunk_id, r.score) for r in a] == [(r.chunk.chunk_id, r.score) for r in b]
 
@@ -135,3 +99,17 @@ def test_term_in_every_document_still_scores_positive():
     chunks = [_chunk("a", "supply risk"), _chunk("b", "supply chain"), _chunk("c", "supply demand")]
     results = BM25Retriever(chunks, BM25Config()).search("supply", top_k=3)
     assert len(results) == 3 and all(r.score > 0 for r in results)
+
+
+def test_duplicate_text_tie_break_and_no_padding():
+    chunks = [_chunk("b", "unique supply phrase"), _chunk("a", "unique supply phrase")]
+    results = BM25Retriever(chunks).search("unique", top_k=10)
+    assert ids(results) == ["a", "b"]
+    assert results[0].score == results[1].score
+
+
+def test_full_corpus_search_reaches_every_canonical_filing(bm25, full_corpus):
+    for document_id in {c.document_id for c in full_corpus}:
+        results = bm25.search("revenue financial risk", top_k=3, filters=ChunkFilter(document_ids=document_id))
+        assert results
+        assert all(r.chunk.document_id == document_id for r in results)

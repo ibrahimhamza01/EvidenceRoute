@@ -8,10 +8,9 @@ from pathlib import Path
 
 SCOPES = {"simple", "multi_source", "corpus_wide"}
 ANSWERABLE = {"true", "false", "pending"}
-CORPORA = {"pilot", "expanded"}
 SPLITS = {"dev", "heldout"}
 EVIDENCE_STATUSES = {
-    "complete", "incomplete_section_not_processed", "none", "related_only", "pending_expanded_corpus",
+    "complete", "incomplete_section_not_processed", "none", "related_only", "pending_annotation",
 }
 RELEVANCE = {"supporting", "related"}
 
@@ -51,16 +50,12 @@ def validate(benchmark: list[dict], gold: list[dict], manifest: list[dict],
             errors.append(f"{qid}: invalid scope {row['scope']!r}")
         if row["answerable"] not in ANSWERABLE:
             errors.append(f"{qid}: invalid answerable {row['answerable']!r}")
-        if row["corpus"] not in CORPORA:
-            errors.append(f"{qid}: invalid corpus {row['corpus']!r}")
         if row["eval_split"] not in SPLITS:
             errors.append(f"{qid}: invalid eval_split {row['eval_split']!r}")
         if row["gold_evidence_status"] not in EVIDENCE_STATUSES:
             errors.append(f"{qid}: invalid gold_evidence_status {row['gold_evidence_status']!r}")
         if not row["expected_answer"].strip():
             errors.append(f"{qid}: missing expected_answer")
-        if (row["corpus"] == "expanded") != (row["answerable"] == "pending"):
-            errors.append(f"{qid}: 'pending' answerability must be used for expanded-corpus questions only")
         if row["router_split"] == "eval" and row["eval_split"] != "heldout":
             errors.append(f"{qid}: router eval questions must be heldout")
         for doc in filter(None, row["document_ids"].split(";")):
@@ -119,10 +114,10 @@ def validate(benchmark: list[dict], gold: list[dict], manifest: list[dict],
 
 
 def review_coverage(benchmark: list[dict]) -> dict[str, tuple[int, int]]:
-    """(verified, total) per split, counting only pilot questions with evidence to review."""
+    """(verified, total) per split, counting questions with completed answer annotations."""
     coverage: dict[str, list[int]] = {split: [0, 0] for split in sorted(SPLITS)}
     for row in benchmark:
-        if row["corpus"] != "pilot":
+        if row["answerable"] == "pending":
             continue
         counts = coverage[row["eval_split"]]
         counts[1] += 1

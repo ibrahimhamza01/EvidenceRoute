@@ -75,16 +75,13 @@ def first_filing():
     return load_manifest(MANIFEST)[0]
 
 
-def test_manifest_contains_original_pilot_filings():
+def test_canonical_manifest_covers_all_companies_and_years():
     filings = load_manifest(MANIFEST)
     by_key = {(f.ticker, f.fiscal_year): f for f in filings}
 
-    expected = {
-        ("NVDA", 2023), ("NVDA", 2024),
-        ("AMD", 2023), ("AMD", 2024),
-    }
-
-    assert expected <= set(by_key)
+    assert len(filings) == 75
+    assert len({f.ticker for f in filings}) == 25
+    assert {f.fiscal_year for f in filings} == {2022, 2023, 2024}
     assert len(by_key) == len(filings)
     assert by_key["NVDA", 2023].cik == "0001045810"
     assert by_key["AMD", 2023].cik == "0000002488"

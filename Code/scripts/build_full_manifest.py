@@ -124,7 +124,7 @@ def main() -> int:
     for ticker, cik, company_name, years in companies:
         for y in years:
             if (ticker, y) in existing and existing[ticker, y].cik != cik:
-                problems.append(f"{ticker} FY{y}: CIK disagrees with validated pilot")
+                problems.append(f"{ticker} FY{y}: CIK disagrees with canonical manifest")
         try:
             payload = sec.json(f"https://data.sec.gov/submissions/CIK{cik}.json")
             filing_data = payload["filings"]

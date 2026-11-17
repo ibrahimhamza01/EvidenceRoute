@@ -8,9 +8,9 @@ Examples (from the repository root):
     PYTHONPATH=Code/src python Code/scripts/demo_retrieval.py "data center revenue growth" \
         --section item_7 --top-k 3 --show-ranks
 
-The default chunk source is the committed development fixture. ``--chunks`` accepts a
+The default chunk source is the canonical full-corpus Parquet. ``--chunks`` accepts a
 JSONL or the pipeline's ``chunks.parquet``. The Qdrant index is persisted under
-``--index-dir`` (default ``data/indexes/dev``, ignored by Git) and is rebuilt
+``--index-dir`` (default ``data/indexes/full-v1``, ignored by Git) and is rebuilt
 automatically whenever the chunks or embedding model change.
 """
 from __future__ import annotations
@@ -24,8 +24,8 @@ from pathlib import Path
 from evidenceroute.retrieval import BM25Retriever, ChunkFilter, HybridRetriever, load_chunks
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CHUNKS = ROOT / "Code/tests/fixtures/retrieval_dev_chunks.jsonl"
-DEFAULT_INDEX_DIR = ROOT / "data/indexes/dev"
+DEFAULT_CHUNKS = ROOT / "data/processed/full-v1/chunks.parquet"
+DEFAULT_INDEX_DIR = ROOT / "data/indexes/full-v1"
 
 
 def make_embedder(name: str):

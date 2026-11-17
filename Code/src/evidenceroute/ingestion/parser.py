@@ -1,6 +1,6 @@
 """SEC 10-K HTML -> canonical Section records.
 
-Pilot parser: structural block extraction, conservative heading recognition,
+Canonical parser: structural block extraction, conservative heading recognition,
 and explicit failure for missing or ambiguous item boundaries.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup, Tag, XMLParsedAsHTMLWarning
 
 from evidenceroute.schemas import Section
 
-TARGET_ITEMS = ("1", "1A", "7", "8", "15")
+TARGET_ITEMS = ("1", "1A", "1C", "7", "8", "15")
 ITEM_ORDER = (
     "1", "1A", "1B", "1C", "2", "3", "4", "5", "6", "7", "7A",
     "8", "9", "9A", "9B", "9C", "10", "11", "12", "13", "14", "15", "16",
@@ -411,8 +411,8 @@ def _resolve_referenced_financial_sections(
     return resolved
 
 
-def extract_sections(html_path: Path, document_id: str, source_url: str, *, include_item_1c: bool = False, resolve_financial_references: bool = False) -> list[Section]:
-    """Return four pilot Sections. Fail closed if any target is empty or misbounded."""
+def extract_sections(html_path: Path, document_id: str, source_url: str) -> list[Section]:
+    """Extract canonical SEC sections, including available Item 1C. Fail closed if any target is empty or misbounded."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
         soup = BeautifulSoup(Path(html_path).read_bytes(), "lxml")
@@ -421,19 +421,15 @@ def extract_sections(html_path: Path, document_id: str, source_url: str, *, incl
         tag.decompose()
     blocks = _blocks(root)
 
-    if resolve_financial_references:
-        from evidenceroute.ingestion.topical_parser import (
-            is_topical_form10k,
-            extract_topical_sections,
-        )
+    from evidenceroute.ingestion.topical_parser import (
+        is_topical_form10k,
+        extract_topical_sections,
+    )
 
-        if is_topical_form10k(blocks):
-            return extract_topical_sections(
-                blocks,
-                document_id,
-                source_url,
-                include_item_1c=include_item_1c,
-            )
+    if is_topical_form10k(blocks):
+        return extract_topical_sections(
+            blocks, document_id, source_url,
+        )
 
     boundaries = detect_item_boundaries(blocks)
 
@@ -457,8 +453,7 @@ def extract_sections(html_path: Path, document_id: str, source_url: str, *, incl
 
     by_item = {b.item: i for i, b in enumerate(boundaries)}
     sections: list[Section] = []
-    targets = ("1", "1A", "1C", "7", "8", "15") if include_item_1c else TARGET_ITEMS
-    for item in targets:
+    for item in TARGET_ITEMS:
         if item == "1C" and item not in by_item:
             continue
         if item not in by_item or by_item[item] + 1 >= len(boundaries):
@@ -479,8 +474,7 @@ def extract_sections(html_path: Path, document_id: str, source_url: str, *, incl
             raise ParsingError(f"Item {item} suspiciously short ({len(text)} chars)")
         sections.append(Section(document_id=document_id, section_id=f"item_{item.lower()}",
                                 section_name=ITEM_NAMES[item], text=text, source_url=source_url))
-    if resolve_financial_references:
-        sections = _resolve_referenced_financial_sections(
-            blocks, boundaries, sections
-        )
+    sections = _resolve_referenced_financial_sections(
+        blocks, boundaries, sections
+    )
     return sections

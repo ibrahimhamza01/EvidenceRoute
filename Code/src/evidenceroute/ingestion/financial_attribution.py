@@ -1,6 +1,6 @@
 """Resolve verified SEC 10-K internal financial cross-references.
 
-Used only in full-corpus mode. Pilot extraction remains unchanged.
+Used by the canonical SEC extraction pipeline.
 """
 from __future__ import annotations
 

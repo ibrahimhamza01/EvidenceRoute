@@ -40,8 +40,6 @@ def test_real_filing_financial_attribution(ticker, year):
         path,
         filing.document_id,
         filing.source_url,
-        include_item_1c=True,
-        resolve_financial_references=True,
     )
 
     by_id = {s.section_id: s for s in sections}
@@ -103,7 +101,7 @@ def test_real_filing_financial_attribution(ticker, year):
 
 
 @pytest.mark.parametrize("year", [2023, 2024])
-def test_nvidia_pilot_mode_retains_reference_only_item8(year):
+def test_nvidia_default_parser_resolves_item8(year):
     if not MANIFEST.exists():
         pytest.skip("Full SEC manifest unavailable")
 
@@ -124,6 +122,6 @@ def test_nvidia_pilot_mode_retains_reference_only_item8(year):
 
     by_id = {s.section_id: s for s in sections}
 
-    # Pilot mode must not silently adopt the full-corpus
-    # financial reattribution behavior.
-    assert len(by_id["item_8"].text) < 2000
+    assert len(by_id["item_8"].text) > 10000
+    assert "Cash and cash equivalents" in by_id["item_8"].text
+    assert "Cash and cash equivalents" not in by_id["item_15"].text
