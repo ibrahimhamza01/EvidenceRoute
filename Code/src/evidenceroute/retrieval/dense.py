@@ -1,14 +1,3 @@
-"""Dense semantic retrieval: SentenceTransformer embeddings stored in Qdrant.
-
-Local development uses Qdrant's embedded mode, either in memory or persisted to a
-directory, so no server is required. Passing a ``QdrantClient`` for a server or
-Qdrant Cloud uses the same code path.
-
-Reproducibility: the collection is rebuilt from the chunk corpus in ``chunk_id``
-order with deterministic point IDs. An index manifest (embedding model, dimension,
-corpus fingerprint, schema version) is stored in the collection metadata, and
-``ensure_index`` rebuilds whenever the stored manifest differs from the current one.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -42,7 +31,6 @@ FILTER_FIELDS = {
 
 
 class DenseIndexError(RuntimeError):
-    """The vector index is missing, stale, or inconsistent with the corpus."""
 
 
 @runtime_checkable
@@ -59,7 +47,6 @@ class Embedder(Protocol):
 
 
 class SentenceTransformerEmbedder:
-    """L2-normalized SentenceTransformer embeddings (cosine similarity in Qdrant)."""
 
     def __init__(self, model_name: str = DEFAULT_MODEL, *, revision: str | None = None,
                  device: str | None = None, batch_size: int = 32,
@@ -110,12 +97,6 @@ class SentenceTransformerEmbedder:
 
 
 class HashingEmbedder:
-    """Deterministic bag-of-words feature hashing, for offline tests and smoke runs.
-
-    This is *not* a semantic model. It lets the Qdrant code path run without
-    downloading weights. Use ``SentenceTransformerEmbedder`` for real retrieval.
-    """
-
     def __init__(self, dimension: int = 256):
         if dimension < 2:
             raise ValueError("dimension must be >= 2")
@@ -159,7 +140,6 @@ class DenseIndexManifest(BaseModel):
 
 
 def point_id(chunk_id: str) -> str:
-    """Qdrant needs integer or UUID IDs; derive a stable UUID from ``chunk_id``."""
     return str(uuid.uuid5(POINT_NAMESPACE, chunk_id))
 
 
@@ -214,7 +194,6 @@ class DenseRetriever:
         return count == len(self.corpus)
 
     def build(self) -> DenseIndexManifest:
-        """Drop and recreate the collection from the corpus."""
         manifest = self.manifest()
         if self.client.collection_exists(self.collection_name):
             self.client.delete_collection(self.collection_name)
@@ -242,7 +221,6 @@ class DenseRetriever:
         return manifest
 
     def ensure_index(self) -> bool:
-        """Build only if missing or stale. Returns True when a rebuild happened."""
         if self.is_current():
             return False
         self.build()
@@ -268,12 +246,6 @@ class DenseRetriever:
 
     def _fetch_with_complete_ties(self, vector: list[float], top_k: int,
                                   query_filter: models.Filter | None) -> list:
-        """Fetch enough points that every point tied with the k-th score is included.
-
-        Qdrant orders equal scores arbitrarily. If the fetched window ends inside a
-        group of points tied at the cutoff score, widen it until the whole group is
-        present, so the ``chunk_id`` tie-break sees every candidate.
-        """
         limit = top_k + self.tie_buffer
         while True:
             points = self.client.query_points(self.collection_name, query=vector,

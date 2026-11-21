@@ -1,4 +1,3 @@
-"""Convenience constructor wiring BM25, dense and RRF from the same chunks and config."""
 from __future__ import annotations
 
 from pathlib import Path

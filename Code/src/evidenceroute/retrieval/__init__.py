@@ -1,8 +1,3 @@
-"""Hybrid evidence retrieval over ``Chunk`` records (BM25 + dense + RRF).
-
-Heavy dependencies are imported lazily: ``qdrant_client`` loads with the dense module,
-and ``sentence_transformers`` only when a ``SentenceTransformerEmbedder`` is created.
-"""
 from evidenceroute.retrieval.base import Retriever
 from evidenceroute.retrieval.bm25 import BM25Config, BM25Retriever
 from evidenceroute.retrieval.corpus import (

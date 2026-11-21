@@ -1,8 +1,3 @@
-"""Validated, deterministically ordered collections of ``Chunk`` records.
-
-Retrieval consumes the agreed ``Chunk`` schema only. Loaders accept JSONL now and
-the processed Parquet export later, without depending on the HTML parser.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +9,6 @@ from evidenceroute.schemas import Chunk
 
 
 class CorpusError(ValueError):
-    """Chunks cannot form a consistent retrieval corpus."""
 
 
 def _canonical(chunk: Chunk) -> str:
@@ -22,12 +16,6 @@ def _canonical(chunk: Chunk) -> str:
 
 
 class ChunkCorpus:
-    """Immutable chunk collection sorted by ``chunk_id``.
-
-    Exact duplicate records are collapsed. Two different records sharing a
-    ``chunk_id`` are rejected, because results must point at one original chunk.
-    """
-
     def __init__(self, chunks: Iterable[Chunk | Mapping[str, Any]]):
         by_id: dict[str, Chunk] = {}
         for raw in chunks:
@@ -62,7 +50,6 @@ class ChunkCorpus:
         return self._by_id.get(chunk_id)
 
     def fingerprint(self) -> str:
-        """SHA-256 over canonical records; identical inputs give identical fingerprints."""
         digest = hashlib.sha256()
         for chunk in self._chunks:
             digest.update(_canonical(chunk).encode("utf-8"))
@@ -84,7 +71,6 @@ def load_chunks_jsonl(path: Path | str) -> ChunkCorpus:
 
 
 def load_chunks_parquet(path: Path | str) -> ChunkCorpus:
-    """Load the processing pipeline's ``chunks.parquet`` (requires pyarrow)."""
     import pyarrow.parquet as pq
 
     table = pq.read_table(Path(path))

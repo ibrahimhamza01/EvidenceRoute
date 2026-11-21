@@ -1,13 +1,3 @@
-"""BM25 lexical retrieval over ``Chunk`` records.
-
-Okapi BM25 with the non-negative IDF variant used by Lucene,
-``idf = ln(1 + (N - df + 0.5) / (df + 0.5))``. The classic Robertson IDF turns
-negative for terms in more than half the documents, which is common in small or
-filtered corpora and would reward documents for containing very common words.
-
-IDF and average document length are computed over the whole corpus. Filters only
-restrict which chunks are scored, so scores remain comparable across filters.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -60,11 +50,9 @@ class BM25Retriever:
         return len(self.corpus)
 
     def query_terms(self, query: str) -> list[str]:
-        """Unique query terms in first-occurrence order."""
         return list(dict.fromkeys(tokenize(query, remove_stopwords=self.config.remove_stopwords)))
 
     def scores(self, query: str, filters: ChunkFilter | None = None) -> dict[int, float]:
-        """Positive BM25 scores keyed by corpus position, for chunks passing ``filters``."""
         k1, b = self.config.k1, self.config.b
         allowed = None
         if filters is not None and not filters.is_empty():

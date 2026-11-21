@@ -1,9 +1,3 @@
-"""Metadata filters shared by BM25, dense and hybrid retrieval.
-
-Semantics: a field left as ``None`` places no constraint. A field with values keeps
-chunks whose metadata equals any of them (OR within a field). Different fields are
-combined with AND.
-"""
 from __future__ import annotations
 
 from typing import Any
