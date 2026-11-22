@@ -1,8 +1,47 @@
-# Evaluation utilities (Issue #10)
+# Evaluation utilities and benchmark (Issues #10 and #18)
 
 [Quick start](../README.md) · [Documentation index](../../README.md#documentation)
 
-The evaluation package supports retrieval metrics, answer/citation evaluation inputs and question-routing labels. No annotated benchmark, gold answers or evaluation results are currently shipped as validated against the full 75-filing corpus. Corpus integrity and citation-provenance tests validate software behavior; they do not establish benchmark answer correctness.
+The evaluation package supports retrieval metrics, answer/citation evaluation inputs and question-routing labels. The reviewed full-corpus benchmark is in `data/benchmark/` (Issue #18, described below). Corpus integrity and citation-provenance tests validate software behavior; they do not establish benchmark answer correctness.
+
+## Full-corpus benchmark (Issue #18)
+
+| File | Contents |
+| --- | --- |
+| `data/benchmark/questions.csv` | 65 questions with scope, answerability, expected answer, companies, fiscal years, document IDs, source URLs, splits, evidence status and review fields |
+| `data/benchmark/gold_evidence.csv` | 142 evidence passages with document, section and chunk IDs, character offsets, quote and relevance |
+
+| | simple | multi_source | corpus_wide | Total |
+| --- | --- | --- | --- | --- |
+| Questions | 25 | 23 | 17 | 65 |
+| dev / heldout | 16 / 9 | 16 / 7 | 12 / 5 | 44 / 21 |
+| Unanswerable | 3 | 1 | 2 | 6 |
+
+All 25 companies and fiscal years 2022 to 2024 appear in the gold evidence. Question types include single-filing facts, multi-company comparisons, multi-year comparisons, two-section questions within one filing, and corpus-wide investigations.
+
+**Construction.** Questions were drafted with LLM assistance and checked against the processed corpus. Twenty-two were reused from the earlier pilot set after revalidation against full-v1 (`source = reused:<old id>`); pilot answers that changed with 25 companies were rewritten or dropped. Every quote was located by exact normalized match in the processed sections, and the build fails if any quote is not found or no chunk fully contains it. Retrieval model outputs were not used to create gold evidence.
+
+**Labeling guidelines.**
+
+- `simple`: one filing (one company, one fiscal year) answers the question. A prior-year comparison stated inside that filing stays `simple`.
+- `multi_source`: the question names two or more filings or sections, for example two companies, two fiscal years reported in separate filings, or two sections of one filing.
+- `corpus_wide`: the set of relevant filers is left open ("who", "which filers", "does anyone"), even when limited to a sector. Some corpus-wide questions deliberately avoid "companies" and "collection" to test lexical shortcuts.
+- Label the wording, not the size of the corpus, and keep scope separate from answerability.
+- Fiscal years: the manifest `fiscal_year` is the calendar year in which the fiscal period ends. Company naming can differ (Home Depot calls the year ended January 28, 2024 "fiscal 2023"), so questions state the company's own wording or the period-end date.
+- Mentions are not relationships: a filer that names a company only as a competitor, investor or auditor location does not count as a supplier or headquarters answer. Such passages are recorded with `relevance = related`.
+- Unanswerable questions cover years outside the corpus, companies outside the corpus, and related-only cases where the filing reports a nearby figure but not the one asked for.
+
+**Additional fields.** Besides the fields required below, `questions.csv` stores `question`, `question_type`, `tickers`, `fiscal_years`, `source_urls`, `split` (router split, `train`/`eval`), `evidence_groups`, `review_status`, `reviewer_notes`, `source` and `notes`. `gold_evidence.csv` also stores `ticker` and `fiscal_year`. One evidence group corresponds to one required piece of evidence; corpus-wide questions use one group per qualifying company.
+
+**Splits.** `Code/scripts/make_splits.py --eval-fraction 0.3 --seed 42` assigns whole template groups within each scope. Router `eval` questions are `heldout` and router `train` questions are `dev`, so routers are never scored on training questions and no `template_id` appears in both splits.
+
+**Review.** All 65 questions and their evidence were checked against the original SEC filings (`quote_verified = true`, `review_status = approved`). A second review pass found problems in an earlier draft, mostly corpus-wide answers whose keyword searches missed differently worded passages (for example Intel naming TSMC as a manufacturer in its risk factors, and ExxonMobil reporting headcount "in thousands"). These were corrected before approval.
+
+```bash
+PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py --benchmark data/benchmark/questions.csv --gold data/benchmark/gold_evidence.csv --processed-dir data/processed/full-v1
+```
+
+Validation passes with 44/44 dev and 21/21 heldout questions verified.
 
 ## Components and data requirements
 
@@ -55,6 +94,9 @@ Quotes are the remapper's source of truth. For rows marked `mapped` or `section_
 Answer evaluation also needs factual correctness, completeness, evidence support and citation validity. Track correct abstentions on unanswerable questions, false answers on unanswerable questions, and incorrect abstentions on answerable questions separately. Routing reports should include accuracy, macro F1, per-class precision/recall and confusion matrices; a correct scope label does not establish the best strategy for cost or answer quality.
 
 ## Current limitations
+
+Benchmark-specific limits: corpus-wide absence claims were checked by keyword and phrase search over all 75 filings plus human review, which can still miss unusual wording; 65 questions give wide confidence intervals; Item 1C cross-references (JPMorganChase, Bank of America, Goldman Sachs FY2023) are counted as present; and question wording comes from a limited set of patterns, so it is less varied than real user questions.
+
 
 The validator checks structure, references and chunk-ID existence; it does not verify quote text at the recorded offsets, prove that a chunk supports an answer, establish completeness across 75 filings, or perform factual answer grading. Review quotes against original HTML, confirm their offsets and containing chunks, and assess negative facts against the entire corpus before marking annotations verified. Remapping preserves human verification flags and never establishes them automatically.
 
