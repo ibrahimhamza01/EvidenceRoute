@@ -71,6 +71,8 @@ Real-filing regressions require original HTML; corpus integration tests require 
 
 ## Detailed guides
 
+- [Full-corpus Standard RAG — Issue #15](docs/full-corpus-standard-rag.md): CLI, metrics, benchmarking and Agentic RAG handoff.
+
 - [Ingestion](docs/ingestion.md): acquisition, parsing, financial statements, Item 1C, chunking, audits, hashes and S3 integrity.
 - [Hybrid retrieval — Issue #4](docs/retrieval.md): BM25, embeddings, Qdrant, RRF, filtering, reproducible indexes and tests.
 - [Standard RAG — Issue #5](docs/standard-rag.md): prompts, Gemini, citations, abstention, tests and limitations.
