@@ -19,7 +19,7 @@ class StandardRAGConfig(BaseModel):
 
     top_k: int = Field(default=5, ge=1, strict=True)
 
-    llm_provider: Literal["gemini"] = "gemini"
+    llm_provider: Literal["mock", "gemini"] = "gemini"
 
     tickers: list[str] | None = None
 
