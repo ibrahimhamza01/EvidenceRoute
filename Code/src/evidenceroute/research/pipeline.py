@@ -6,6 +6,9 @@ from evidenceroute.retrieval.base import Retriever, validate_top_k
 from evidenceroute.retrieval.filters import ChunkFilter
 from evidenceroute.schemas import ResearchResponse
 
+RETRIEVAL_ERROR_MESSAGE = "Unable to retrieve SEC evidence at this time."
+
+
 
 def run_standard_rag(
     question: str,
@@ -22,11 +25,23 @@ def run_standard_rag(
 
     validate_top_k(top_k)
 
-    evidence = retriever.search(
-        query=question,
-        top_k=top_k,
-        filters=filters,
-    )
+    try:
+        evidence = retriever.search(
+            query=question,
+            top_k=top_k,
+            filters=filters,
+        )
+    except Exception:
+        return ResearchResponse(
+            question=question,
+            answer=RETRIEVAL_ERROR_MESSAGE,
+            strategy="rag",
+            citations=[],
+            verification_status="not_checked",
+        )
+
+    if evidence is None:
+        evidence = []
 
     return generate_rag_answer(
         question=question,

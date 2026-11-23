@@ -117,3 +117,39 @@ def test_pipeline_rejects_invalid_top_k(top_k):
         )
 
     retriever.search.assert_not_called()
+
+
+def test_pipeline_handles_retrieval_failure():
+    from evidenceroute.research.pipeline import RETRIEVAL_ERROR_MESSAGE
+
+    retriever = Mock()
+    retriever.search.side_effect = RuntimeError("Search unavailable")
+    llm = Mock()
+
+    response = run_standard_rag(
+        "What risks does NVIDIA face?",
+        retriever,
+        llm,
+    )
+
+    assert response.answer == RETRIEVAL_ERROR_MESSAGE
+    assert response.strategy == "rag"
+    assert response.citations == []
+    assert response.verification_status == "not_checked"
+    llm.generate.assert_not_called()
+
+
+def test_pipeline_handles_none_retrieval_results():
+    retriever = Mock()
+    retriever.search.return_value = None
+    llm = Mock()
+
+    response = run_standard_rag(
+        "What risks does NVIDIA face?",
+        retriever,
+        llm,
+    )
+
+    assert response.answer == ABSTENTION_MESSAGE
+    assert response.citations == []
+    llm.generate.assert_not_called()
