@@ -2,7 +2,10 @@
 
 import csv
 import json
+import runpy
 from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,7 +30,8 @@ SOURCE = "https://www.sec.gov/Archives/edgar/data/1045810/000104581024000001/fix
 
 
 @pytest.fixture
-def corpus(tmp_path):
+def corpus(tmp_path, request):
+    large = getattr(request, "param", False)
     filing = Filing(
         document_id=DOCUMENT, company_name="NVIDIA fixture", ticker="NVDA", cik="0001045810",
         accession_number="0001045810-24-000001", form_type="10-K", fiscal_year=2024,
@@ -44,9 +48,10 @@ def corpus(tmp_path):
         Section(document_id=DOCUMENT, section_id="item_1", section_name="Business",
                 source_url=SOURCE, text="A synthetic business description."),
         Section(document_id=DOCUMENT, section_id=RISK, section_name="Risk Factors",
-                source_url=SOURCE, text="Supplier disruptions can affect shipments. Café. " * 5),
+                source_url=SOURCE, text="Supplier disruptions can affect shipments. Café. " * (700 if large else 5)),
     ]
-    write_parquet(sections, chunk_sections(sections, filing, max_chars=60, overlap_chars=0), tmp_path)
+    write_parquet(sections, chunk_sections(sections, filing, max_chars=1800 if large else 60, overlap_chars=0),
+                  tmp_path)
     return CorpusEnvironment(manifest_path=manifest, processed_dir=tmp_path)
 
 
@@ -66,7 +71,9 @@ def test_tool_and_action_schemas_are_json_serializable_and_closed(corpus):
     }
     assert all(schema["additionalProperties"] is False for schema in schemas.values())
     assert schemas["get_chunk"]["required"] == ["chunk_id"]
-    assert schemas["read_chunks"]["properties"]["limit"]["maximum"] == 10
+    for name in ("read_chunks", "search_chunks"):
+        limit = schemas[name]["properties"]["limit"]
+        assert (limit["default"], limit["maximum"]) == (1, 10)
     assert action_schema()["discriminator"]["propertyName"] == "type"
     json.dumps([schemas, action_schema()])
     dispatched = CorpusToolDispatcher(corpus, max_response_bytes=24_000)
@@ -111,7 +118,7 @@ def test_scripted_root_hands_back_observations_and_preserves_provenance(corpus):
 def test_complete_search_and_section_listing_leave_research_scope_unknown(corpus):
     model = ScriptedModelClient([
         tool("list_sections", document_id=DOCUMENT),
-        tool("search_chunks", query="disruptions"),
+        tool("search_chunks", query="disruptions", limit=10),
         finish(),
     ])
     trace = RootController(corpus, model).run("Find supplier disclosures.")
@@ -159,7 +166,7 @@ def test_pagination_requires_all_ranges_and_keeps_access_types_separate(corpus):
 
 def test_last_page_alone_and_undelivered_page_do_not_complete_pagination(corpus):
     model = ScriptedModelClient([
-        tool("read_chunks", document_id=DOCUMENT, section_id=RISK, offset=1),
+        tool("read_chunks", document_id=DOCUMENT, section_id=RISK, offset=1, limit=10),
         tool("read_chunks", document_id=DOCUMENT, section_id=RISK, limit=1),
     ])
     trace = RootController(corpus, model, limits=RootLimits(max_iterations=2)).run("Read the risks.")
@@ -211,11 +218,63 @@ def test_oversized_search_is_reported_without_making_hits_model_visible(corpus):
     model = ScriptedModelClient([search, finish(full.evidence[0].chunk_id), finish()])
     trace = RootController(corpus, model, limits=RootLimits(max_response_bytes=budget)).run("Search.")
     assert trace.steps[0].error["code"] == "response_too_large"
+    assert trace.steps[0].error["response_bytes"] == len(full.content.encode("utf-8"))
+    assert "suggested_limit" not in trace.steps[0].error
+    assert "get_section" in trace.steps[0].error["message"]
     assert trace.steps[1].error["code"] == "unseen_citation"
     assert all(len(obs.encode("utf-8")) <= budget for obs in model.observations[1:])
     assert trace.coverage.visible_chunks == ()
     assert trace.coverage.pagination == ()
     assert trace.coverage.search_discovered == full.evidence
+
+
+@pytest.mark.parametrize("corpus", [True], indirect=True, ids=["long-risk-section"])
+def test_demo_sized_search_rejects_ten_hits_and_recovers_at_same_offset(corpus):
+    args = {"query": "disruptions", "filters": {"section_ids": [RISK]}, "offset": 2}
+    requested = tool("search_chunks", **args, limit=10)
+    full = CorpusToolDispatcher(corpus, max_response_bytes=100_000).dispatch(
+        requested["name"], requested["arguments"],
+    )
+    assert len(full.evidence) == 10
+    expected = json.loads(full.content)["result"]["items"][0]["chunk"]
+    model = ScriptedModelClient([requested, tool("search_chunks", **args), finish(expected["chunk_id"])])
+    trace = RootController(corpus, model, limits=RootLimits(max_response_bytes=6_000)).run("Find a risk.")
+    rejected, retried, _ = trace.steps
+    assert rejected.error == {
+        "code": "response_too_large", "max_response_bytes": 6_000,
+        "response_bytes": len(full.content.encode("utf-8")), "suggested_limit": 1,
+        "message": "No results delivered. Retry with suggested_limit and the same offset and filters.",
+    }
+    assert rejected.error["response_bytes"] > 6_000
+    assert rejected.observation_sent and rejected.evidence == ()
+    assert "result" not in rejected.observation
+    assert len(rejected.search_discovered) == 10
+    assert retried.validated_arguments["limit"] == 1
+    assert retried.validated_arguments["offset"] == rejected.validated_arguments["offset"] == 2
+    assert retried.validated_arguments["filters"] == rejected.validated_arguments["filters"]
+    assert retried.observation["result"]["items"][0]["chunk"] == expected
+    assert retried.observation["result"]["next_offset"] == 3
+    assert retried.observation_sent and trace.stop_reason == "finished"
+    assert trace.coverage.visible_chunks == (full.evidence[0],)
+    assert len(trace.coverage.search_discovered) == 10
+    default_read = CorpusToolDispatcher(corpus, max_response_bytes=6_000).dispatch(
+        "read_chunks", {"document_id": DOCUMENT, "section_id": RISK},
+    )
+    assert default_read.arguments["limit"] == 1
+    assert len(default_read.evidence) == 1
+    assert json.loads(default_read.content)["result"]["next_offset"] == 1
+
+
+def test_oversized_section_recommends_smaller_character_window_and_respects_minimum_cap(corpus):
+    args = {"document_id": DOCUMENT, "section_id": RISK, "offset": 10}
+    full = corpus.get_section(DOCUMENT, RISK, offset=10)
+    dispatcher = CorpusToolDispatcher(corpus, max_response_bytes=128)
+    response = dispatcher.dispatch("get_section", args)
+    assert len(response.content.encode("utf-8")) <= 128
+    body = json.loads(response.content)
+    assert "result" not in body
+    assert body["error"]["code"] == "response_too_large"
+    assert body["error"]["suggested_limit"] == len(full.text) // 2
 
 
 def test_finish_is_allowed_at_tool_budget_but_an_extra_tool_is_rejected(corpus):
@@ -380,3 +439,58 @@ def test_bedrock_converse_integrates_with_existing_dispatch_and_coverage(corpus,
         assert trace.cited_chunk_ids == (chunk.chunk_id,)
         assert trace.coverage.visible_chunks[0].source_url == SOURCE
         assert sum(attempt.input_tokens for attempt in trace.model_attempts) == 14
+
+
+@pytest.mark.parametrize("detailed", [False, True], ids=["summary", "trace"])
+def test_demo_reports_configured_limits_and_optional_trace(corpus, detailed, monkeypatch, capsys):
+    expected = corpus.search_chunks("disruptions", limit=1).items[0].chunk
+
+    class DemoModel(ScriptedModelClient):
+        config = SimpleNamespace(model="fixture-model")
+
+        def next_action(self, question, tools, observation, *, remaining_seconds):
+            search = next(schema for schema in tools if schema["name"] == "search_chunks")
+            assert "4500 UTF-8 bytes" in search["description"]
+            assert "limit=1" in question
+            assert 0 < remaining_seconds <= 12
+            return super().next_action(question, tools, observation, remaining_seconds=remaining_seconds)
+
+    model = DemoModel([
+        tool("search_chunks", query="disruptions", limit=0),
+        tool("search_chunks", query="disruptions"), finish(expected.chunk_id),
+    ])
+    monkeypatch.setattr("evidenceroute.research.rlm.CorpusEnvironment", lambda: corpus)
+    monkeypatch.setattr(BedrockRootClient, "from_env", lambda: model)
+    demo = runpy.run_path(str(Path(__file__).resolve().parents[1] / "examples" / "demo_rlm_claude.py"))
+    flags = [
+        "--live", "--max-iterations", "3", "--max-tool-calls", "2",
+        "--max-response-bytes", "4500", "--deadline-seconds", "12",
+    ]
+    assert demo["main"](flags + (["--trace"] if detailed else [])) == 0
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert report["limits"] == {
+        "max_iterations": 3, "max_tool_calls": 2, "max_response_bytes": 4500, "deadline_seconds": 12,
+    }
+    assert report["stop_reason"] == "finished"
+    assert expected.text not in output
+    assert ("steps" in report) is detailed
+    if detailed:
+        failed, valid, finished = report["steps"]
+        assert failed["requested_action"]["arguments"]["limit"] == 0
+        assert failed["validated_arguments"] is None
+        assert failed["observation_error"]["code"] == "invalid_arguments"
+        assert failed["observation_sent"] and valid["observation_sent"]
+        assert valid["validated_arguments"]["limit"] == 1
+        assert valid["observation_chunk_ids"] == valid["search_discovered_chunk_ids"] == [expected.chunk_id]
+        assert finished["requested_action"]["type"] == "finish"
+        assert not finished["observation_sent"]
+
+
+@pytest.mark.parametrize("args", [[], ["--live", "--max-response-bytes", "1"]])
+def test_demo_rejects_unauthorized_or_invalid_run_before_provider_setup(args, monkeypatch):
+    monkeypatch.setattr(BedrockRootClient, "from_env", lambda: pytest.fail("Provider setup was attempted."))
+    demo = runpy.run_path(str(Path(__file__).resolve().parents[1] / "examples" / "demo_rlm_claude.py"))
+    with pytest.raises(SystemExit) as error:
+        demo["main"](args)
+    assert error.value.code == 2

@@ -14,6 +14,8 @@ from evidenceroute.research.rlm.environment import (
     MAX_QUERY_CHARS,
     MAX_SECTION_CHARS,
     CorpusEnvironment,
+    Page,
+    SectionWindow,
 )
 from evidenceroute.retrieval import ChunkFilter
 from evidenceroute.schemas import Chunk, RetrievalResult
@@ -28,7 +30,7 @@ class StrictInput(BaseModel):
 
 
 class _Page(StrictInput):
-    offset: int = Field(default=0, ge=0)
+    offset: int = Field(default=0, ge=0, description="Use next_offset from a successful response to continue.")
 
 
 class _MetadataPage(_Page):
@@ -54,11 +56,13 @@ class _Sections(_MetadataPage, _Filing):
 
 class _Section(_Page, _Filing):
     section_id: Identifier
-    limit: int = Field(default=MAX_SECTION_CHARS, ge=1, le=MAX_SECTION_CHARS)
+    limit: int = Field(default=MAX_SECTION_CHARS, ge=1, le=MAX_SECTION_CHARS,
+                       description="Maximum text characters, measured separately from the response byte cap.")
 
 
 class _ChunkPage(_Page):
-    limit: int = Field(default=MAX_CHUNK_ROWS, ge=1, le=MAX_CHUNK_ROWS)
+    limit: int = Field(default=1, ge=1, le=MAX_CHUNK_ROWS,
+                       description="Maximum whole chunks. Start with 1 for targeted questions.")
 
 
 class _Read(_ChunkPage, _Filing):
@@ -86,19 +90,25 @@ _TOOLS: dict[str, tuple[str, type[StrictInput]]] = {
     "list_filings": ("List filings, optionally filtered by ticker and fiscal year.", _Filings),
     "get_filing": ("Look up original metadata for one filing.", _Filing),
     "list_sections": ("List a filing's section metadata and chunk counts.", _Sections),
-    "get_section": ("Read a character window from one original processed section.", _Section),
-    "read_chunks": ("Read a page of whole original chunks from a filing or section.", _Read),
+    "get_section": ("Read original section text by character offset and limit.", _Section),
+    "read_chunks": ("Page through whole original chunks in order. Set section_id to scope the read.", _Read),
     "get_chunk": ("Look up one original chunk by its ID.", _Chunk),
-    "search_chunks": ("Rank keyword matches with optional metadata filters.", _Search),
+    "search_chunks": ("Rank keyword matches as whole chunks. Use a short query and filter to the target "
+                      "filing and section when known. Returned chunks include text and citation IDs.", _Search),
 }
 
 
-def tool_schemas() -> list[dict]:
+def tool_schemas(*, max_response_bytes: int | None = None) -> list[dict]:
     """Return fresh JSON-compatible tool definitions with JSON Schema inputs."""
-    return [
+    tools = [
         {"name": name, "description": description, "input_schema": args.model_json_schema()}
         for name, (description, args) in _TOOLS.items()
     ]
+    if max_response_bytes is not None:
+        for tool in tools:
+            if tool["name"] in {"get_section", "read_chunks", "search_chunks"}:
+                tool["description"] += f" This run caps each observation at {max_response_bytes} UTF-8 bytes."
+    return tools
 
 
 def _json_default(value):
@@ -118,11 +128,13 @@ def validation_message(error: ValidationError) -> str:
     return f"{location or 'input'} ({first['type'][:30]})"
 
 
-def error_observation(code: str, message: str, max_bytes: int) -> str:
-    content = observation_json({"ok": False, "error": {"code": code, "message": message}})
-    if len(content.encode("utf-8")) > max_bytes:
-        return observation_json({"ok": False, "error": {"code": code}})
-    return content
+def error_observation(code: str, message: str, max_bytes: int, **details: int) -> str:
+    error = {"code": code, **details}
+    for candidate in ({**error, "message": message}, error):
+        content = observation_json({"ok": False, "error": candidate})
+        if len(content.encode("utf-8")) <= max_bytes:
+            return content
+    return observation_json({"ok": False, "error": {"code": code}})
 
 
 @dataclass(frozen=True)
@@ -176,16 +188,31 @@ class CorpusToolDispatcher:
             evidence = self._evidence(name, result)
             discovered = evidence if name == "search_chunks" else ()
             content = observation_json({"ok": True, "result": result})
-            if len(content.encode("utf-8")) > self._max_bytes:
-                return self._error(
-                    "response_too_large", "Reduce the limit or narrow the request.",
-                    validated, discovered,
-                )
+            response_bytes = len(content.encode("utf-8"))
+            if response_bytes > self._max_bytes:
+                return self._oversized(name, validated, result, response_bytes, discovered)
             return DispatchResult(validated, content, evidence, discovered)
         except KeyError:
             return self._error("unknown_id", "No corpus record matches the supplied IDs.", validated)
         except Exception as exc:
             return self._error("tool_error", type(exc).__name__, validated)
+
+    def _oversized(
+        self, name: str, arguments: dict, result, response_bytes: int, discovered: tuple[EvidenceRef, ...],
+    ) -> DispatchResult:
+        details = {"max_response_bytes": self._max_bytes, "response_bytes": response_bytes}
+        if isinstance(result, SectionWindow) and len(result.text) > 1:
+            details["suggested_limit"] = len(result.text) // 2
+        elif isinstance(result, Page) and len(result.items) > 1:
+            details["suggested_limit"] = 1
+        if "suggested_limit" in details:
+            message = "No results delivered. Retry with suggested_limit and the same offset and filters."
+        elif name in {"search_chunks", "read_chunks", "get_chunk"}:
+            message = "No chunk delivered. Try get_section with a small character limit if the section is known."
+        else:
+            message = "No result delivered. This request is already at its smallest size."
+        content = error_observation("response_too_large", message, self._max_bytes, **details)
+        return DispatchResult(arguments, content, search_discovered=discovered)
 
     @staticmethod
     def _evidence(name: str, result) -> tuple[EvidenceRef, ...]:
@@ -200,7 +227,5 @@ class CorpusToolDispatcher:
 
     def _error(
         self, code: str, message: str, arguments: dict | None = None,
-        discovered: tuple[EvidenceRef, ...] = (),
     ) -> DispatchResult:
-        return DispatchResult(arguments, error_observation(code, message, self._max_bytes),
-                              search_discovered=discovered)
+        return DispatchResult(arguments, error_observation(code, message, self._max_bytes))

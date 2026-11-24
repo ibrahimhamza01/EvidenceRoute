@@ -183,7 +183,8 @@ class RootController:
             steps.append(step)
             try:
                 raw = self._model.next_action(
-                    question, tool_schemas(), pending, remaining_seconds=deadline - model_start,
+                    question, tool_schemas(max_response_bytes=self._limits.max_response_bytes),
+                    pending, remaining_seconds=deadline - model_start,
                 )
             except Exception as exc:
                 step.error = {"code": "model_error", "message": type(exc).__name__}
