@@ -218,6 +218,7 @@ __marimo__/
 /data/raw/
 /data/processed/
 /data/indexes/
+/data/benchmarks/
 
 .DS_Store
 .Rhistory
