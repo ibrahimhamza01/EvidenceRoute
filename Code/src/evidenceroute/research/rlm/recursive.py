@@ -1,0 +1,289 @@
+"""Sequential model-directed delegation with scoped tools and shared limits."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from time import monotonic
+from typing import Literal
+from uuid import uuid4
+
+from pydantic import Field, ValidationError
+
+from evidenceroute.research.rlm.budget import BudgetExceeded, SharedBudget, SharedLimits
+from evidenceroute.research.rlm.controller import (
+    ExecutionTrace, RootController, RootLimits, RootModelClient, StepTrace, _FinishAction,
+)
+from evidenceroute.research.rlm.coverage import CoverageReport, ResearchScope, SectionTarget
+from evidenceroute.research.rlm.environment import CorpusEnvironment
+from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingEvidence, PartitionCoverage, partition_status
+from evidenceroute.research.rlm.scoped import ScopedCorpus
+from evidenceroute.research.rlm.tools import (
+    DispatchResult, EvidenceRef, Identifier, StrictInput, error_observation, observation_json, validation_message,
+)
+
+
+class _Partition(StrictInput):
+    document_id: Identifier
+    section_id: Identifier
+
+
+class _Delegate(StrictInput):
+    question: str = Field(min_length=1, max_length=1_500)
+    goal: str = Field(min_length=1, max_length=750)
+    partitions: list[_Partition] = Field(min_length=1, max_length=500)
+
+
+@dataclass(frozen=True)
+class Invocation:
+    run_id: str
+    invocation_id: str
+    parent_id: str | None
+    depth: int
+    question: str
+    goal: str | None
+    partitions: tuple[SectionTarget, ...] | None
+
+
+@dataclass
+class DelegationTrace:
+    status: Literal["rejected", "failed", "incomplete", "finished", "oversized"]
+    error: str | None = None
+    invocation: Invocation | None = None
+    child: ExecutionTrace | None = None
+    delivered_finding_ids: tuple[str, ...] = ()
+
+
+class RecursiveResearch:
+    """Start a run with a fresh client per invocation and a single shared budget."""
+
+    def __init__(
+        self, corpus: CorpusEnvironment, model_factory: Callable[[Invocation], RootModelClient], *,
+        shared_limits: SharedLimits | None = None, local_limits: RootLimits | None = None,
+        clock: Callable[[], float] = monotonic,
+    ):
+        self.corpus = corpus
+        self.model_factory = model_factory
+        self.shared_limits = shared_limits if shared_limits is not None else SharedLimits()
+        self.local_limits = local_limits if local_limits is not None else RootLimits()
+        self.clock = clock
+
+    def run(
+        self, question: str, *, partitions: tuple[SectionTarget, ...] | None = None,
+        run_id: str | None = None,
+    ) -> ExecutionTrace:
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("Research question must be a non-blank string.")
+        budget = SharedBudget(self.shared_limits, self.clock)
+        if partitions is not None:
+            partitions = tuple(partitions)
+            if not partitions or len(partitions) > self.shared_limits.max_partitions:
+                raise ValueError("Root authorization must fit the partition limit and be nonempty.")
+            self._validate_partitions(partitions)
+        invocation = Invocation(run_id or uuid4().hex, "root", None, 0, question, None, partitions)
+        return self._invoke(invocation, budget, [], budget.deadline)
+
+    def _validate_partitions(self, partitions: tuple[SectionTarget, ...]) -> None:
+        if len(set(partitions)) != len(partitions):
+            raise ValueError("Partition pairs must be unique.")
+        for pair in partitions:
+            self.corpus.get_section(pair.document_id, pair.section_id, limit=1)
+
+    def _invoke(
+        self, invocation: Invocation, budget: SharedBudget, clients: list[RootModelClient],
+        parent_deadline: float,
+    ) -> ExecutionTrace:
+        model = self.model_factory(invocation)
+        bind = getattr(model, "bind_execution_budget", None)
+        if any(model is previous for previous in clients) or not callable(bind):
+            raise ValueError("The factory must return a fresh, budget-aware model client.")
+        bind(budget)
+        clients.append(model)
+        budget.model_sessions += 1
+        session = RecursiveSession(self, invocation, budget, clients, parent_deadline)
+        partitions = invocation.partitions
+        view = self.corpus if partitions is None else ScopedCorpus(self.corpus, partitions)
+        scope = ResearchScope() if partitions is None else ResearchScope(
+            tuple(sorted({pair.document_id for pair in partitions})), partitions,
+        )
+        prompt = invocation.question
+        if invocation.goal is not None:
+            prompt += f"\nAnalysis goal: {invocation.goal}"
+        if partitions is not None:
+            prompt += "\nAuthorized partitions: " + observation_json([vars(pair) for pair in partitions])
+        prompt += (
+            "\nUse delegate_research only for a narrower subproblem. Submit findings via finish_research "
+            "with exact quotes and original chunk IDs. Report uncertainty, conflicts and incomplete analysis. "
+            "Name used_finding_ids when synthesizing delegated evidence. Search misses do not establish absence."
+        )
+        return RootController(view, model, limits=self.local_limits, clock=self.clock).run(
+            prompt, scope=scope, _recursive=session,
+        )
+
+
+class RecursiveSession:
+    def __init__(
+        self, runner: RecursiveResearch, invocation: Invocation, budget: SharedBudget,
+        clients: list[RootModelClient], parent_deadline: float,
+    ):
+        self.runner = runner
+        self.invocation = invocation
+        self.budget = budget
+        self.clients = clients
+        self.parent_deadline = parent_deadline
+        self.direct_ids: set[str] = set()
+        self.delivered_findings: dict[str, Finding] = {}
+        self.findings: tuple[Finding, ...] = ()
+        self.used_finding_ids: tuple[str, ...] = ()
+        self.analysis_status: AnalysisStatus = "incomplete"
+
+    def tool_schema(self) -> dict:
+        return {
+            "name": "delegate_research",
+            "description": (
+                "Investigate a narrower question in a fresh conversation with exact document and section pairs. "
+                f"Current depth {self.invocation.depth}, maximum {self.budget.limits.max_depth}. "
+                "All delegates share the run budget. Returned findings include original excerpts and coverage."
+            ),
+            "input_schema": _Delegate.model_json_schema(),
+        }
+
+    def delegate(self, arguments: dict, deadline: float) -> tuple[DispatchResult, DelegationTrace]:
+        cap = self.runner.local_limits.max_response_bytes
+        validated = None
+        invocation = None
+
+        def reject(code: str, message: str, *, status: Literal["rejected", "failed"] = "rejected"):
+            return (DispatchResult(validated, error_observation(code, message, cap)),
+                    DelegationTrace(status, code, invocation=invocation))
+
+        try:
+            request = _Delegate.model_validate(arguments)
+        except ValidationError as exc:
+            return reject("invalid_arguments", validation_message(exc))
+        validated = request.model_dump(mode="json")
+        pairs = tuple(SectionTarget(p.document_id, p.section_id) for p in request.partitions)
+        parent_pairs = self.invocation.partitions
+        depth = self.invocation.depth + 1
+        try:
+            self.budget.check_child(depth, len(pairs))
+            if parent_pairs is not None and not set(pairs).issubset(parent_pairs):
+                return reject("scope_violation", "Delegate only authorized document and section pairs.")
+            if self.invocation.depth > 0 and set(pairs) == set(parent_pairs or ()):
+                return reject("scope_violation", "A descendant must delegate a strict subset.")
+            self.runner._validate_partitions(pairs)
+            if self.runner.clock() >= deadline:
+                raise BudgetExceeded("deadline")
+            number = self.budget.reserve_child(depth, len(pairs))
+        except BudgetExceeded as exc:
+            return reject(str(exc), "Shared budget does not permit this delegation.")
+        except (KeyError, ValueError):
+            return reject("invalid_partitions", "Use unique canonical document and section pairs.")
+
+        invocation = Invocation(self.invocation.run_id, f"child-{number}", self.invocation.invocation_id,
+                                depth, request.question, request.goal, pairs)
+        try:
+            child = self.runner._invoke(invocation, self.budget, self.clients, deadline)
+        except Exception:
+            return reject("child_execution_error", "Child invocation could not run.", status="failed")
+        successful = child.stop_reason == "finished"
+        complete = (
+            successful and bool(child.findings) and child.analysis_status == "analyzed"
+            and all(p.status == "complete" for p in child.partition_coverage)
+            and all(finding.analysis_status == "analyzed" for finding in child.findings)
+        )
+        status = ("finished" if complete else "incomplete") if successful else "failed"
+        findings = child.findings if successful else ()
+        body = {
+            "ok": successful, "result": {
+                "child_invocation_id": invocation.invocation_id, "status": status,
+                "stop_reason": child.stop_reason, "budget_stop": child.budget_stop,
+                "analysis_status": child.analysis_status, "coverage": child.partition_coverage,
+                "findings": findings,
+            },
+        }
+        if not successful:
+            body["error"] = {"code": "child_not_finished", "message": "Inspect the child stop reason and coverage."}
+        content = observation_json(body)
+        delegation = DelegationTrace(status, invocation=invocation, child=child)
+        if len(content.encode("utf-8")) > cap:
+            delegation.status = "oversized"
+            delegation.error = "response_too_large"
+            content = error_observation(
+                "response_too_large", "Child findings exceeded the cap. Try a smaller delegated task.",
+                cap, max_response_bytes=cap, response_bytes=len(content.encode("utf-8")),
+            )
+            return DispatchResult(validated, content), delegation
+        refs = tuple(dict.fromkeys(item.source for finding in findings for item in finding.evidence))
+        return DispatchResult(validated, content, refs), delegation
+
+    def record_delivery(self, step: StepTrace) -> None:
+        if step.delegation is None:
+            self.direct_ids.update(ref.chunk_id for ref in step.evidence)
+        elif step.delegation.child is not None and step.delegation.status in {"finished", "incomplete"}:
+            findings = step.delegation.child.findings
+            self.delivered_findings.update((finding.finding_id, finding) for finding in findings)
+            step.delegation.delivered_finding_ids = tuple(finding.finding_id for finding in findings)
+
+    def finish(self, action: _FinishAction, coverage: CoverageReport) -> str | None:
+        used = tuple(dict.fromkeys(action.used_finding_ids))
+        if any(finding_id not in self.delivered_findings for finding_id in used):
+            return "Use only delivered finding IDs."
+        used_evidence = [item for finding_id in used for item in self.delivered_findings[finding_id].evidence]
+        selected_ids = {item.source.chunk_id for item in used_evidence}
+        cited = set(action.cited_chunk_ids)
+        if not cited.issubset(self.direct_ids | selected_ids):
+            return "Declare the delivered finding IDs used by delegated citations."
+
+        findings = []
+        for index, draft in enumerate(action.findings, start=1):
+            evidence = []
+            for item in draft.evidence:
+                if item.chunk_id not in self.direct_ids and not any(
+                    item.chunk_id == observed.source.chunk_id and item.quote in observed.quote
+                    for observed in used_evidence
+                ):
+                    return "Findings need text from an observed chunk or a declared delivered excerpt."
+                chunk = self.runner.corpus.get_chunk(item.chunk_id)
+                if item.quote not in chunk.text:
+                    return "Finding quotations must occur verbatim in the original chunk."
+                evidence.append(FindingEvidence(EvidenceRef.from_chunk(chunk), item.quote))
+            source = evidence[0].source
+            target = SectionTarget(source.document_id, source.section_id)
+            if any((item.source.document_id, item.source.section_id) != (target.document_id, target.section_id)
+                   for item in evidence):
+                return "Each finding must cite evidence from one document and section."
+            findings.append(Finding(
+                f"{self.invocation.invocation_id}:finding-{index}", chunk.company_name, draft.claim, tuple(evidence),
+                draft.analysis_status, partition_status(coverage, target), draft.uncertainty, draft.conflict,
+            ))
+        referenced = cited | {item.source.chunk_id for finding in findings for item in finding.evidence}
+        if any(not any(item.source.chunk_id in referenced for item in self.delivered_findings[fid].evidence)
+               for fid in used):
+            return "Each used finding must contribute a chunk to the answer or a new finding."
+        self.findings = tuple(findings)
+        self.used_finding_ids = used
+        self.analysis_status = (action.analysis_status or "incomplete") if referenced else "incomplete"
+        return None
+
+    def trace_fields(self, coverage: CoverageReport) -> dict:
+        partitions = tuple(PartitionCoverage(pair, partition_status(coverage, pair))
+                           for pair in self.invocation.partitions or ())
+        if self.invocation.partitions is None:
+            coverage_status = "unknown"
+        elif all(pair.status == "complete" for pair in partitions):
+            coverage_status = "complete"
+        elif any(pair.status != "missing" for pair in partitions):
+            coverage_status = "partial"
+        else:
+            coverage_status = "missing"
+        return {
+            "invocation": self.invocation,
+            "shared_limits": self.budget.limits.model_dump(mode="json"),
+            "shared_budget": self.budget.snapshot(),
+            "findings": self.findings,
+            "used_finding_ids": self.used_finding_ids,
+            "analysis_status": self.analysis_status,
+            "partition_coverage": partitions,
+            "coverage_status": coverage_status,
+        }

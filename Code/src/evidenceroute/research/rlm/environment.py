@@ -208,18 +208,24 @@ class CorpusEnvironment:
     def read_chunks(
         self, document_id: str, section_id: str | None = None, *,
         offset: int = 0, limit: int = MAX_CHUNK_ROWS,
+        _allowed_sections: frozenset[tuple[str, str]] | None = None,
     ) -> Page[Chunk]:
         """Read whole chunks in processed section order, then by chunk index."""
         _validate_page(offset, limit, MAX_CHUNK_ROWS)
         sections = self._sections[document_id]
         section_ids = sections if section_id is None else (sections[section_id].section_id,)
-        chunks = [chunk for sid in section_ids for chunk in self._section_chunks[document_id, sid]]
+        chunks = [
+            chunk for sid in section_ids
+            if _allowed_sections is None or (document_id, sid) in _allowed_sections
+            for chunk in self._section_chunks[document_id, sid]
+        ]
         page = _page(chunks, offset, limit)
         return Page(tuple(c.model_copy() for c in page.items), page.total, page.next_offset)
 
     def search_chunks(
         self, query: str, *, filters: ChunkFilter | None = None,
         offset: int = 0, limit: int = MAX_CHUNK_ROWS,
+        _allowed_sections: frozenset[tuple[str, str]] | None = None,
     ) -> Page[RetrievalResult]:
         """Rank keyword matches by BM25 score, breaking ties by chunk ID."""
         _validate_page(offset, limit, MAX_CHUNK_ROWS)
@@ -228,7 +234,11 @@ class CorpusEnvironment:
         if not query.strip():
             return Page((), 0, None)
         scores = self._searcher.scores(query, filters)
-        ranked = sorted(scores, key=lambda index: (-scores[index], self._chunks[index].chunk_id))
+        ranked = sorted(
+            (index for index in scores if _allowed_sections is None or
+             (self._chunks[index].document_id, self._chunks[index].section_id) in _allowed_sections),
+            key=lambda index: (-scores[index], self._chunks[index].chunk_id),
+        )
         page = _page(ranked, offset, limit)
         hits = tuple(
             RetrievalResult(chunk=self._chunks[index].model_copy(), score=scores[index])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -19,6 +19,9 @@ from evidenceroute.research.rlm.environment import (
 )
 from evidenceroute.retrieval import ChunkFilter
 from evidenceroute.schemas import Chunk, RetrievalResult
+
+if TYPE_CHECKING:
+    from evidenceroute.research.rlm.scoped import ScopedCorpus
 
 MIN_RESPONSE_BYTES = 128
 Identifier = Annotated[str, Field(min_length=1, max_length=160)]
@@ -163,7 +166,7 @@ class DispatchResult:
 class CorpusToolDispatcher:
     """Validate tool requests and serialize the exact model-facing observation."""
 
-    def __init__(self, corpus: CorpusEnvironment, *, max_response_bytes: int):
+    def __init__(self, corpus: CorpusEnvironment | ScopedCorpus, *, max_response_bytes: int):
         if type(max_response_bytes) is not int or max_response_bytes < MIN_RESPONSE_BYTES:
             raise ValueError(f"max_response_bytes must be at least {MIN_RESPONSE_BYTES}")
         self._corpus = corpus

@@ -7,12 +7,14 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from time import monotonic
-from typing import Annotated, Literal, Protocol
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 from pydantic import ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
+from evidenceroute.research.rlm.budget import BudgetExceeded, BudgetUsage, SharedBudget
 from evidenceroute.research.rlm.coverage import CoverageReport, CoverageTracker, ResearchScope
 from evidenceroute.research.rlm.environment import CorpusEnvironment
+from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingDraft, PartitionCoverage
 from evidenceroute.research.rlm.tools import (
     MIN_RESPONSE_BYTES,
     CorpusToolDispatcher,
@@ -25,6 +27,10 @@ from evidenceroute.research.rlm.tools import (
     validation_message,
 )
 
+if TYPE_CHECKING:
+    from evidenceroute.research.rlm.recursive import DelegationTrace, Invocation, RecursiveSession
+    from evidenceroute.research.rlm.scoped import ScopedCorpus
+
 
 class _ToolAction(StrictInput):
     type: Literal["tool"]
@@ -36,6 +42,9 @@ class _FinishAction(StrictInput):
     type: Literal["finish"]
     answer: str = Field(min_length=1, max_length=12_000)
     cited_chunk_ids: list[Identifier] = Field(default_factory=list, max_length=50)
+    findings: list[FindingDraft] = Field(default_factory=list, max_length=8)
+    used_finding_ids: list[Identifier] = Field(default_factory=list, max_length=32)
+    analysis_status: AnalysisStatus | None = None
 
 
 _ACTION = TypeAdapter(Annotated[_ToolAction | _FinishAction, Field(discriminator="type")])
@@ -46,11 +55,15 @@ def action_schema() -> dict:
     return _ACTION.json_schema()
 
 
-def finish_input_schema() -> dict:
+def finish_input_schema(*, recursive: bool = False) -> dict:
     """Describe a finish payload whose action type is supplied by the adapter."""
     schema = _FinishAction.model_json_schema()
     del schema["properties"]["type"]
     schema["required"].remove("type")
+    if not recursive:
+        for field in ("findings", "used_finding_ids", "analysis_status"):
+            del schema["properties"][field]
+        schema.pop("$defs", None)
     return schema
 
 
@@ -69,6 +82,13 @@ class ScriptedModelClient:
     def __init__(self, decisions: Iterable[JsonValue]):
         self._decisions = deque(decisions)
         self.observations: list[str | None] = []
+        self._budget_bound = False
+
+    def bind_execution_budget(self, budget: SharedBudget) -> None:
+        """Scripted decisions do not use a provider transport."""
+        if self._budget_bound or self.observations:
+            raise ValueError("Create a fresh scripted client for each invocation.")
+        self._budget_bound = True
 
     def next_action(
         self, question: str, tools: list[dict], observation: str | None, *,
@@ -89,7 +109,8 @@ class RootLimits(StrictInput):
     deadline_seconds: float = Field(default=30.0, gt=0)
 
 
-StopReason = Literal["finished", "iteration_limit", "tool_call_limit", "deadline", "model_error"]
+StopReason = Literal["finished", "iteration_limit", "tool_call_limit", "deadline", "model_error",
+                     "budget_exhausted"]
 
 
 @dataclass(frozen=True)
@@ -121,6 +142,7 @@ class StepTrace:
     search_discovered: tuple[EvidenceRef, ...] = ()
     error: dict | None = None
     model_attempts: tuple[ModelAttempt, ...] = ()
+    delegation: DelegationTrace | None = None
 
     def record(self, result: DispatchResult) -> None:
         self.validated_arguments = result.arguments
@@ -140,6 +162,15 @@ class ExecutionTrace:
     coverage: CoverageReport
     answer: str | None
     cited_chunk_ids: tuple[str, ...]
+    invocation: Invocation | None = None
+    shared_limits: dict[str, int | float] | None = None
+    shared_budget: BudgetUsage | None = None
+    budget_stop: str | None = None
+    findings: tuple[Finding, ...] = ()
+    used_finding_ids: tuple[str, ...] = ()
+    analysis_status: AnalysisStatus | None = None
+    partition_coverage: tuple[PartitionCoverage, ...] = ()
+    coverage_status: Literal["unknown", "complete", "partial", "missing"] | None = None
 
     @property
     def model_attempts(self) -> tuple[ModelAttempt, ...]:
@@ -150,7 +181,7 @@ class RootController:
     """Run a bounded sequence of structured decisions and corpus observations."""
 
     def __init__(
-        self, corpus: CorpusEnvironment, model: RootModelClient, *,
+        self, corpus: CorpusEnvironment | ScopedCorpus, model: RootModelClient, *,
         limits: RootLimits | None = None, clock: Callable[[], float] = monotonic,
     ):
         self._corpus = corpus
@@ -159,11 +190,14 @@ class RootController:
         self._clock = clock
         self._dispatcher = CorpusToolDispatcher(corpus, max_response_bytes=self._limits.max_response_bytes)
 
-    def run(self, question: str, *, scope: ResearchScope | None = None) -> ExecutionTrace:
+    def run(self, question: str, *, scope: ResearchScope | None = None,
+            _recursive: RecursiveSession | None = None) -> ExecutionTrace:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Research question must be a non-blank string.")
         start = self._clock()
         deadline = start + self._limits.deadline_seconds
+        if _recursive is not None:
+            deadline = min(deadline, _recursive.parent_deadline, _recursive.budget.deadline)
         scope = scope if scope is not None else ResearchScope()
         scope.validate(self._corpus)
         coverage = CoverageTracker(scope)
@@ -173,19 +207,34 @@ class RootController:
         answer = None
         citations: tuple[str, ...] = ()
         stop: StopReason = "iteration_limit"
+        budget_stop = None
+        tools = tool_schemas(max_response_bytes=self._limits.max_response_bytes)
+        if _recursive is not None:
+            tools.append(_recursive.tool_schema())
 
         for iteration in range(1, self._limits.max_iterations + 1):
             model_start = self._clock()
             if model_start >= deadline:
                 stop = "deadline"
                 break
+            if _recursive is not None:
+                try:
+                    _recursive.budget.start_decision()
+                except BudgetExceeded as exc:
+                    budget_stop = str(exc)
+                    stop = "deadline" if budget_stop == "deadline" else "budget_exhausted"
+                    break
             step = StepTrace(iteration)
             steps.append(step)
             try:
                 raw = self._model.next_action(
-                    question, tool_schemas(max_response_bytes=self._limits.max_response_bytes),
-                    pending, remaining_seconds=deadline - model_start,
+                    question, tools, pending, remaining_seconds=deadline - model_start,
                 )
+            except BudgetExceeded as exc:
+                budget_stop = str(exc)
+                stop = "deadline" if budget_stop == "deadline" else "budget_exhausted"
+                step.error = {"code": budget_stop}
+                break
             except Exception as exc:
                 step.error = {"code": "model_error", "message": type(exc).__name__}
                 stop = "deadline" if self._clock() >= deadline else "model_error"
@@ -197,6 +246,8 @@ class RootController:
                 step.model_attempts = getattr(self._model, "last_attempts", ())
                 if pending is not None and getattr(self._model, "last_observation_delivered", True):
                     self._deliver(steps[-2], coverage)
+                    if _recursive is not None:
+                        _recursive.record_delivery(steps[-2])
 
             try:
                 step.requested_action = json.loads(json.dumps(raw, allow_nan=False))
@@ -220,6 +271,14 @@ class RootController:
                 if not visible.issuperset(action.cited_chunk_ids):
                     pending = self._feedback(step, "unseen_citation", "Cite only chunks supplied to the model.")
                     continue
+                if _recursive is not None:
+                    failure = _recursive.finish(action, coverage.report())
+                    if failure is not None:
+                        pending = self._feedback(step, "invalid_findings", failure)
+                        continue
+                elif action.findings or action.used_finding_ids or action.analysis_status is not None:
+                    pending = self._feedback(step, "invalid_action", "Recursive fields require a research session.")
+                    continue
                 answer = action.answer
                 citations = tuple(action.cited_chunk_ids)
                 stop = "finished"
@@ -232,7 +291,16 @@ class RootController:
                 break
             calls += 1
             tool_start = self._clock()
-            result = self._dispatcher.dispatch(action.name, action.arguments)
+            if _recursive is not None and action.name == "delegate_research":
+                result, step.delegation = _recursive.delegate(action.arguments, deadline)
+            else:
+                try:
+                    if _recursive is not None:
+                        _recursive.budget.start_corpus_attempt()
+                except BudgetExceeded as exc:
+                    pending = self._feedback(step, str(exc), "Shared corpus work budget exhausted.")
+                    continue
+                result = self._dispatcher.dispatch(action.name, action.arguments)
             step.tool_seconds = self._clock() - tool_start
             step.record(result)
             coverage.record_search(result.search_discovered)
@@ -241,8 +309,10 @@ class RootController:
                 stop = "deadline"
                 break
 
+        report = coverage.report()
+        metadata = _recursive.trace_fields(report) if _recursive is not None else {}
         return ExecutionTrace(question, tuple(steps), calls, self._clock() - start,
-                              stop, coverage.report(), answer, citations)
+                              stop, report, answer, citations, budget_stop=budget_stop, **metadata)
 
     def _feedback(self, step: StepTrace, code: str, message: str) -> str:
         content = error_observation(code, message, self._limits.max_response_bytes)

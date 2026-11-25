@@ -76,7 +76,11 @@ class BedrockConverseTransport:
             )) as client:
                 return client.converse(**payload)
         except aws_errors.ClientError as exc:
-            raise _client_error(exc) from None
+            error = _client_error(exc)
+            usage = exc.response.get("usage")
+            if isinstance(usage, dict):
+                error.usage = usage
+            raise error from None
         except (aws_errors.NoCredentialsError, aws_errors.PartialCredentialsError):
             raise ProviderTransportError("aws_missing_credentials") from None
         except (aws_errors.CredentialRetrievalError, aws_errors.SSOError, aws_errors.TokenRetrievalError):

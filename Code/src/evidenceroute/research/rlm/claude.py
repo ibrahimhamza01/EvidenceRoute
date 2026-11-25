@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from evidenceroute.research.rlm.budget import SharedBudget
 from evidenceroute.research.rlm.controller import ModelAttempt, finish_input_schema
 
 _FINISH = "finish_research"
@@ -74,10 +75,12 @@ class ClaudeModelError(RuntimeError):
 class ProviderTransportError(ClaudeModelError):
     """An already-sanitized transport failure and its retry policy."""
 
-    def __init__(self, code: str, *, retryable: bool = False, retry_after: float | None = None):
+    def __init__(self, code: str, *, retryable: bool = False, retry_after: float | None = None,
+                 usage: dict | None = None):
         super().__init__(code)
         self.retryable = retryable
         self.retry_after = retry_after
+        self.usage = usage
 
 
 class MessagesTransportError(ProviderTransportError):
@@ -184,6 +187,12 @@ class ClaudeRootClient:
         self._used_ids: set[str] = set()
         self.last_attempts: tuple[ModelAttempt, ...] = ()
         self.last_observation_delivered = False
+        self._budget: SharedBudget | None = None
+
+    def bind_execution_budget(self, budget: SharedBudget) -> None:
+        if self._budget is not None:
+            raise ValueError("Create a fresh provider client for each invocation.")
+        self._budget = budget
 
     @classmethod
     def from_env(cls) -> ClaudeRootClient:
@@ -205,7 +214,7 @@ class ClaudeRootClient:
         tools = [*tools, {
             "name": _FINISH,
             "description": "Submit the answer and any chunk IDs supplied by the corpus tools.",
-            "input_schema": finish_input_schema(),
+            "input_schema": finish_input_schema(recursive=self._budget is not None),
         }]
         response = self._request(self._payload(tools), deadline)
         assistant = self._assistant_message(response)
@@ -267,26 +276,36 @@ class ClaudeRootClient:
             remaining = deadline - started
             if remaining <= 0:
                 raise ClaudeModelError("deadline")
+            if self._budget is not None:
+                self._budget.start_provider_attempt()
             try:
                 response = self._transport.send(
                     deepcopy(payload), timeout_seconds=min(self.config.timeout_seconds, remaining),
                 )
             except ProviderTransportError as exc:
-                self._record_error(started, str(exc))
+                self._record_error(started, str(exc), exc.usage)
                 delay = max(0.25 * 2**attempt, exc.retry_after or 0.0)
                 if not exc.retryable or attempt == self.config.max_retries or delay >= deadline - self._clock():
                     raise ClaudeModelError(str(exc)) from None
+                if self._budget is not None:
+                    self._budget.check_provider_attempt()
                 self._wait(delay)
             except Exception:
                 self._record_error(started, "transport")
                 raise ClaudeModelError("transport") from None
             else:
-                self.last_attempts += (self._usage_attempt(self._clock() - started, response),)
+                self._record_attempt(self._usage_attempt(self._clock() - started, response))
                 return response
         raise AssertionError("Configured attempts exhausted without a result")
 
-    def _record_error(self, started: float, code: str) -> None:
-        self.last_attempts += (ModelAttempt(self.config.model, self._clock() - started, error=code),)
+    def _record_error(self, started: float, code: str, usage: dict | None = None) -> None:
+        attempt = self._usage_attempt(self._clock() - started, {"usage": usage})
+        self._record_attempt(replace(attempt, error=code))
+
+    def _record_attempt(self, attempt: ModelAttempt) -> None:
+        self.last_attempts += (attempt,)
+        if self._budget is not None:
+            self._budget.record_provider_usage(attempt)
 
     def _usage_attempt(self, latency: float, response: dict) -> ModelAttempt:
         return _attempt(self.config.model, latency, response)
