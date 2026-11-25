@@ -11,6 +11,16 @@
 
 The caller can supply required filing and section IDs through `ResearchScope`. An unspecified requirement remains unknown.
 
+### Research scope planning
+
+The interpreter identifies companies, fiscal years, section IDs, the topic and objective, and whether the question requires comprehensive review. It marks inferred requirements and explains its assumptions or uncertainty. Invalid or incomplete structured output raises an interpretation error. The offline interpreter is injected, and the host preserves the original question. A future provider-backed interpreter must charge attempts and reported tokens to the same budget and deadline as execution.
+
+Python pages through the filing and section metadata without search. Company selectors match a ticker first, then an exact name recorded in the manifest, ignoring case and extra whitespace. Matched aliases collapse to their canonical ticker. Targets are unique and sorted by ticker, fiscal year, and section ID. Unknown companies, ambiguous matches, and unavailable filings or sections remain visible as unresolved company/year/section slots in the required count.
+
+Each company group keeps its resolved fiscal years and the original question together. The [live semantic review](#reading-the-report) shows why that matters. Independently choosing excerpts for each year can make different topics look like a change in disclosure. A shared group lets the analyst check the same risk in each filing. Even matched excerpts need adequate coverage before making an absence claim.
+
+The plan stays host-side. The admission check tests whether one child per nonempty group fits the shared depth, delegation, and pair-assignment limits. It leaves the plan unchanged. The runner can already take the pairs for a selected group or bounded slice through `partitions=`. A future scheduler can keep the full plan as the denominator and expose counts and paged group IDs to the root, resolving each ID to authorized pairs before delegation. Provider and local limits still apply at execution. Inventory resolution does not measure evidence coverage. Research-wide roll-up remains pending because pagination offsets from different scoped views can refer to different underlying items and cannot be merged directly.
+
 ### Bounded recursive execution
 
 `RecursiveResearch` opts into recursive execution. Its factory creates a fresh budget-aware model client per invocation, and `RootController` handles each conversation. The model supplies a question, a goal, and a nonempty set of unique canonical document/section pairs to `delegate_research`. The root can assign all its authorized pairs to a fresh child to investigate a narrower question over the same evidence. With no explicit authorization, it can select any valid canonical pairs. Below the root, every successful delegation must remove at least one pair. The scope therefore shrinks along each branch, and a singleton cannot be subdivided under the current pair representation.
@@ -98,6 +108,7 @@ Direct Anthropic Messages remains available through `--provider anthropic --live
 | RLM-11 · Carry original excerpts with findings | Validate source quotes against accessible chunks, track generated and delivered findings separately, and require declared finding use for delegated citations. Preserve child coverage, failures and conflict notes. | Sending whole child histories would expose unrelated context and use more tokens. Excerpts limit what parents can quote without fetching more evidence. Declared use is a model report and does not verify the claim. |
 | RLM-12 · Reserve provider slots for finalization | Hold provider capacity for each configured child ahead of admission, and protect finish-only slots for each invocation. Charge every transport attempt, including retries, to its active phase and the shared cap. | Prompting alone leaves the last slot spendable on retrieval. Fixed shares isolate siblings but may leave capacity unused for children that never launch. Child slots left over at exit return to root investigation. |
 | RLM-13 · Constrain and size protected finish requests | Use a finish-specific prompt and output cap. Allow native named tool choice where supported and keep runtime validation in both modes. After a truncated investigation reply, reuse the last valid history for protected finalization. | The course Sonnet 4.5 profile accepted named choice on a protected finish that used 332 output tokens. The need for the higher cap remains untested. Truncation recovery is offline-tested and ends investigation early to preserve capacity for synthesis. |
+| RLM-14 · Keep required scope independent of execution | Enumerate required slots from metadata before applying limits. Group years by company and retain unresolved slots. | Top-K retrieval could skip entire companies. Trimming to the budget would shrink the coverage denominator. One run may need to take a bounded slice, with its results still measured against the original plan. |
 
 See the [Converse tool contract](https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use-client-side.html) and [Boto3 request configuration](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html) for wire and timeout details.
 
@@ -240,7 +251,17 @@ python -m pytest -q Code/tests/test_retrieval_bm25.py Code/tests/test_retrieval_
   Code/tests/test_rag_corpus.py Code/tests/test_corpus_regression.py::test_exported_canonical_corpus_integrity
 ```
 
-Automatic corpus-wide scope planning, exhaustive coverage roll-up, durable finding storage, systematic conflict resolution, semantic claim verification, and corpus-wide evaluation remain pending.
+### Corpus-wide planning verification
+
+```bash
+PYTHONPATH=Code/src python Code/examples/demo_rlm_plan.py --max-depth 1 --max-delegations 8 --max-partitions 16
+```
+
+The [issue #16 question](https://github.com/ibrahimhamza01/EvidenceRoute/issues/16) asks which companies introduced an AI-related infrastructure risk in FY2024 that was absent in FY2023. The scripted interpretation keeps those years and infers all corpus companies, Item 1A, and comprehensive review. The local snapshot contains 25 companies and 75 filings. The planner resolved **50 of 50** required Item 1A targets in **25 groups**, with **zero missing requirements**. The example limits of 8 delegations and 16 pair assignments cannot admit the full plan in one run. The demo made zero provider attempts and assessed no evidence.
+
+`python -m pytest -q Code/tests/test_rlm_*.py` passed with **159 passed, 1 warning in 3.39s**. The related retrieval, provenance, and canonical integrity regressions recorded **40 passed, 1 warning in 18.59s** using the commands above. Both warnings were the existing AnyIO pytest deprecation. The existing scripted recursive demo also exited successfully with two original citations and zero provider attempts.
+
+Corpus-wide execution scheduling, exhaustive coverage roll-up, durable finding storage, systematic conflict resolution, semantic claim verification, and corpus-wide evaluation remain pending.
 
 ## Bounded live recursive experiment · Four observed runs
 
