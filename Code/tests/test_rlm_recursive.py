@@ -17,7 +17,10 @@ from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy
 from evidenceroute.research.rlm.claude import ClaudeConfig, ClaudeRootClient, ProviderTransportError
 from evidenceroute.research.rlm.controller import RootLimits, ScriptedModelClient
 from evidenceroute.research.rlm.coverage import SectionTarget
+from evidenceroute.research.rlm.planned_research import execute_research_plan
+from evidenceroute.research.rlm.planning import interpret_intent, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
+from evidenceroute.research.rlm.research_coverage import aggregate_research_coverage
 from evidenceroute.schemas import Filing, Section
 
 RISK = "item_1a"
@@ -75,6 +78,162 @@ def finish(*chunk_ids, findings=(), used=(), status="analyzed"):
 def finding(chunk, *, quote=QUOTE, claim="Supply risk discussed.", status="analyzed", **notes):
     return {"claim": claim, "evidence": [{"chunk_id": chunk.chunk_id, "quote": quote}],
             "analysis_status": status, **notes}
+
+
+def _company_plan(corpus, years=(2023, 2024), sections=(RISK,)):
+    intent = interpret_intent("Compare supply risks.", lambda *_: {
+        "company_selection": "all", "fiscal_years": years, "section_ids": sections,
+        "objective": "year_over_year" if len(years) > 1 else "review", "topic": "supply risks",
+        "comprehensive": True, "inferred_fields": [],
+    })
+    return resolve_research_plan(intent, corpus)
+
+
+def test_research_coverage_deduplicates_overlapping_reads_and_keeps_citation_boundaries(snapshot):
+    corpus, (old, new, _) = snapshot
+    plan = _company_plan(corpus, sections=(BUSINESS, RISK))
+    old_risk, new_risk, new_business = SectionTarget(old, RISK), SectionTarget(new, RISK), SectionTarget(new, BUSINESS)
+    risk, unread = corpus.read_chunks(new, RISK).items
+    business = corpus.read_chunks(new, BUSINESS).items
+    cutoff = 25
+
+    class FailWithoutAck(ScriptedModelClient):
+        def next_action(self, *args, **kwargs):
+            self.last_observation_delivered = bool(self._decisions)
+            return super().next_action(*args, **kwargs)
+
+    actions = {
+        "root": [delegate(old_risk, new_risk), delegate(new_business, new_risk),
+                 finish(unread.chunk_id), finish(business[0].chunk_id),
+                 finish(risk.chunk_id, used=["child-1:finding-1"], status="incomplete")],
+        "child-1": [tool("read_chunks", document_id=new, limit=1), tool("get_chunk", chunk_id=risk.chunk_id),
+                    tool("get_section", document_id=new, section_id=RISK, limit=cutoff),
+                    tool("search_chunks", query="unmatchableterm"),
+                    finish(findings=[finding(risk, status="conflicting", conflict="Comparison inconclusive.")])],
+        "child-2": [tool("read_chunks", document_id=new, limit=1),
+                    tool("read_chunks", document_id=new, offset=len(business), limit=1),
+                    tool("get_section", document_id=new, section_id=RISK, offset=cutoff - 5),
+                    tool("get_section", document_id=new, section_id=BUSINESS, offset=cutoff),
+                    tool("read_chunks", document_id=new, section_id=BUSINESS, offset=1, limit=1),
+                    tool("search_chunks", query="details", filters={"section_ids": [RISK]}, limit=1)],
+    }
+
+    def factory(invocation):
+        model = FailWithoutAck if invocation.invocation_id == "child-2" else ScriptedModelClient
+        return model(actions[invocation.invocation_id])
+
+    trace = RecursiveResearch(corpus, factory).run("Collect excerpts.", partitions=(old_risk, new_risk, new_business))
+    report = aggregate_research_coverage(corpus, plan, trace)
+    by_pair = {target.pair: target for target in report.targets}
+    assert report.required_target_count == 8 and len(report.missing_requirements) == 2
+    assert by_pair[old_risk].status == "none" and by_pair[old_risk].assigned_child_ids == ("child-1",)
+    seen = by_pair[new_risk]
+    assert seen.assigned_child_ids == ("child-1", "child-2")
+    assert seen.whole_chunk_ids == (risk.chunk_id,) and unread.chunk_id in seen.discovered_chunk_ids
+    assert seen.chunk_inventory_count == 2 and not seen.chunk_inventory_complete
+    assert seen.character_ranges == ((0, seen.section_character_count),) and seen.section_text_complete
+    assert seen.status == "complete" and seen.failed_invocation_ids == ("child-2",)
+    assert seen.delegated_excerpt_chunk_ids == (risk.chunk_id,)
+    assert seen.generated_finding_ids == seen.acknowledged_finding_ids == seen.used_finding_ids == ("child-1:finding-1",)
+    seen_business = by_pair[new_business]
+    assert seen_business.chunk_inventory_complete and not seen_business.section_text_complete
+    assert set(seen_business.whole_chunk_ids) == {chunk.chunk_id for chunk in business}
+    assert seen_business.character_ranges == ((cutoff, seen_business.section_character_count),)
+    root, first, failed = report.invocations
+    assert root.whole_chunk_ids == () and root.cited_chunk_ids == (risk.chunk_id,)
+    assert first.findings[0].analysis_status == "conflicting"
+    assert [(w.pair, w.start, w.end) for w in first.section_windows] == [(new_risk, 0, cutoff)]
+    assert failed.stop_reason == "model_error" and failed.findings_acknowledged_by_parent == ()
+    assert [step.error["code"] for step in trace.steps[2:4]] == ["unseen_citation", "unseen_citation"]
+
+
+def test_research_coverage_counts_only_deliverable_batch_items(snapshot):
+    corpus, (_, new, _) = snapshot
+    plan = _company_plan(corpus, years=(2024,))
+    pair = SectionTarget(new, RISK)
+    chunks = corpus.read_chunks(new, RISK).items
+    batch = {"type": "tool_batch", "calls": [
+        {"tool_use_id": f"read-{i}", "name": "get_chunk", "arguments": {"chunk_id": chunk.chunk_id}}
+        for i, chunk in enumerate(chunks)
+    ]}
+    trace = RecursiveResearch(
+        corpus, lambda _: ScriptedModelClient([batch, finish()]), local_limits=RootLimits(max_response_bytes=750),
+    ).run("Check two chunks.", partitions=(pair,))
+    first, second = trace.steps[0].batch_operations
+    assert first.observation_sent and second.observation_sent
+    assert not first.delivery_error and second.delivery_error == "batch_observation_limit"
+    seen = next(t for t in aggregate_research_coverage(corpus, plan, trace).targets if t.pair == pair)
+    assert seen.whole_chunk_ids == (chunks[0].chunk_id,) and seen.status == "partial"
+
+
+@pytest.mark.parametrize("second_status", ["finished", "undelegated", "failed"])
+def test_execute_planned_groups_preserves_scope_and_original_citations(snapshot, second_status):
+    corpus, (_, new, other) = snapshot
+    plan = _company_plan(corpus, years=(2024,), sections=(RISK, BUSINESS))
+    first, second = plan.groups
+    chunks = [corpus.read_chunks(doc, RISK).items[0] for doc in (new, other)]
+    count = 2 if second_status == "finished" else 1
+    selected = chunks[:count]
+    called = []
+
+    def factory(invocation):
+        called.append(invocation)
+        if invocation.depth == 0:
+            return ScriptedModelClient([
+                delegate(first.targets[0]),  # A host-side guard rejects splitting an admitted group.
+                delegate(*first.targets),
+                *([delegate(*second.targets)] if second_status != "undelegated" else []),
+                finish(*(chunk.chunk_id for chunk in selected),
+                       used=[f"child-{i}:finding-1" for i in range(1, count + 1)]),
+            ])
+        chunk = chunks[invocation.partitions == second.targets]
+        last = (tool("search_chunks", query="unmatchableterm")
+                if invocation.partitions == second.targets and second_status == "failed"
+                else finish(findings=[finding(chunk)]))
+        return ScriptedModelClient([tool("get_chunk", chunk_id=chunk.chunk_id), last])
+
+    runner = RecursiveResearch(corpus, factory, shared_limits=SharedLimits(max_delegations=2, max_partitions=4),
+                               finalization=FinalizationPolicy())
+    result = execute_research_plan(plan, runner)
+    assert result.plan is plan and result.coverage.required_target_count == 4
+    assert result.answer_status == "incomplete" and result.trace.stop_reason == "finished"
+    assert set(called[0].partitions) == set(plan.resolved_targets)
+    assert result.coverage.rejected_delegations == (("root", "group_violation"),)
+    assert result.groups[0].findings_acknowledged_by_root == ("child-1:finding-1",)
+    second_outcome = result.groups[1]
+    assert second_outcome.pending_reason is None
+    assert second_outcome.root_delegate_ids == (() if second_status == "undelegated" else ("child-2",))
+    assert second_outcome.access_status == ("none" if second_status == "undelegated" else "partial")
+    assert second_outcome.failed_invocation_ids == (("child-2",) if second_status == "failed" else ())
+    assert {ref.chunk_id: ref.source_url for ref in result.citations} == {c.chunk_id: c.source_url for c in selected}
+    assert result.trace.shared_budget.partition_assignments == (2 if second_status == "undelegated" else 4)
+
+
+def test_plan_admission_is_deterministic_and_reports_pending_and_missing(snapshot):
+    corpus, _ = snapshot
+    plan = _company_plan(corpus, years=(2024,), sections=(RISK, BUSINESS))
+    runner = RecursiveResearch(corpus, lambda _: ScriptedModelClient([finish()]),
+                               shared_limits=SharedLimits(max_delegations=2, max_partitions=2))
+    result = execute_research_plan(plan, runner)
+    assert [group.pending_reason for group in result.groups] == [None, "partition_limit"]
+    assert result.trace.invocation.partitions == plan.groups[0].targets
+    assert result.coverage.required_target_count == 4
+    assert sum(not target.admitted for target in result.coverage.targets) == 2
+
+    result = execute_research_plan(_company_plan(corpus), runner)
+    assert result.groups[1].pending_reason == "unresolved_requirements"
+    assert result.coverage.missing_requirements[0].reason == "missing_filing"
+    assert result.coverage.required_target_count == 4
+
+
+def test_plan_preflight_rejects_infeasible_provider_reservations_before_any_model(snapshot):
+    corpus, _ = snapshot
+    plan = _company_plan(corpus)
+    runner = RecursiveResearch(corpus, lambda _: pytest.fail("No model should start"),
+                               shared_limits=SharedLimits(max_delegations=2, max_provider_attempts=9),
+                               finalization=FinalizationPolicy())
+    with pytest.raises(ValueError, match="allocation must leave"):
+        execute_research_plan(plan, runner)
 
 
 def research(corpus, scripts, **options):
@@ -258,6 +417,8 @@ def test_section_text_and_unseen_quotes_cannot_grant_chunk_attribution(snapshot)
     ]})
     trace = runner.run("Check a risk.")
     assert trace.steps[1].error["code"] == trace.steps[3].error["code"] == "invalid_findings"
+    assert trace.steps[1].error["message"].startswith("Finding 1, evidence 1: use an observed chunk")
+    assert chunk.chunk_id not in trace.steps[1].error["message"]
     assert trace.stop_reason == "finished"
     assert trace.findings[0].evidence[0].quote == QUOTE
 
@@ -274,6 +435,10 @@ def test_parent_cannot_expand_a_delivered_quote_using_canonical_lookup(snapshot)
     })
     trace = runner.run("Check a risk.")
     assert trace.steps[1].error["code"] == "invalid_findings"
+    assert trace.steps[1].error["message"] == (
+        f"Finding 1, evidence 1 (chunk {chunk.chunk_id}): copy a contiguous quote exactly from "
+        "the delivered excerpt or omit it."
+    )
     assert trace.findings[0].evidence[0].quote == "Supply interruptions"
 
 
@@ -601,6 +766,136 @@ def converse_batch(*actions):
         for index, action in enumerate(actions[1:], 2)
     )
     return reply
+
+
+@pytest.fixture(scope="module")
+def planned_corpus():
+    try:
+        return CorpusEnvironment()
+    except FileNotFoundError:
+        pytest.skip("Canonical local corpus unavailable")
+
+
+@pytest.mark.parametrize("missing_year", [False, True])
+def test_live_planned_research_stubbed_bedrock(planned_corpus, monkeypatch, capsys, missing_year):
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    monkeypatch.syspath_prepend(str(examples))
+    monkeypatch.setattr("evidenceroute.research.rlm.CorpusEnvironment", lambda: planned_corpus)
+    monkeypatch.setenv("CLAUDE_MAX_OUTPUT_TOKENS", "1024")
+    demo = runpy.run_path(str(examples / "demo_rlm_planned_research.py"))
+    pairs = [tuple(SectionTarget(planned_corpus.list_filings(ticker=ticker, fiscal_year=year).items[0].document_id, RISK)
+                   for year in (2023, 2024)) for ticker in ("AAPL", "AMD")]
+    chunks = [[planned_corpus.read_chunks(pair.document_id, pair.section_id, limit=1).items[0] for pair in group]
+              for group in pairs]
+    findings = [[finding(chunk, quote=chunk.text[:80].strip(), status="incomplete") for chunk in group]
+                for group in chunks]
+    selected = [chunk.chunk_id for group in chunks for chunk in group]
+    used = [f"child-{i}:finding-{j}" for i in (1, 2) for j in (1, 2)]
+    if missing_year:
+        findings[1].pop()
+        selected.pop()
+        used.pop()
+    sessions = stub_bedrock(monkeypatch, [
+        [converse_batch(*(delegate(*group) for group in pairs)),
+         converse_reply(finish(*selected, used=used, status="incomplete"), "root-finish")],
+        *[[converse_batch(*(tool("get_chunk", chunk_id=chunk.chunk_id) for chunk in group)),
+           converse_reply(finish(findings=items, status="incomplete"), "child-finish")]
+          for group, items in zip(chunks, findings)],
+    ])
+
+    assert demo["main"](["--live", "--trace", "--max-tool-calls", "2"]) == int(missing_year)
+    report = json.loads(capsys.readouterr().out)
+    assert report["intent_interpretation"] == "scripted" and not report["semantic_claims_verified"]
+    assert report["structural_status"] == ("incomplete" if missing_year else "success")
+    assert report["structural_criteria"]["companies"]["AMD"]["both_years_acknowledged"] is not missing_year
+    assert report["structural_criteria"]["companies"]["AMD"]["both_years_cited_from_declared_used_findings"] is not missing_year
+    assert report["stop_reason"] == "finished" and report["answer_status"] == "incomplete"
+    assert (report["requested_companies"], report["required_targets"], len(report["admitted_scope"])) == (25, 50, 4)
+    assert report["access_counts_by_target"] == {"none": 46, "partial": 4}
+    assert report["unique_whole_chunks_delivered"] == 4 and report["section_characters_delivered"] == 0
+    assert report["trace"]["declared_used_finding_ids"] == used
+    assert {ref["chunk_id"] for ref in report["original_citations"]} == set(selected)
+    assert report["provider_usage"]["provider_attempts"] == report["shared_usage"]["provider_attempts"] == 6
+    assert report["provider_usage"]["tokens"]["input_tokens"]["reported_total"] == 66
+    assert report["provider_usage"]["reported_provider_latency_seconds_sum"] == 1.5
+    assert report["provider"]["max_retries"] == report["provider_usage"]["provider_retries"] == 0
+    assert report["limits"]["shared"] == {
+        "max_depth": 1, "max_delegations": 2, "max_provider_attempts": 18, "max_corpus_attempts": 12,
+        "max_partitions": 4, "max_reported_tokens": 100_000, "deadline_seconds": 180.0,
+    }
+    assert report["limits"]["local"]["max_iterations"] == 6
+    assert report["limits"]["local"]["deadline_seconds"] == 180
+    assert report["limits"]["local"]["max_response_bytes"] == 6_000
+    assert report["limits"]["finalization"]["child_provider_attempts"] == 6
+    assert report["limits"]["finalization"]["finalization_attempts"] == 2
+    assert [result["toolResult"]["toolUseId"] for result in sessions[0].requests[1]["messages"][-1]["content"]] == [
+        "batch-1", "batch-2",
+    ]
+    for session in sessions:
+        initial, final = session.requests
+        assert initial["toolConfig"]["toolChoice"] == {"auto": {}}
+        assert final["toolConfig"]["toolChoice"] == {"tool": {"name": "finish_research"}}
+        assert (initial["inferenceConfig"]["maxTokens"], final["inferenceConfig"]["maxTokens"]) == (1024, 2048)
+    for session in sessions[1:]:
+        prompt = session.requests[0]["messages"][0]["content"][0]["text"]
+        assert "Choose your own focused queries" in prompt and "A search miss does not show" in prompt
+        assert "Do not insert ellipses" in prompt
+        assert "4 provider attempt(s) for this invocation" in session.requests[0]["system"][0]["text"]
+
+
+@pytest.mark.parametrize(("bad_quote", "corrected"), [
+    ("Supply interruptions...operations.", True),
+    ("Supply interruptions affect Operations.", True),
+    (" Supply interruptions affect operations.", True),
+    ("Supply interruptions affect operations!", False),
+])
+def test_protected_finish_quote_feedback_and_bounded_correction(snapshot, monkeypatch, bad_quote, corrected):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (_, new, _) = snapshot
+    pair = SectionTarget(new, RISK)
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    invalid = finding(chunk)
+    invalid["evidence"].append({"chunk_id": chunk.chunk_id, "quote": bad_quote})
+    bad_finish = finish(chunk.chunk_id, findings=[finding(chunk), invalid], status="incomplete")
+    good_finish = finish(chunk.chunk_id, findings=[finding(chunk)], status="incomplete")
+    sessions = stub_bedrock(monkeypatch, [[
+        converse_reply(tool("get_chunk", chunk_id=chunk.chunk_id), "read-id"),
+        converse_reply(bad_finish, "first-finish"),
+        converse_reply(good_finish if corrected else bad_finish, "second-finish"),
+    ]])
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        shared_limits=SharedLimits(max_delegations=0, max_provider_attempts=6),
+        local_limits=RootLimits(max_tool_calls=1, max_iterations=6, max_response_bytes=6_000),
+        finalization=FinalizationPolicy(finalization_attempts=2, finalization_tool_choice="required"),
+    ).run("Collect one risk excerpt.", partitions=(pair,))
+
+    first_finish, correction = sessions[0].requests[1:]
+    for payload in (first_finish, correction):
+        assert payload["toolConfig"]["toolChoice"] == {"tool": {"name": "finish_research"}}
+        assert [tool["toolSpec"]["name"] for tool in payload["toolConfig"]["tools"]] == ["finish_research"]
+    assert correction["messages"][:-2] == first_finish["messages"]
+    assert correction["messages"][-2]["content"][0]["toolUse"]["toolUseId"] == "first-finish"
+    result = correction["messages"][-1]["content"][0]["toolResult"]
+    assert result["toolUseId"] == "first-finish"
+    body = result["content"][0]["json"]
+    assert body == {"ok": False, "error": {"code": "invalid_findings", "message": (
+        f"Finding 2, evidence 2 (chunk {chunk.chunk_id}): copy a contiguous quote exactly from "
+        "the delivered chunk text, including punctuation and spacing, or omit it."
+    )}}
+    assert len(sessions[0].requests) == trace.shared_budget.provider_attempts == 3
+    assert trace.shared_budget.finalization_provider_attempts == 2 and trace.shared_budget.corpus_attempts == 1
+    assert trace.steps[1].observation_sent
+    assert trace.analysis_status == "incomplete" and trace.coverage_status == "partial"
+    if corrected:
+        assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
+        assert len(trace.findings) == 1
+        item = trace.findings[0].evidence[0]
+        assert (item.quote, item.source.document_id, item.source.source_url) == (QUOTE, new, chunk.source_url)
+    else:
+        assert trace.stop_reason == "budget_exhausted" and trace.budget_stop == "finalization_attempt_limit"
+        assert trace.findings == () and trace.cited_chunk_ids == ()
 
 
 @pytest.mark.parametrize("tool_limit", [1, 4])

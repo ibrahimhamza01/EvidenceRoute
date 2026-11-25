@@ -1,9 +1,9 @@
 """Finding drafts from the model and findings resolved against SEC evidence."""
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, StringConstraints
 
 from evidenceroute.research.rlm.coverage import CoverageReport, SectionTarget
 from evidenceroute.research.rlm.tools import EvidenceRef, Identifier, StrictInput
@@ -14,7 +14,11 @@ CoverageStatus = Literal["complete", "partial", "missing"]
 
 class EvidenceDraft(StrictInput):
     chunk_id: Identifier
-    quote: str = Field(min_length=1, max_length=500)
+    quote: Annotated[str, StringConstraints(strip_whitespace=False)] = Field(
+        min_length=1, max_length=500, pattern=r"\S",
+        description="Copy one short contiguous passage exactly from delivered evidence. "
+                    "Keep punctuation and whitespace. Do not insert ellipses, paraphrase, or join passages.",
+    )
 
 
 class FindingDraft(StrictInput):

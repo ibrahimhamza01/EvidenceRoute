@@ -61,6 +61,7 @@ class RecursiveResearch:
         self, corpus: CorpusEnvironment, model_factory: Callable[[Invocation], RootModelClient], *,
         shared_limits: SharedLimits | None = None, local_limits: RootLimits | None = None,
         finalization: FinalizationPolicy | None = None,
+        child_guidance: str | None = None,
         clock: Callable[[], float] = monotonic,
     ):
         self.corpus = corpus
@@ -69,10 +70,12 @@ class RecursiveResearch:
         self.local_limits = local_limits if local_limits is not None else RootLimits()
         self.clock = clock
         self.finalization = finalization
+        self.child_guidance = child_guidance
 
     def run(
         self, question: str, *, partitions: tuple[SectionTarget, ...] | None = None,
         run_id: str | None = None,
+        root_delegation_groups: tuple[tuple[SectionTarget, ...], ...] | None = None,
     ) -> ExecutionTrace:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Research question must be a non-blank string.")
@@ -82,8 +85,13 @@ class RecursiveResearch:
             if not partitions or len(partitions) > self.shared_limits.max_partitions:
                 raise ValueError("Root authorization must fit the partition limit and be nonempty.")
             self._validate_partitions(partitions)
+        groups = None
+        if root_delegation_groups is not None:
+            groups = frozenset(frozenset(group) for group in root_delegation_groups)
+            if not groups or any(not group or not group.issubset(partitions or ()) for group in groups):
+                raise ValueError("Root delegation groups must be nonempty subsets of authorized pairs.")
         invocation = Invocation(run_id or uuid4().hex, "root", None, 0, question, None, partitions)
-        return self._invoke(invocation, budget, [], budget.deadline)
+        return self._invoke(invocation, budget, [], budget.deadline, groups)
 
     def _validate_partitions(self, partitions: tuple[SectionTarget, ...]) -> None:
         if len(set(partitions)) != len(partitions):
@@ -94,13 +102,15 @@ class RecursiveResearch:
     def _invoke(
         self, invocation: Invocation, budget: SharedBudget, clients: list[RootModelClient],
         parent_deadline: float,
+        root_groups: frozenset[frozenset[SectionTarget]] | None = None,
     ) -> ExecutionTrace:
         with budget.invocation_allocation(root=invocation.depth == 0):
-            return self._run_invocation(invocation, budget, clients, parent_deadline)
+            return self._run_invocation(invocation, budget, clients, parent_deadline, root_groups)
 
     def _run_invocation(
         self, invocation: Invocation, budget: SharedBudget, clients: list[RootModelClient],
         parent_deadline: float,
+        root_groups: frozenset[frozenset[SectionTarget]] | None,
     ) -> ExecutionTrace:
         model = self.model_factory(invocation)
         bind = getattr(model, "bind_execution_budget", None)
@@ -109,7 +119,7 @@ class RecursiveResearch:
         bind(budget)
         clients.append(model)
         budget.model_sessions += 1
-        session = RecursiveSession(self, invocation, budget, clients, parent_deadline)
+        session = RecursiveSession(self, invocation, budget, clients, parent_deadline, root_groups)
         partitions = invocation.partitions
         view = self.corpus if partitions is None else ScopedCorpus(self.corpus, partitions)
         scope = ResearchScope() if partitions is None else ResearchScope(
@@ -118,6 +128,8 @@ class RecursiveResearch:
         prompt = invocation.question
         if invocation.goal is not None:
             prompt += f"\nAnalysis goal: {invocation.goal}"
+        if invocation.depth > 0 and self.child_guidance:
+            prompt += f"\nInvestigation guidance: {self.child_guidance}"
         if partitions is not None:
             prompt += "\nAuthorized partitions: " + observation_json([vars(pair) for pair in partitions])
         if invocation.depth < budget.limits.max_depth:
@@ -136,12 +148,14 @@ class RecursiveSession:
     def __init__(
         self, runner: RecursiveResearch, invocation: Invocation, budget: SharedBudget,
         clients: list[RootModelClient], parent_deadline: float,
+        root_groups: frozenset[frozenset[SectionTarget]] | None,
     ):
         self.runner = runner
         self.invocation = invocation
         self.budget = budget
         self.clients = clients
         self.parent_deadline = parent_deadline
+        self.root_groups = root_groups
         self.direct_ids: set[str] = set()
         self.delivered_findings: dict[str, Finding] = {}
         self.findings: tuple[Finding, ...] = ()
@@ -189,6 +203,8 @@ class RecursiveSession:
             self.budget.check_child(depth, len(pairs))
             if parent_pairs is not None and not set(pairs).issubset(parent_pairs):
                 return reject("scope_violation", "Delegate only authorized document and section pairs.")
+            if self.root_groups is not None and frozenset(pairs) not in self.root_groups:
+                return reject("group_violation", "Delegate one whole admitted company group at a time.")
             if self.invocation.depth > 0 and set(pairs) == set(parent_pairs or ()):
                 return reject("scope_violation", "A descendant must delegate a strict subset.")
             self.runner._validate_partitions(pairs)
@@ -258,15 +274,19 @@ class RecursiveSession:
         findings = []
         for index, draft in enumerate(action.findings, start=1):
             evidence = []
-            for item in draft.evidence:
-                if item.chunk_id not in self.direct_ids and not any(
-                    item.chunk_id == observed.source.chunk_id and item.quote in observed.quote
-                    for observed in used_evidence
-                ):
-                    return "Findings need text from an observed chunk or a declared delivered excerpt."
+            for evidence_index, item in enumerate(draft.evidence, start=1):
+                location = f"Finding {index}, evidence {evidence_index}"
+                if item.chunk_id not in self.direct_ids:
+                    if item.chunk_id not in selected_ids:
+                        return f"{location}: use an observed chunk or a declared delivered excerpt, or omit it."
+                    if not any(item.chunk_id == observed.source.chunk_id and item.quote in observed.quote
+                               for observed in used_evidence):
+                        return (f"{location} (chunk {item.chunk_id}): copy a contiguous quote exactly from "
+                                "the delivered excerpt or omit it.")
                 chunk = self.runner.corpus.get_chunk(item.chunk_id)
                 if item.quote not in chunk.text:
-                    return "Finding quotations must occur verbatim in the original chunk."
+                    return (f"{location} (chunk {item.chunk_id}): copy a contiguous quote exactly from "
+                            "the delivered chunk text, including punctuation and spacing, or omit it.")
                 evidence.append(FindingEvidence(EvidenceRef.from_chunk(chunk), item.quote))
             source = evidence[0].source
             target = SectionTarget(source.document_id, source.section_id)

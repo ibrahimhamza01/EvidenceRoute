@@ -19,7 +19,7 @@ Python pages through the filing and section metadata without search. Company sel
 
 Each company group keeps its resolved fiscal years and the original question together. The [live semantic review](#reading-the-report) shows why that matters. Independently choosing excerpts for each year can make different topics look like a change in disclosure. A shared group lets the analyst check the same risk in each filing. Even matched excerpts need adequate coverage before making an absence claim.
 
-The plan stays host-side. The admission check tests whether one child per nonempty group fits the shared depth, delegation, and pair-assignment limits. It leaves the plan unchanged. The runner can already take the pairs for a selected group or bounded slice through `partitions=`. A future scheduler can keep the full plan as the denominator and expose counts and paged group IDs to the root, resolving each ID to authorized pairs before delegation. Provider and local limits still apply at execution. Inventory resolution does not measure evidence coverage. Research-wide roll-up remains pending because pagination offsets from different scoped views can refer to different underlying items and cannot be merged directly.
+The plan stays host-side. `execute_research_plan` checks the existing reservation policy, then admits whole groups in ticker order up to the requested group cap and the shared and root structural limits. Unresolved groups and groups that do not fit retain an explicit pending reason. The existing runner receives only admitted pairs and the root must delegate one whole group at a time. The full plan remains the reporting denominator. Provider, token, and time limits can still stop execution after admission.
 
 ### Bounded recursive execution
 
@@ -31,7 +31,7 @@ A bounded delegation observation carries the child's stop reason, analysis statu
 
 | Signal | What it establishes |
 | --- | --- |
-| Evidence access and coverage | Direct chunk access supplies the whole original chunk. A delegated finding supplies only its delivered excerpt. A section window advances text coverage but supplies no chunk IDs. The tracker computes per-invocation pagination from acknowledged ranges. A complete section read or chunk traversal can mark a partition complete, while a search hit or delegated excerpt alone shows partial access. Child pagination stays in the child trace. Exhaustive research-wide coverage aggregation across descendants is pending. |
+| Evidence access and coverage | Direct chunk access supplies the whole original chunk. A delegated finding supplies only its delivered excerpt. A section window advances text coverage but supplies no chunk IDs. The per-invocation tracker still reports acknowledged pagination. Planned execution also rolls up original chunk IDs and section-window ranges across the tree against the full plan. |
 | Analysis status | The model declares its assessment, uncertainty, and conflicts. The controller defaults the invocation to `incomplete` when no status or supporting references are supplied. A validated `finished` action can still have partial coverage or incomplete analysis. A search miss cannot establish that a disclosure was absent. |
 | Citation and quotation validation | Citation IDs must refer to evidence the invocation received. Citations based solely on delegated evidence require the delivered finding ID. For structured findings, the host resolves canonical source metadata and checks exact quote membership in the original chunk. A finding based solely on a delegated excerpt must also stay within that excerpt. |
 | Semantic correctness | Independent claim verification is pending. A valid citation and exact quote establish the source and wording, while the claim's interpretation still needs review. |
@@ -109,6 +109,7 @@ Direct Anthropic Messages remains available through `--provider anthropic --live
 | RLM-12 · Reserve provider slots for finalization | Hold provider capacity for each configured child ahead of admission, and protect finish-only slots for each invocation. Charge every transport attempt, including retries, to its active phase and the shared cap. | Prompting alone leaves the last slot spendable on retrieval. Fixed shares isolate siblings but may leave capacity unused for children that never launch. Child slots left over at exit return to root investigation. |
 | RLM-13 · Constrain and size protected finish requests | Use a finish-specific prompt and output cap. Allow native named tool choice where supported and keep runtime validation in both modes. After a truncated investigation reply, reuse the last valid history for protected finalization. | The course Sonnet 4.5 profile accepted named choice on a protected finish that used 332 output tokens. The need for the higher cap remains untested. Truncation recovery is offline-tested and ends investigation early to preserve capacity for synthesis. |
 | RLM-14 · Keep required scope independent of execution | Enumerate required slots from metadata before applying limits. Group years by company and retain unresolved slots. | Top-K retrieval could skip entire companies. Trimming to the budget would shrink the coverage denominator. One run may need to take a bounded slice, with its results still measured against the original plan. |
+| RLM-15 · Roll up evidence by canonical IDs and section offsets | Deduplicate acknowledged whole-chunk IDs across invocations. Merge acknowledged character ranges only within the same canonical document/section pair. | Document-wide pagination offsets can refer to different items in different scopes. Counting child excerpts as whole chunks would overstate root access. |
 
 See the [Converse tool contract](https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use-client-side.html) and [Boto3 request configuration](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html) for wire and timeout details.
 
@@ -261,7 +262,64 @@ The [issue #16 question](https://github.com/ibrahimhamza01/EvidenceRoute/issues/
 
 `python -m pytest -q Code/tests/test_rlm_*.py` passed with **159 passed, 1 warning in 3.39s**. The related retrieval, provenance, and canonical integrity regressions recorded **40 passed, 1 warning in 18.59s** using the commands above. Both warnings were the existing AnyIO pytest deprecation. The existing scripted recursive demo also exited successfully with two original citations and zero provider attempts.
 
-Corpus-wide execution scheduling, exhaustive coverage roll-up, durable finding storage, systematic conflict resolution, semantic claim verification, and corpus-wide evaluation remain pending.
+### Bounded multi-company execution and coverage
+
+```bash
+PYTHONPATH=Code/src python Code/examples/demo_rlm_planned_research.py
+```
+
+The scripted run admitted AAPL and AMD and kept 23 groups pending. The two children ran the same targeted search once per fiscal year and delivered four findings that the root cited using original SEC chunk IDs. The report counted **4 partial and 46 untouched targets** out of **50**, **4 of 3,038** unique whole chunks, and **0 of 4,005,903** characters delivered through section windows. The runner recorded 3 sessions, 9 decisions, 2 delegations, 4 corpus attempts, 4 pair assignments, and zero provider attempts. The root stopped `finished` while the research answer remained `incomplete`. The scripts demonstrate candidate retrieval and synthesis plumbing. The excerpts leave the novelty question unanswered.
+
+The ledger distinguishes search discovery, acknowledged whole chunks, acknowledged section windows, and delivered excerpts. It records findings generated, acknowledged, and used, alongside assignment and model-reported analysis outcomes. Access is `complete` when either the canonical chunk inventory or the full section character range was delivered, with separate completeness flags for both measures. An acknowledged read by a child that later fails still contributes to access telemetry. Root citations still depend on evidence delivered to the root and the runner's existing validation. Complete access establishes neither semantic correctness nor that a risk was absent.
+
+Verification recorded **167 focused RLM tests passed, 1 warning in 7.26s** and **40 related regressions passed, 1 warning in 17.86s**. Both warnings were the existing AnyIO pytest deprecation. The original scripted NVIDIA demo still exited successfully with two citations and zero provider attempts.
+
+#### Opt-in live two-company experiment
+
+Scope interpretation remains scripted. The plan keeps all 25 companies and 50 Item 1A targets, while the runner initially admits AAPL and AMD for both years. Bedrock Claude chooses the retrieval queries and investigation steps. Each child receives guidance to compare the same risk across years, return short verbatim quotes with original IDs, disclose uncertainty and partial coverage, and avoid inferring absence from a search miss. The root is asked to limit its synthesis to the assigned evidence.
+
+```bash
+BEDROCK_REGION=us-east-1 \
+  BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
+  CLAUDE_MAX_OUTPUT_TOKENS=1024 PYTHONPATH=Code/src \
+  python Code/examples/demo_rlm_planned_research.py --live --trace
+```
+
+Defaults allow depth 1, two delegations, four pair assignments, 12 shared corpus attempts, 18 provider attempts, a 100,000 reported-token threshold, and 180 seconds for both shared and local deadlines. The root and each child initially get six provider attempts. Each allocation now reserves two for protected finalization, leaving four for investigation. Local defaults are six decisions and six tool attempts per invocation. `--help` lists configurable limits. The experiment keeps the 6,000-byte observation cap and zero provider retries. Investigation defaults to 1,024 output tokens via `CLAUDE_MAX_OUTPUT_TOKENS`. Protected finalization defaults to 2,048 output tokens and requires named finish-tool choice. The existing reservation preflight rejects infeasible allocations before any provider client starts.
+
+The JSON reports the full and admitted scopes, invocation outcomes, pending groups and per-target coverage, provider tokens and latency, and original citations. Findings and their acknowledged delivery are recorded separately from declared use. `--trace` adds per-step provider and tool details. Exit `0` requires both whole-company delegations, a finished child and acknowledged findings for both years per company, and a finished root synthesis citing original evidence from those findings and declaring the finding IDs used. An unsupported or missing year produces structural status `incomplete` and exit `1` even if the root finishes. Structural success still leaves the corpus-wide `answer_status` incomplete and `semantic_claims_verified` false.
+
+##### First live run and quotation correction
+
+Run `2a38409af02e4f4fbdbd54b21c3afba0` delegated both whole company groups and exercised research-wide access accounting. Of 25 companies, 23 remained pending. Four of 50 targets had partial access and 46 were untouched. The ledger recorded 13 unique acknowledged whole chunks out of 3,038 required, with 292 chunks in the admitted inventory. The run used 3 sessions, 16 decisions, 16 provider attempts and responses (13 investigation and 3 protected finish), 12 corpus attempts, and 4 pair assignments. It reported 77,835 input and 5,018 output tokens (82,853 total), 62.6930 seconds elapsed, and 58.409 seconds summed provider latency. No provider errors, retries, or truncation occurred.
+
+Each child used five investigation attempts and its single protected finish. Both finishes failed exact quotation validation. The root then made two direct Apple searches, exhausted the shared corpus allowance, and also failed quote validation. All three protected requests selected `finish_research`. The run ended structurally `incomplete`, with zero validated findings or final citations and root stop `budget_exhausted` / `finalization_attempt_limit`.
+
+| Submitted evidence | Canonical comparison |
+| --- | --- |
+| Apple `1b31d472397f437ab1975947` and `e4bf3d03444b5f8b4e1614e3` | The inserted `...` skipped the list from `antitrust` through `intellectual property ownership and infringement` before `digital platforms`. Neither quote was contiguous. |
+| AMD `483314af3b949a29920abbbf` | The only difference was the straight apostrophe in `customers' ability`. The source uses `customers’ ability`. |
+| AMD `e8e013b9b919159fb6168bca` and `fb3d8728e8dba18029424d7a` | Both submitted excerpts were exact contiguous matches. The rejected first quotation prevented accepting the finish. |
+| Root `d79cf93171c2e9d56c5a2613`, `9872ded1fcb8eedd58fb2d78`, and `e4bf3d03444b5f8b4e1614e3` | The first quote matched. The other two used `Company's` where the source uses `Company’s`. |
+
+The AMD FY2024 power-and-water disclosure is a candidate infrastructure risk. FY2023 search misses leave its novelty unestablished. The revised instructions distinguish an observed FY2024 risk, comparable FY2023 evidence, possible change needing verification, and insufficient evidence to assess novelty. General AI references alone do not establish an infrastructure risk.
+
+Validation still requires an exact contiguous quote, preserving punctuation and whitespace. Feedback identifies the first failing finding and evidence item and names its chunk only when the invocation can cite it. It supplies no replacement text. The second protected attempt can correct or omit the finding, or return an explicitly incomplete result. It receives the validation error under the original Bedrock tool-use ID and cannot resume investigation. The shared attempt ceiling and output caps are unchanged.
+
+Stubbed Bedrock tests verified correction and repeated rejection within the two finish slots, with original citations and partial coverage preserved. The focused RLM suite recorded **173 passed, 1 warning in 9.22s**. Related retrieval, provenance, and canonical integrity checks recorded **40 passed, 1 warning in 20.73s**. Both suites reported the existing AnyIO pytest deprecation. The scripted NVIDIA and planned demos still ran with zero provider attempts.
+
+##### Second live run and comparative evidence
+
+Run `3925e7f8bc014cb4a3a6cb22a89e6312` recorded 17 provider attempts and responses, 12 corpus attempts, 3 model sessions, and 2 delegations. It reported 84,910 input and 6,590 output tokens (91,500 total) over 70.2815 seconds. The ledger recorded 10 discovered chunks and 9 unique acknowledged whole chunks. One oversized search result was rejected and its undelivered evidence received no access credit. Coverage remained at four partial targets and 46 untouched targets.
+
+The root acknowledged three validated Apple child findings. AMD failed quotation validation on both protected finishes. The root failed its finish on the same AMD quotation issue and reached its six-decision limit with provider capacity unused. The run ended structurally `incomplete` with zero final citations. Compared with the first run, the second delivered three findings instead of zero, acknowledged fewer whole chunks (9 vs. 13), and used more reported tokens (91,500 vs. 82,853) and time (70.2815 vs. 62.6930 seconds). Both runs used 12 corpus attempts and neither produced final citations. The two individual runs do not isolate the effect of the quotation guidance or reservation change.
+
+- **AMD:** The canonical FY2023 Item 1A chunk `043757f52188a8c6fb2a2857` already states that data centers depend on clean water and reliable energy and that shortages could impair customer capacity expansion and use of AMD products and services. FY2024 chunk `483314af3b949a29920abbbf` repeats that risk and explicitly connects it to potential harm to AMD revenue. The FY2023 passage is candidate counterevidence to the claim that the underlying constraint was new in FY2024. These excerpts leave open whether the revenue language changed elsewhere in the filings.
+- **Apple:** The child reported insufficient evidence to determine infrastructure-risk novelty. The root inferred novelty from safety and regulatory disclosures. The validated FY2023 quotation itself does not mention AI, and the retrieved evidence did not establish the proposed infrastructure-risk change.
+
+The two-company demo optimization cycle ends here. The next milestone is systematic comparison of the same risk across years, including an explicit search for prior-year counterevidence before making a novelty claim.
+
+Durable finding storage, semantic verification, systematic reinvestigation and conflict resolution, live intent interpretation, and comprehensive corpus execution remain pending. This demo executes one bounded slice and does not launch follow-up runs.
 
 ## Bounded live recursive experiment · Four observed runs
 
@@ -379,7 +437,7 @@ The report takes shared counts and measured token usage from the root's final bu
 
 **Semantic review of the successful run.** The final answer inferred a shift toward geopolitical risks in FY2024 from two independently selected excerpts. An earlier FY2023 run retrieved `bd263969e91358073d0ea0a1`, which explicitly discusses geopolitical tensions involving Taiwan and China and their implications for supply continuity. The latest excerpts cannot establish that geopolitical risk was new or received greater emphasis in FY2024. The latest FY2023 quotation also does not independently support its finding's additional claim about demand estimation challenges. That child returned `finished` with a finding marked `analyzed`, while its invocation-level analysis status remained `incomplete`.
 
-Citation provenance identifies the original chunk and quotation validation checks its wording. Coverage describes the evidence accessed, and analysis status is model-reported. In this run, both partitions remained partial and exhaustive descendant coverage roll-up is still pending. Independent semantic verification would have to test whether the evidence supports each claim and comparison.
+Citation provenance identifies the original chunk and quotation validation checks its wording. Coverage describes the evidence accessed, and analysis status is model-reported. In this run, both partitions remained partial. The original NVIDIA demo still reports per-invocation coverage. The planned execution ledger is exercised separately above. Independent semantic verification would have to test whether the evidence supports each claim and comparison.
 
 ### Offline verification of the live path
 

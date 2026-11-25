@@ -201,3 +201,29 @@ def test_canonical_plan_demo_and_runner_handoff(canonical_corpus, monkeypatch, c
     trace = runner.run(group.question, partitions=group.targets)
     assert trace.stop_reason == "finished" and trace.shared_budget.provider_attempts == 0
     assert trace.coverage.scope.required_sections == group.targets and trace.coverage_status == "missing"
+
+
+def test_canonical_planned_research_demo_executes_two_cross_year_groups(canonical_corpus, monkeypatch, capsys):
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    monkeypatch.syspath_prepend(str(examples))
+    monkeypatch.setattr("evidenceroute.research.rlm.CorpusEnvironment", lambda: canonical_corpus)
+
+    def unexpected_provider(*_args, **_kwargs):
+        pytest.fail("The default path must not construct a Bedrock client")
+
+    monkeypatch.setattr("evidenceroute.research.rlm.bedrock.BedrockRootClient.from_env", unexpected_provider)
+    demo = runpy.run_path(str(examples / "demo_rlm_planned_research.py"))
+    assert demo["main"]([]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["requested_companies"] == 25 and report["required_targets"] == 50
+    assert report["answer_status"] == "incomplete" and report["stop_reason"] == "finished"
+    assert report["structural_status"] == "success" and report["provider"] is None
+    assert report["access_counts_by_target"] == {"none": 46, "partial": 4}
+    assert report["unique_search_discovered_chunks"] == report["unique_whole_chunks_delivered"] == 4
+    assert report["section_characters_delivered"] == 0
+    assert [g["ticker"] for g in report["groups"] if g["pending_reason"] is None] == ["AAPL", "AMD"]
+    assert [(ref["ticker"], ref["fiscal_year"]) for ref in report["original_citations"]] == [
+        ("AAPL", 2023), ("AAPL", 2024), ("AMD", 2023), ("AMD", 2024),
+    ]
+    assert report["shared_usage"]["provider_attempts"] == 0
+    assert len(report["ledger"]["invocations"]) == 3
