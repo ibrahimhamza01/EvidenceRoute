@@ -105,7 +105,8 @@ def test_tool_use_round_trip_preserves_history_and_evidence_tool_schemas():
     (message({"type": "text", "text": "Plain answer."}, reason="end_turn"), "missing_finish"),
     (message(use(), reason="max_tokens"), "truncated_response"),
     (message(reason="refusal"), "unexpected_stop_reason"),
-    (message(use(), use(use_id="other")), "multiple_tool_uses"),
+    (message(use(), use()), "invalid_tool_use"),
+    (message(use(), use(use_id="bad id")), "invalid_tool_use"),
     (message({"type": "text", "text": "No call."}), "missing_tool_use"),
     (message({"type": "text"}, use()), "invalid_content"),
     (message(use(args=["invalid"])), "invalid_tool_use"),
@@ -129,6 +130,44 @@ def test_new_question_resets_history_and_duplicate_ids_are_rejected_within_a_run
         decide(client, '{"ok":true}')
     decide(client)
     assert provider.calls[2][0]["messages"] == [{"role": "user", "content": "NVIDIA FY2024?"}]
+
+
+def test_direct_messages_batch_replays_native_blocks_and_returns_all_ids_in_one_turn():
+    first = use(use_id="first")
+    second = use(use_id="second")
+    provider = FakeTransport(message(first, second), message(use("finish_research", {"answer": "Okay."}, "end")))
+    client = ClaudeRootClient(provider)
+    decision = decide(client)
+    assert decision["type"] == "tool_batch"
+    assert provider.calls[0][0]["tool_choice"]["disable_parallel_tool_use"]
+    results = {"tool_results": [
+        {"tool_use_id": "first", "observation": {"ok": True}},
+        {"tool_use_id": "second", "observation": {"ok": False, "error": {"code": "invalid_arguments"}}},
+    ]}
+    assert decide(client, json.dumps(results))["type"] == "finish"
+    assert provider.calls[1][0]["messages"][-2] == {"role": "assistant", "content": [first, second]}
+    received = provider.calls[1][0]["messages"][-1]
+    assert received["role"] == "user"
+    assert [(b["tool_use_id"], b["is_error"]) for b in received["content"]] == [
+        ("first", False), ("second", True),
+    ]
+
+
+def test_oversize_call_list_leaves_bounded_redacted_telemetry():
+    uses = [use(args={"authorization": "private fixture", "account": "123456789012"}, use_id=f"use-{i}")
+            for i in range(5)]
+    client = ClaudeRootClient(FakeTransport(message(
+        {"type": "thinking", "thinking": "private reasoning fixture", "signature": "fixture"}, *uses,
+    )))
+    with pytest.raises(ClaudeModelError, match="tool_batch_limit"):
+        decide(client)
+    assert client.last_tool_request_count == 5
+    assert len(client.last_tool_requests) == 4
+    assert client.last_tool_requests[0] == {
+        "tool_use_id": "use-0", "name": "list_filings",
+        "arguments": {"authorization": "<redacted>", "account": "<redacted>"},
+    }
+    assert "private reasoning" not in repr(client.last_tool_requests)
 
 
 def test_request_retries_preserve_payload_respect_retry_after_and_record_usage():
@@ -264,6 +303,11 @@ def test_native_transport_sanitizes_http_bodies_and_parses_success(monkeypatch):
     response._content = b'{"error":{"message":"fixture-secret"}}'
     with pytest.raises(MessagesTransportError, match="^http_401$"):
         transport.send({}, timeout_seconds=1)
+    response.status_code = 400
+    with pytest.raises(ClaudeModelError, match="^http_required_finish_validation$") as rejected:
+        transport.send({"tool_choice": {"type": "tool", "name": "finish_research"}}, timeout_seconds=1)
+    assert not rejected.value.retryable
+    assert "fixture-secret" not in "".join(traceback.format_exception(rejected.value))
     response.status_code = 200
     response._content = b"non-JSON fixture-secret"
     with pytest.raises(MessagesTransportError, match="^invalid_json$") as error:

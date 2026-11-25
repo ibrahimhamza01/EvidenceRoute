@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Annotated
 
@@ -24,6 +25,30 @@ if TYPE_CHECKING:
     from evidenceroute.research.rlm.scoped import ScopedCorpus
 
 MIN_RESPONSE_BYTES = 128
+MAX_TOOL_BATCH = 4
+TOOL_USE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+
+
+def trace_data(value):
+    """Keep tool telemetry JSON-only and mask credential fields and AWS identifiers."""
+    if isinstance(value, dict):
+        return {
+            trace_data(key): "<redacted>" if any(token in re.sub(r"[^a-z]", "", str(key).lower())
+                                                 for token in ("authorization", "credential", "apikey",
+                                                               "accesskey", "sessiontoken", "securitytoken",
+                                                               "secretkey", "secretaccesskey", "accountid",
+                                                               "reasoning", "thinking"))
+            else trace_data(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [trace_data(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(
+            r"(?<!\w)\d{12}(?!\w)|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bsk-ant-[\w-]+",
+            "<redacted>", value,
+        )
+    return value
 Identifier = Annotated[str, Field(min_length=1, max_length=160)]
 FiscalYear = Annotated[int, Field(ge=1900, le=9999)]
 

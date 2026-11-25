@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,6 +30,24 @@ class BudgetExceeded(RuntimeError):
     """A stable, model-facing admission failure code."""
 
 
+class FinalizationPolicy(BaseModel):
+    """Reserve provider allowances and configure the protected finish phase."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    child_provider_attempts: int = Field(default=4, ge=1)
+    finalization_attempts: int = Field(default=1, ge=1)
+    finalization_max_output_tokens: int = Field(default=2048, ge=1, le=128_000)
+    finalization_tool_choice: Literal["auto", "required"] = "auto"
+
+
+@dataclass
+class ProviderAllocation:
+    investigation_left: int
+    finalization_left: int
+    finalizing: bool = False
+
+
 @dataclass(frozen=True)
 class BudgetUsage:
     model_sessions: int
@@ -40,16 +59,58 @@ class BudgetUsage:
     reported_tokens: int
     attempts_with_missing_usage: int
     remaining_seconds: float
+    investigation_provider_attempts: int
+    finalization_provider_attempts: int
+    released_child_provider_slots: int
 
 
 class SharedBudget:
-    def __init__(self, limits: SharedLimits, clock: Callable[[], float] = monotonic):
+    def __init__(self, limits: SharedLimits, clock: Callable[[], float] = monotonic, *,
+                 finalization: FinalizationPolicy | None = None):
         self.limits = limits
         self.clock = clock
         self.deadline = clock() + limits.deadline_seconds
         self.model_sessions = self.model_decisions = self.delegated_invocations = 0
         self.provider_attempts = self.corpus_attempts = self.partition_assignments = 0
         self.reported_tokens = self.attempts_with_missing_usage = 0
+        self.investigation_provider_attempts = self.finalization_provider_attempts = 0
+        self.released_child_provider_slots = 0
+        self.finalization = finalization
+        self.active_allocation: ProviderAllocation | None = None
+        self._root_allocation: ProviderAllocation | None = None
+        if finalization is not None:
+            reserve = finalization.finalization_attempts
+            # Reserve even unadmitted children so an early branch cannot spend
+            # a later sibling's share before that sibling is created.
+            child_slots = limits.max_delegations * finalization.child_provider_attempts
+            root_slots = limits.max_provider_attempts - child_slots
+            if root_slots <= reserve or (limits.max_delegations and finalization.child_provider_attempts <= reserve):
+                raise ValueError("Provider allocation must leave investigation and finalization capacity per invocation.")
+            self._root_allocation = ProviderAllocation(root_slots - reserve, reserve)
+
+    @contextmanager
+    def invocation_allocation(self, *, root: bool) -> Iterator[None]:
+        if self.finalization is None:
+            yield
+            return
+        parent = self.active_allocation
+        allocation = self._root_allocation
+        if not root:
+            reserve = self.finalization.finalization_attempts
+            allocation = ProviderAllocation(self.finalization.child_provider_attempts - reserve, reserve)
+        assert allocation is not None
+        self.active_allocation = allocation
+        try:
+            yield
+        finally:
+            self.active_allocation = parent
+            if root:
+                self._root_allocation = None
+            else:
+                unused = allocation.investigation_left + allocation.finalization_left
+                assert self._root_allocation is not None
+                self._root_allocation.investigation_left += unused
+                self.released_child_provider_slots += unused
 
     def check_work(self) -> None:
         if self.clock() >= self.deadline:
@@ -64,11 +125,25 @@ class SharedBudget:
     def start_provider_attempt(self) -> None:
         self.check_provider_attempt()
         self.provider_attempts += 1
+        allocation = self.active_allocation
+        if allocation is not None and allocation.finalizing:
+            allocation.finalization_left -= 1
+            self.finalization_provider_attempts += 1
+        else:
+            if allocation is not None:
+                allocation.investigation_left -= 1
+            self.investigation_provider_attempts += 1
 
     def check_provider_attempt(self) -> None:
         self.check_work()
         if self.provider_attempts >= self.limits.max_provider_attempts:
             raise BudgetExceeded("provider_attempt_limit")
+        allocation = self.active_allocation
+        if allocation is not None:
+            if allocation.finalizing and not allocation.finalization_left:
+                raise BudgetExceeded("finalization_attempt_limit")
+            if not allocation.finalizing and not allocation.investigation_left:
+                raise BudgetExceeded("investigation_attempt_limit")
 
     def record_provider_usage(self, attempt: ModelAttempt) -> None:
         if attempt.input_tokens is None or attempt.output_tokens is None:
@@ -106,4 +181,6 @@ class SharedBudget:
             self.provider_attempts, self.corpus_attempts, self.partition_assignments,
             self.reported_tokens, self.attempts_with_missing_usage,
             max(0.0, self.deadline - self.clock()),
+            self.investigation_provider_attempts, self.finalization_provider_attempts,
+            self.released_child_provider_slots,
         )

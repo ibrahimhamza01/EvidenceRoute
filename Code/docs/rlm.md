@@ -3,41 +3,48 @@
 ## Architecture and control flow
 
 1. `RootController` sends the question, tool schemas, previous observation, and remaining time to a model client. The scripted client plays back predetermined decisions for offline tests.
-2. The model client maps a provider reply into one internal tool or finish decision. The next request replays the original assistant message and pairs the tool result with the provider's tool-use ID.
+2. A provider reply is one model decision. It can contain one tool call, an ordered batch of up to four tool calls, or an exclusive finish. The next request replays the original assistant message and sends one user message containing a result for each native tool-use ID. [Bedrock Converse tool use](https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use-client-side.html) · [Anthropic tool result ordering](https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use)
 3. `CorpusToolDispatcher` validates the name and arguments against the same models that publish the schemas. It calls only allowlisted local operations and returns a bounded JSON success or error. Invalid arguments become feedback the model can correct.
 4. The controller accepts a structured finish only when its cited chunk IDs were delivered to the model. It records requested decisions, validated arguments, observations, original evidence IDs, provider attempts, timing, and stop reason.
 
 `CorpusEnvironment` provides validated, read-only access to the canonical SEC corpus of **25 companies, 75 filings, 416 sections, and 24,766 chunks**. It loads `data/filings_manifest.csv` and the section and chunk Parquet files under `data/processed/full-v1/`. The tools list companies, filings, and sections, fetch filing metadata or original chunks, page through section text, and search with BM25. The corpus stays local. The provider receives the question and the observations accumulated during the run.
 
-The caller can supply required filing and section IDs through `ResearchScope`. An unspecified requirement is unknown. Pagination is complete when delivered ranges cover the requested collection or text. The trace distinguishes search discoveries, delivered chunks, and pagination. Claim verification remains a separate step.
+The caller can supply required filing and section IDs through `ResearchScope`. An unspecified requirement remains unknown.
 
 ### Bounded recursive execution
 
-`RecursiveResearch` opts into recursive execution. Its factory creates a fresh budget-aware model client per invocation. The existing `RootController` handles each conversation. A model can call `delegate_research` with a narrower question, a goal, and explicit canonical document and section pairs. The host checks authorization and budgets, then runs the child synchronously. A child can delegate a strict subset of its assigned pairs. The factory receives invocation metadata and is trusted application code. Claude and Bedrock enforce the provider-attempt limit within their retry loop. Scripted clients make zero provider calls.
+`RecursiveResearch` opts into recursive execution. Its factory creates a fresh budget-aware model client per invocation, and `RootController` handles each conversation. The model supplies a question, a goal, and a nonempty set of unique canonical document/section pairs to `delegate_research`. The root can assign all its authorized pairs to a fresh child to investigate a narrower question over the same evidence. With no explicit authorization, it can select any valid canonical pairs. Below the root, every successful delegation must remove at least one pair. The scope therefore shrinks along each branch, and a singleton cannot be subdivided under the current pair representation.
 
-Each child starts with its own question, goal, authorized pairs, and an empty model history. A Python corpus view constrains filing and company listings, section operations, chunk lookups, and search. Search applies the exact pair mask before pagination and counting. The shared lexical index still uses corpus-wide scoring statistics. If the caller leaves root authorization unspecified, the root may access the canonical corpus and can delegate only validated pairs.
+Each child starts with its own question, goal, authorized pairs, and an empty model history. A Python corpus view constrains metadata, reads, lookups, and search. Filtering exact pairs **before counting and slicing** makes totals, offsets, and coverage denominators refer to the authorized collection. For example, if ranked hits are `[outside, A, B]`, a one-hit first page returns `A` with total `2` and next offset `1`. Filtering after slicing could leave an empty page or retain the wrong total. BM25 scoring statistics still come from the corpus-wide index.
 
-A recursive finish can submit findings with a claim, exact supporting quotations, original chunk IDs, analysis status, uncertainty, and conflicts. The host resolves the source metadata from the corpus, verifies the quotation against accessible evidence, and computes coverage from delivered reads. A section window supplies text and can advance section coverage. It has no chunk IDs, so a finding still needs evidence from a chunk operation or a delivered original excerpt.
+A bounded delegation observation carries the child's stop reason, analysis status, partition coverage, and validated findings. Failed, oversized, or unacknowledged observations grant no citations. The trace separates findings generated, acknowledged, and declared used. A declared finding must have been delivered and must contribute a chunk to the answer or a new finding.
 
-A bounded delegation observation carries the child's stop reason, analysis status, partition coverage, and validated findings. A failed child grants no citations. An oversized observation is rejected as a whole. The trace records findings generated by the child and which IDs were acknowledged by the parent. The model declares `used_finding_ids` at finish. The controller checks that they were delivered and contributed a chunk to the answer or a new finding. The parent can request another investigation or synthesize an answer citing original chunk IDs. A child can re-quote an excerpt from a grandchild within the text delivered to it. Search misses give no basis for claiming a risk was absent, and conflict handling remains model-directed.
-
-Root and child traces carry a run ID, invocation and parent IDs, depth, authorized partitions, step timings, provider attempts, nested delegation outcomes, and shared usage snapshots. Coverage is conservative per invocation. Child excerpts count as evidence access for the parent, while completed child pagination remains in the child trace. The parent does not infer exhaustive coverage from a set of summaries. Claim verification remains pending.
+| Signal | What it establishes |
+| --- | --- |
+| Evidence access and coverage | Direct chunk access supplies the whole original chunk. A delegated finding supplies only its delivered excerpt. A section window advances text coverage but supplies no chunk IDs. The tracker computes per-invocation pagination from acknowledged ranges. A complete section read or chunk traversal can mark a partition complete, while a search hit or delegated excerpt alone shows partial access. Child pagination stays in the child trace. Exhaustive research-wide coverage aggregation across descendants is pending. |
+| Analysis status | The model declares its assessment, uncertainty, and conflicts. The controller defaults the invocation to `incomplete` when no status or supporting references are supplied. A validated `finished` action can still have partial coverage or incomplete analysis. A search miss cannot establish that a disclosure was absent. |
+| Citation and quotation validation | Citation IDs must refer to evidence the invocation received. Citations based solely on delegated evidence require the delivered finding ID. For structured findings, the host resolves canonical source metadata and checks exact quote membership in the original chunk. A finding based solely on a delegated excerpt must also stay within that excerpt. |
+| Semantic correctness | Independent claim verification is pending. A valid citation and exact quote establish the source and wording, while the claim's interpretation still needs review. |
 
 This is **RLM-inspired recursive long-context processing**. The original paper uses a programmable REPL to inspect, partition, and recurse over external input. EvidenceRoute exposes typed corpus and delegation tools for this SEC workflow. [Recursive Language Models](https://arxiv.org/abs/2512.24601)
 
-#### Shared budget
+#### Shared budget and termination
 
 Root and descendants draw from one `SharedBudget`. A model session is a fresh client, a decision is one invocation of that client, a provider attempt is one transport request including a retry, and a corpus attempt is a dispatcher call. Local controller iteration and tool-attempt limits still apply. A delegation consumes a local tool slot, and shared delegation and partition budgets are charged before the child starts. Repeated assignment of a partition consumes another assignment slot.
 
-| Shared limit | Default and behavior |
+| Condition | Effect |
 | --- | --- |
-| Depth and delegated invocations | Depth 2 below the root (root depth 0), and 8 admitted delegated invocations across the run. |
-| Provider and corpus attempts | 24 transport attempts and 32 corpus tool attempts. Admission is checked before each transport call, retry, or corpus dispatch. |
-| Partitions | 16 cumulative delegated pair assignments, also used as the maximum explicit root authorization size. |
-| Reported tokens | Stop admitting additional work once 60,000 reported tokens have been counted. The counter sums the reported input, output and cache categories as a conservative policy. Missing input or output counters are counted separately as missing usage. A response can exceed the threshold before its usage is known. |
-| Deadline | 90 seconds shared across the tree. Each invocation also respects its local deadline and the parent's remaining time. Blocking SDK calls are cooperative and late decisions are discarded. |
+| Valid finish | Ends the invocation as `finished`. Invalid actions, citations, or findings return feedback for correction while decisions remain available. |
+| Depth, scope, or shared delegation and partition limits | Reject the proposed child with feedback to the parent. Shared defaults allow depth 2 below the root, 8 admitted children, and 16 cumulative pair assignments. The assignment cap also bounds explicit root authorization. The delegation tool is omitted at the depth ceiling, and runtime validation still guards any attempted call. |
+| Shared provider or corpus attempt limits | The defaults are 24 provider attempts and 32 corpus attempts. Provider exhaustion ends an invocation when the adapter needs another request or retry. Corpus exhaustion rejects that dispatch and can still leave room for the model to finish. |
+| Local controller limits | Exhausting iterations ends with `iteration_limit`. With protected finalization, the local tool cap or last decision triggers finish-only mode. Without it, another single tool request after the local tool budget is spent ends with `tool_call_limit`. |
+| Measured token threshold | At 60,000 reported tokens by default, further decisions, requests, and tool work are blocked. An already returned valid finish can still be accepted. Successful and failed attempts contribute available input, output, and cache counters. Missing input or output counters are tracked separately, and a response can cross the threshold before usage is known. |
+| Cooperative deadline | The controller uses the earliest of the shared deadline (90 seconds by default), its local deadline, and the parent's deadline. Providers cap request timeouts by remaining time. Late decisions are discarded. Synchronous SDK calls can overrun the deadline. |
+| Model or provider failure | Retryable provider errors can retry within configured attempt and time limits. Truncated investigation replies can transition to protected finalization when a finish attempt remains. Other unhandled failures end the invocation, normally as `model_error`. A failed child returns an error outcome to the parent, which can continue within its remaining budget. |
 
-Depth, admission counts, and provider-attempt limits are enforced before work begins with the supplied clients. The measured token threshold is not an absolute cap. Successful and failed attempts contribute counters when provided. An unreported attempt can still consume tokens.
+Batch operations execute sequentially in provider order. One batch spends one model decision, and each admitted operation spends its own local tool slot and applicable corpus or delegation budget. The controller checks those limits before each operation. An invalid operation can return an error while its peers continue. A request skipped at a local or shared limit gets its own error result when a follow-up is allowed. The local tool limit can skip the rest of a batch and still allow a later finish. Running out of provider attempts blocks further batch work that would require another provider turn.
+
+The observation byte limit applies to each result and the combined batch envelope. The controller reserves space for all IDs and compact errors before execution. If the envelope cannot fit, it stops without executing the batch. Otherwise earlier results get first use of the remaining bytes. An oversized result is replaced by an error and leaves the original evidence and pagination intact. Coverage and citation eligibility require both a successful result and acknowledged delivery of that result. An acknowledgement of the batch's error block grants no evidence.
 
 #### Offline example
 
@@ -63,7 +70,7 @@ Bedrock is AWS's managed model API. EvidenceRoute uses Boto3's `bedrock-runtime`
 
 Other accounts and profiles require their own region and `bedrock:InvokeModel` permissions. [Converse API permissions](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html)
 
-Course credentials reportedly expire about every four hours. Manually supplied environment credentials do not refresh automatically. On expiry, obtain a fresh credential set from the course issuer, replace all three values in the shell environment or externally managed profile, and start a new process. Remove stale environment credentials if switching to a profile. The application delegates credential retrieval and any provider-supported refresh to Boto3. Keep credentials outside the repository and leave SDK wire debugging off when using real credentials. Expired or missing credentials, invalid authentication, access denial, and configuration errors stop the run without retries and appear as sanitized trace codes. [Boto3 credential provider chain](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html)
+Course credentials reportedly expire about every four hours. Manually supplied environment credentials do not refresh automatically. On expiry, obtain a fresh credential set from the course issuer, replace all three values in the shell environment or externally managed profile, and start a new process. Remove stale environment credentials if switching to a profile. The application delegates credential retrieval and any provider-supported refresh to Boto3. Keep credentials outside the repository and leave SDK wire debugging off when using real credentials. Expired or missing credentials, invalid authentication, access denial, and provider request configuration errors end the affected invocation without retries and appear as sanitized trace codes. [Boto3 credential provider chain](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html)
 
 The optional demo starts with one search hit for a NVIDIA FY2024 risk disclosure. It reports the configured limits, coverage, citations, request attempts, tokens, latency, and stop reason. The `--trace` flag adds requested actions, validated arguments, errors, evidence IDs, and observation delivery status. It omits raw tool-result text. The `--live` flag authorizes provider calls.
 
@@ -82,13 +89,15 @@ Direct Anthropic Messages remains available through `--provider anthropic --live
 | RLM-02 · Exact pages and lexical search | Character windows and whole chunks preserve source text. Existing BM25 lookup and chunk-ID tie breaking give repeatable search. | Whole sections can be too large for a tool turn. Dense search could find different wording at the cost of another model and index. Keyword search can miss relevant evidence. The initial BM25 build is lazy. |
 | RLM-03 · Allowlisted tool schemas | Generate schemas and validate requests using the same argument models. The dispatcher owns execution. | Separate schemas and validators can drift. An unrestricted function interface would broaden model-controlled execution. Adding a tool requires an explicit registry change. |
 | RLM-04 · Bounded decisions and observations | Reuse the root-client interface. Reject oversized results as a whole so evidence and offsets remain consistent. | Parsing prose would need extra conventions. Truncating JSON could remove provenance. Oversized requests may need a smaller page or section window. |
-| RLM-05 · Separate scope, access, and analysis | Use caller-established requirements when provided, merge delivered ranges, and accept citations only to delivered chunk IDs. Unspecified root requirements stay unknown. | Inferring scope or counting the final page alone can overstate coverage. Citation checks establish access to evidence. Claim verification is pending. |
-| RLM-06 · Preserve native provider messages | Replay assistant content, including reasoning signatures when present. Translate Bedrock `toolUse` and `toolResult` at the edge and use `finish_research` for validated completion. Bedrock Converse has no single-call switch in its tool choice. The adapter instructs the model to use one tool and rejects multiple calls before dispatch. The direct Messages transport requests single-tool turns. | A second controller would duplicate validation and coverage. Accepting prose as a finish would bypass those checks. Tool result errors travel in the existing JSON body. Unexpected or truncated responses leave the run incomplete. |
+| RLM-05 · Separate scope, access, and analysis | Merge acknowledged ranges per invocation and preserve child pagination in its own trace. | Rolling up summaries as coverage would overstate how much the parent inspected. Unspecified root requirements stay unknown. |
+| RLM-06 · Preserve native messages and execute batches sequentially | Bedrock can return multiple tool-use blocks in one reply. Preserve the complete assistant message and pair each result with its original ID in one user message. Validate IDs before dispatch and reject mixed batches containing `finish_research`. The direct Messages transport requests single-tool turns and can handle a batch safely. | Prompting alone did not enforce single-call replies in the first live run. Sequential execution keeps budget checks and delivery accounting ordered. Batches over four calls, malformed or duplicate IDs, and partial replies never reach dispatch. |
 | RLM-07 · AWS SDK, bounded attempts, and opt-in | Use the existing Boto3 dependency and standard credential chain. Disable SDK retries for Converse so the shared loop owns retry accounting and time checks. Reuse the session and apply the remaining time to new request clients. | Handwritten signing and credential rotation would duplicate SDK behavior. A new client per attempt adds setup cost. Socket timeouts and credential resolution are synchronous and cannot guarantee a hard deadline. Late decisions are discarded. |
 | RLM-08 · Per-attempt usage and acknowledged delivery | Record input/output and cache counters when supplied, wall latency, Bedrock latency when supplied, and sanitized errors. Credit a provider observation only after an assistant response acknowledges the turn. | An iteration count hides retries. A lost response leaves delivery and usage unknown. Neither adapter requests prompt caching or estimates cost. |
 | RLM-09 · Small chunk pages by default | The model-facing `search_chunks` and `read_chunks` tools default to one whole chunk and still accept an explicit limit up to ten. Tool descriptions show the run's byte cap. Oversized responses report the attempted size and cap and suggest a smaller page or text window when possible. | A larger default can return more evidence per successful call but exceeded the demo budget for the NVIDIA search. Starting with one chunk can require more turns for broad questions. Silently dropping results would obscure pagination. Increasing the byte cap also increases the amount of evidence replayed in later model requests. |
-| RLM-10 · Sequential delegation with one budget | Reuse the controller and provider retry loop, use fresh clients, and cap work across the whole tree. Authorize exact document and section pairs in Python. | Per-child budgets would multiply resources. Parallel delegation would need synchronized admission and trace handling. Typed tools give the model less flexibility than a REPL while keeping authorization and evidence delivery inspectable. |
+| RLM-10 · Sequential delegation with one budget | Scope shrinks at every delegation below the root. A shared budget also caps work across sibling branches. | Per-child budgets would multiply resources. Parallel delegation would need synchronized admission and trace handling. Pairs are the current indivisible scope units. |
 | RLM-11 · Carry original excerpts with findings | Validate source quotes against accessible chunks, track generated and delivered findings separately, and require declared finding use for delegated citations. Preserve child coverage, failures and conflict notes. | Sending whole child histories would expose unrelated context and use more tokens. Excerpts limit what parents can quote without fetching more evidence. Declared use is a model report and does not verify the claim. |
+| RLM-12 · Reserve provider slots for finalization | Hold provider capacity for each configured child ahead of admission, and protect finish-only slots for each invocation. Charge every transport attempt, including retries, to its active phase and the shared cap. | Prompting alone leaves the last slot spendable on retrieval. Fixed shares isolate siblings but may leave capacity unused for children that never launch. Child slots left over at exit return to root investigation. |
+| RLM-13 · Constrain and size protected finish requests | Use a finish-specific prompt and output cap. Allow native named tool choice where supported and keep runtime validation in both modes. After a truncated investigation reply, reuse the last valid history for protected finalization. | The course Sonnet 4.5 profile accepted named choice on a protected finish that used 332 output tokens. The need for the higher cap remains untested. Truncation recovery is offline-tested and ends investigation early to preserve capacity for synthesis. |
 
 See the [Converse tool contract](https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use-client-side.html) and [Boto3 request configuration](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html) for wire and timeout details.
 
@@ -231,7 +240,139 @@ python -m pytest -q Code/tests/test_retrieval_bm25.py Code/tests/test_retrieval_
   Code/tests/test_rag_corpus.py Code/tests/test_corpus_regression.py::test_exported_canonical_corpus_integrity
 ```
 
-Live recursive verification, automatic corpus-wide scope planning, exhaustive coverage roll-up, durable finding storage, systematic conflict resolution, semantic claim verification, and corpus-wide evaluation remain pending.
+Automatic corpus-wide scope planning, exhaustive coverage roll-up, durable finding storage, systematic conflict resolution, semantic claim verification, and corpus-wide evaluation remain pending.
+
+## Bounded live recursive experiment · Four observed runs
+
+The first live recursive experiment asks Claude to compare one documented supply-chain risk disclosure from NVIDIA's FY2023 and FY2024 filings. It should identify similarities and differences supported by the retrieved evidence and disclose limitations. The demo resolves the two canonical filings and their Item 1A sections locally. These exact document/section pairs are the entire authorized scope. The root is prompted to delegate one separate investigation per year. Each child chooses its own queries and tool actions, starts with small evidence pages, and returns a compact finding with an exact quotation and original chunk ID. The parent synthesizes the delivered findings.
+
+The default demo still runs the scripted offline tree. The `--live` flag opts in to Bedrock. The factory creates a fresh `BedrockRootClient` for each invocation, and the existing `RecursiveResearch` runner binds the shared budget. Depth one permits the two expected children and leaves grandchildren outside the experiment. The controller omits the delegation tool at the depth ceiling and keeps the runtime depth check. Starting with this shallow tree makes failures in delegation, evidence delivery, and synthesis easier to distinguish. A scripted live tool sequence would bypass model-directed decisions. Giving the root a wider corpus would make it harder to attribute evidence and resource use to the two target filings.
+
+### Run comparison
+
+All four runs used Amazon Bedrock with Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) in `us-east-1`.
+
+| Metric | Initial | Batching | Reservations | Latest |
+| --- | ---: | ---: | ---: | ---: |
+| Provider attempts | 1 | 12 | 10 | 9 |
+| Corpus attempts | 0 | 8 | 6 | 5 |
+| Input tokens | 3,835 | 54,703 | 43,451 | 36,417 |
+| Output tokens | 416 | 2,392 | 3,190 | 2,866 |
+| Total reported tokens | 4,251 | 57,095 | 46,641 | 39,283 |
+| Wall time (seconds) | 4.0379 | 35.6985 | 43.8476 | 37.2452 |
+| Delivered findings | 0 | 1 | 1 | 2 |
+| Final original citations | 0 | 0 | 0 | 2 |
+| Outcome | `multiple_tool_uses` | `budget_exhausted` | `truncated_response` | `success` |
+
+The successful run used about 31.2% fewer reported tokens than the budget-exhausted run and 15.8% fewer than the preceding reservations run. The reservations run itself used 18.3% fewer reported tokens and took 22.8% longer than the batching run. These are individual runs with changes to prompts and finalization policies. The comparisons do not isolate the effect of any one change, support statistical generalization, or establish measured billing savings.
+
+### First live result
+
+The single-tool adapter rejected the response with `multiple_tool_uses`. The run ended as `incomplete` with stop reason `model_error`. It recorded one session, one decision, one provider response, 3.952s provider-reported latency, no delegation, and no exhausted budget. The exact tool names and arguments were not recorded, so the trace does not establish which requests were grouped.
+
+### Batch-enabled live result and finalization starvation
+
+Run `f3e66af80dab48179df5627829f56e7f` recorded 3 sessions, 13 decisions, 12 provider responses, and a maximum depth of 1. The root requested two delegations in one reply. Both children ran sequentially and the root acknowledged both outcomes. No provider protocol errors occurred.
+
+- **FY2023:** Four searches delivered four chunks. The fifth API call finished with a validated finding on geopolitical tensions and supply continuity. The parent acknowledged original chunk `bd263969e91358073d0ea0a1`. The child used 24,198 tokens. Per-request input was **3,328 → 4,000 → 4,637 → 5,270 → 5,838**.
+- **FY2024:** Four retrieval operations delivered four chunks, including `d21883065d62ee6692558dfe`, the chunk used by the earlier targeted experiment. The fifth API call requested another retrieval and hit `tool_call_limit`. The child used 23,689 tokens and submitted no validated finding, so the root acquired no citation access from it. Per-request input was **3,328 → 4,000 → 4,591 → 5,231 → 5,855**.
+- **Root:** Its additional retrieval hit `corpus_attempt_limit`. Its next decision was blocked by `provider_attempt_limit`, ending with `budget_exhausted`. Root usage was 8,625 input and 583 output tokens.
+
+This run demonstrated live recursive delegation and child-to-parent evidence transfer. Investigations consumed the capacity needed to finalize. The child token sequences also show that fresh conversations isolate parent context while each child's own history still accumulates.
+
+### Protected finalization
+
+The live demo keeps the same shared limits. With the default 12 provider attempts and two child slots of four each, the root initially has four attempts. Each pool holds **three investigation attempts and one finish-only attempt**. Prospective child pools are held before admission, so neither the root nor an early child can spend a later child's share. Unused attempts from an admitted child return to root investigation on exit, including failure. Slots for children that never launch stay set aside until the run ends. A voluntary early finish during investigation uses an investigation attempt.
+
+Run `71927fc9d79b444589f7aecdd244fc57` recorded 3 sessions and 10 decisions, completed both depth-one delegations, and made nine investigation attempts and one protected finish attempt. No shared attempt, reported-token, or deadline limit was exhausted.
+
+- **FY2023:** Three provider attempts and two searches delivered four unique chunks. The child finished during investigation with a validated finding citing `bd263969e91358073d0ea0a1`. The parent acknowledged the finding. The child used 15,343 reported tokens and returned one unused provider slot.
+- **FY2024:** Three investigation requests delivered three chunks. On the protected attempt, Claude requested `search_chunks` despite the finish-only tool list. The runtime rejected it as `finalization_only` and the child stopped with `budget_exhausted` / `finalization_attempt_limit`. It used 15,930 reported tokens and granted no findings or citations to the parent.
+- **Root:** The root acknowledged both child outcomes and directly retrieved FY2024 chunk `948f04ad7acdaaa298cc3d01`. Its third provider reply reached the 1,024 output-token cap. The adapter rejected it as `truncated_response` without recording a complete action. The root stopped with `model_error` despite remaining provider capacity.
+
+#### Finish request controls and truncation recovery
+
+Investigation turns show the remaining local and shared budgets and leave tool choice to the model. The controller enters finish-only mode when investigation attempts or local tool slots run out, when it reaches the last local decision, or when neither corpus work nor delegation is available. It replaces the investigation prompt and offers only `finish_research`. The default `auto` choice can still yield a prohibited request, as observed in the protected run. `--finalization-tool-choice required` requests the named finish tool in Bedrock Converse or direct Anthropic Messages. Runtime enforcement rejects further research and validates the finish, citations, and quotations. The prompt asks for an incomplete result or abstention when evidence is insufficient.
+
+The course Sonnet 4.5 profile accepted named choice in the successful run below. Converse support varies by model and configuration. The AWS `SpecificToolChoice` reference lists Claude 3, while the AWS Claude guide describes the Converse setting more broadly. The demo defaults to `auto`. A validation rejection with named choice is reported as `aws_required_finish_validation` (or `http_required_finish_validation` for a direct Messages HTTP 400) without retry or automatic fallback. The adapters do not enable extended thinking. [AWS SpecificToolChoice](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_SpecificToolChoice.html) [AWS Claude tool use](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages-tool-use.html#forced-tool-use) [Anthropic tool choice](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools#forcing-tool-use)
+
+Reservations protect request slots. The finish output cap is separately configurable and defaults to 2,048 tokens, while investigation defaults to 1,024. The experiment asks each child for a one-sentence answer plus one supported finding with the quote given once. The root is asked for a concise comparison with original citations, the IDs of findings it used, and coverage limits. Queries remain model-driven. These prompt and cap changes affect comparability with earlier live runs.
+
+A `max_tokens` investigation reply supplies usage but no executable action. If a protected slot and the other limits permit, the controller makes one transition to finish-only. It resends the last valid history with the original pending tool results and IDs, including batches. It never appends the partial assistant reply or duplicates result messages. Previously unacknowledged evidence becomes eligible only after the provider acknowledges delivery. The recovery attempt spends the existing finish allowance. A truncated finish ends the invocation, and a transport retry still spends an attempt from the current phase. The shared 60,000-token admission threshold and cooperative deadline still apply. This recovery is verified offline only.
+
+### First successful end-to-end live run
+
+Run `1b803beef0f948d9943f23e582c57cd7` ended with status `success` and stop reason `finished`. All six structural criteria passed. The root requested both fiscal-year delegations in one batch. The run recorded 3 sessions, 9 decisions, 9 provider responses, zero retries, 2 partition assignments, and a maximum depth of 1. The nine attempts comprised eight investigation attempts and one protected finish. Provider-reported latency summed to 33.601 seconds. Cache reads and writes reported zero tokens, and there were no provider or validation errors.
+
+| Invocation | Provider / corpus attempts | Reported tokens | Evidence and finish |
+| --- | ---: | ---: | --- |
+| FY2023 child | 4 / 3 | 16,171 | Received two unique chunks, with one repeated direct lookup. Exhausted its investigation allowance, then used `finish_research` with required tool choice and 332 output tokens. Delivered `child-1:finding-1`, citing `a19fccaa6f0cd45a5fb8c0a8`. |
+| FY2024 child | 3 / 2 | 12,825 | Two searches delivered two unique chunks. Finished during investigation and released one unused provider slot. Delivered `child-2:finding-1`, citing `02834a6d106b2138d0425352`. |
+| Root | 2 / 0 | 10,287 | Received and declared both findings used. Its final response used 976 output tokens to synthesize a comparison citing both original chunks. Both partitions retained partial coverage. |
+
+This establishes live model-directed delegation, protected finalization, child-to-parent evidence transfer, and synthesis with Claude. The protected finish used fewer than 1,024 output tokens, so this run does not establish a need for the increased finish cap. Depth-two delegation and truncation recovery remain offline-tested.
+
+### Configuration and manual reproduction
+
+With the local canonical files available and temporary AWS credentials configured outside the repository, run from the repository root:
+
+```bash
+BEDROCK_REGION=us-east-1 \
+  BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
+  CLAUDE_MAX_OUTPUT_TOKENS=1024 PYTHONPATH=Code/src \
+  python Code/examples/demo_rlm_recursive.py --live --trace \
+    --finalization-tool-choice required --finalization-max-output-tokens 2048
+```
+
+The successful run used the configuration above. Use `--finalization-tool-choice auto` for a separate run with the default policy if the provider rejects a named request. The demo disables automatic retries even if `CLAUDE_MAX_RETRIES` is set. The Bedrock SDK permits one transport attempt per call. The request timeout defaults to 20 seconds and is capped by the remaining time.
+
+| Limit | Default | Option |
+| --- | ---: | --- |
+| Shared recursion depth | 1 | `--max-depth` |
+| Shared delegated invocations | 2 | `--max-delegations` |
+| Shared provider attempts | 12 | `--max-provider-attempts` |
+| Shared corpus attempts | 8 | `--max-corpus-attempts` |
+| Shared partition assignments | 2 | `--max-partitions` |
+| Shared reported-token threshold | 60,000 | `--max-reported-tokens` |
+| UTF-8 bytes per observation | 6,000 | `--max-response-bytes` |
+| Shared and per-invocation deadline | 120 seconds | `--deadline-seconds` |
+| Model decisions per invocation | 6 | `--max-iterations` |
+| Tool attempts per invocation | 4 | `--max-tool-calls` |
+| Provider attempts per child | 4 | `--child-provider-attempts` |
+| Reserved finish-only provider attempts per invocation | 1 | `--finalization-attempts` (`0` restores the unreserved policy) |
+| Output tokens per investigation response | 1,024 | `CLAUDE_MAX_OUTPUT_TOKENS` |
+| Output tokens per protected finish response | 2,048 | `--finalization-max-output-tokens` |
+| Finish-only tool choice | `auto` | `--finalization-tool-choice {auto,required}` |
+
+The shared counts are checked before new work. Both deadline settings use the same flag so the root's usual 30-second controller default cannot shorten the experiment. Children inherit the time remaining. The deadline remains cooperative for blocking SDK calls. Token admission uses reported usage after a request, so an individual response can cross the threshold and missing counters can hide usage. The run never raises its budgets in response to an error.
+
+With reservations enabled, the configuration must leave at least one investigation attempt after reserving finalization for the root and for each configured child. Reduce the child count or allocation explicitly when lowering the provider cap.
+
+### Reading the report
+
+Exit `0` means the recursive experiment met its structural criteria. Exit `1` means the run produced a report and was incomplete. Invalid setup or arguments exit `2`. The report checks provider responses, separate singleton delegations for both years, validated child findings, acknowledged delivery, a finished synthesis declaring which findings it used, and citations from those used findings covering both years. A root that cites both filings directly still misses the delegation criterion. A validated excerpt can contribute even when the child reports incomplete analysis or partial coverage. The report preserves those statuses. An empty finding, failed child, or unacknowledged observation cannot satisfy that year's evidence requirement.
+
+The JSON shows authorized pairs, the invocation tree, budget stops, errors, per-invocation counts, citations, and coverage. Requested tool counts include the native finish request. Operation records separate requests, execution outcomes, and delivery. The report also retains bounded, sanitized tool IDs, names, and arguments for rejected responses when the tool blocks can be decoded. Each excerpt records whether the parent declared its finding used. `--trace` adds per-decision and per-attempt telemetry. The report omits private reasoning, raw provider payloads, authentication headers, and whole observation bodies.
+
+The report takes shared counts and measured token usage from the root's final budget snapshot. It separates investigation attempts, finish-only attempts, and unused child slots returned to the root. Per-invocation traces identify the change to finalization and its reason. Provider usage is aggregated once over the invocation tree, with missing-counter counts retained. Per-invocation wall times include their children, so adding them would double-count time. Summed provider latency and attempt wall time describe provider work separately from elapsed run time.
+
+**Semantic review of the successful run.** The final answer inferred a shift toward geopolitical risks in FY2024 from two independently selected excerpts. An earlier FY2023 run retrieved `bd263969e91358073d0ea0a1`, which explicitly discusses geopolitical tensions involving Taiwan and China and their implications for supply continuity. The latest excerpts cannot establish that geopolitical risk was new or received greater emphasis in FY2024. The latest FY2023 quotation also does not independently support its finding's additional claim about demand estimation challenges. That child returned `finished` with a finding marked `analyzed`, while its invocation-level analysis status remained `incomplete`.
+
+Citation provenance identifies the original chunk and quotation validation checks its wording. Coverage describes the evidence accessed, and analysis status is model-reported. In this run, both partitions remained partial and exhaustive descendant coverage roll-up is still pending. Independent semantic verification would have to test whether the evidence supports each claim and comparison.
+
+### Offline verification of the live path
+
+Stubbed Bedrock and Anthropic responses verify both-years delegation in one reply, provider result IDs, sequential execution, malformed and duplicate IDs, mixed finish rejection, mid-batch budget exhaustion, and the aggregate byte cap. The default scripted demo still runs without provider attempts. These checks do not estimate live latency, token savings, or answer quality.
+
+The starvation regression reproduces 12 provider attempts, 13 model decisions, 8 corpus attempts, and no final citations with reservations disabled. Other stubbed tests inspect named finish choice and output caps in both provider payloads, preserve pending single and batched results across truncation, and verify usage, runtime rejection, evidence validation, and budget stops. A combined regression recovers the root after truncation and still reports the experiment incomplete when the FY2024 child's finish attempt requests a prohibited search. A direct FY2024 citation cannot satisfy the delegated-finding criterion.
+
+| Check | Result |
+| --- | --- |
+| Focused RLM suite, including starvation, finalization, and truncation recovery | 138 passed, 1 warning in 2.51s |
+| Related retrieval, RAG provenance, and canonical corpus regressions | 40 passed, 1 warning in 17.41s |
+| Default scripted demo on the canonical corpus | Exit 0, two original chunk citations, zero provider attempts |
+
+Both test runs reported the existing AnyIO pytest deprecation. Reproduction uses the same offline test commands from the recursive milestone above.
 
 ## Ongoing engineering record
 

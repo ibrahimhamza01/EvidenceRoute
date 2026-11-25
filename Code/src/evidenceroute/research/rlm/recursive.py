@@ -10,9 +10,9 @@ from uuid import uuid4
 
 from pydantic import Field, ValidationError
 
-from evidenceroute.research.rlm.budget import BudgetExceeded, SharedBudget, SharedLimits
+from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
 from evidenceroute.research.rlm.controller import (
-    ExecutionTrace, RootController, RootLimits, RootModelClient, StepTrace, _FinishAction,
+    ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction,
 )
 from evidenceroute.research.rlm.coverage import CoverageReport, ResearchScope, SectionTarget
 from evidenceroute.research.rlm.environment import CorpusEnvironment
@@ -60,6 +60,7 @@ class RecursiveResearch:
     def __init__(
         self, corpus: CorpusEnvironment, model_factory: Callable[[Invocation], RootModelClient], *,
         shared_limits: SharedLimits | None = None, local_limits: RootLimits | None = None,
+        finalization: FinalizationPolicy | None = None,
         clock: Callable[[], float] = monotonic,
     ):
         self.corpus = corpus
@@ -67,6 +68,7 @@ class RecursiveResearch:
         self.shared_limits = shared_limits if shared_limits is not None else SharedLimits()
         self.local_limits = local_limits if local_limits is not None else RootLimits()
         self.clock = clock
+        self.finalization = finalization
 
     def run(
         self, question: str, *, partitions: tuple[SectionTarget, ...] | None = None,
@@ -74,7 +76,7 @@ class RecursiveResearch:
     ) -> ExecutionTrace:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Research question must be a non-blank string.")
-        budget = SharedBudget(self.shared_limits, self.clock)
+        budget = SharedBudget(self.shared_limits, self.clock, finalization=self.finalization)
         if partitions is not None:
             partitions = tuple(partitions)
             if not partitions or len(partitions) > self.shared_limits.max_partitions:
@@ -90,6 +92,13 @@ class RecursiveResearch:
             self.corpus.get_section(pair.document_id, pair.section_id, limit=1)
 
     def _invoke(
+        self, invocation: Invocation, budget: SharedBudget, clients: list[RootModelClient],
+        parent_deadline: float,
+    ) -> ExecutionTrace:
+        with budget.invocation_allocation(root=invocation.depth == 0):
+            return self._run_invocation(invocation, budget, clients, parent_deadline)
+
+    def _run_invocation(
         self, invocation: Invocation, budget: SharedBudget, clients: list[RootModelClient],
         parent_deadline: float,
     ) -> ExecutionTrace:
@@ -111,8 +120,10 @@ class RecursiveResearch:
             prompt += f"\nAnalysis goal: {invocation.goal}"
         if partitions is not None:
             prompt += "\nAuthorized partitions: " + observation_json([vars(pair) for pair in partitions])
+        if invocation.depth < budget.limits.max_depth:
+            prompt += "\nUse delegate_research only for a narrower subproblem."
         prompt += (
-            "\nUse delegate_research only for a narrower subproblem. Submit findings via finish_research "
+            "\nSubmit findings via finish_research "
             "with exact quotes and original chunk IDs. Report uncertainty, conflicts and incomplete analysis. "
             "Name used_finding_ids when synthesizing delegated evidence. Search misses do not establish absence."
         )
@@ -136,6 +147,15 @@ class RecursiveSession:
         self.findings: tuple[Finding, ...] = ()
         self.used_finding_ids: tuple[str, ...] = ()
         self.analysis_status: AnalysisStatus = "incomplete"
+
+    def can_delegate(self) -> bool:
+        if self.invocation.depth and len(self.invocation.partitions or ()) <= 1:
+            return False
+        try:
+            self.budget.check_child(self.invocation.depth + 1, 1)
+        except BudgetExceeded:
+            return False
+        return True
 
     def tool_schema(self) -> dict:
         return {
@@ -217,7 +237,7 @@ class RecursiveSession:
         refs = tuple(dict.fromkeys(item.source for finding in findings for item in finding.evidence))
         return DispatchResult(validated, content, refs), delegation
 
-    def record_delivery(self, step: StepTrace) -> None:
+    def record_delivery(self, step: ToolTrace) -> None:
         if step.delegation is None:
             self.direct_ids.update(ref.chunk_id for ref in step.evidence)
         elif step.delegation.child is not None and step.delegation.status in {"finished", "incomplete"}:

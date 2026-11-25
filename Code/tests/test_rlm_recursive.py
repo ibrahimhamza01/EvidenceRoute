@@ -1,15 +1,19 @@
 """Offline recursive workflows over canonical-shaped local fixtures."""
 
 import csv
+import runpy
 from collections import deque
 from dataclasses import asdict
 import json
+from pathlib import Path
 
+import boto3
 import pytest
+from botocore.exceptions import ClientError
 
 from evidenceroute.ingestion.processor import chunk_sections, write_parquet
 from evidenceroute.research.rlm import CorpusEnvironment
-from evidenceroute.research.rlm.budget import SharedLimits
+from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
 from evidenceroute.research.rlm.claude import ClaudeConfig, ClaudeRootClient, ProviderTransportError
 from evidenceroute.research.rlm.controller import RootLimits, ScriptedModelClient
 from evidenceroute.research.rlm.coverage import SectionTarget
@@ -396,3 +400,689 @@ def test_factory_cannot_reuse_a_model_session(snapshot):
     trace = RecursiveResearch(corpus, lambda _: shared_client).run("Check a risk.")
     assert trace.steps[0].delegation.error == "child_execution_error"
     assert trace.shared_budget.model_sessions == trace.shared_budget.delegated_invocations == 1
+
+
+@pytest.fixture
+def recursive_demo(snapshot, monkeypatch):
+    corpus, _ = snapshot
+    monkeypatch.setattr("evidenceroute.research.rlm.CorpusEnvironment", lambda: corpus)
+    path = Path(__file__).resolve().parents[1] / "examples" / "demo_rlm_recursive.py"
+    return runpy.run_path(str(path))["main"]
+
+
+def test_recursive_demo_defaults_to_scripted_without_provider_setup(recursive_demo, monkeypatch, capsys):
+    monkeypatch.setattr(boto3, "Session", lambda: pytest.fail("Offline mode must not construct a session"))
+    assert recursive_demo([]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "scripted offline"
+    assert report["shared_usage"]["provider_attempts"] == 0
+    assert report["trace"]["delegations"][1]["child"]["delegations"][0]["child"]["invocation"]["depth"] == 2
+
+
+def converse_reply(action, tool_id, *, usage=None):
+    finish_action = action["type"] == "finish"
+    name = "finish_research" if finish_action else action["name"]
+    arguments = {key: value for key, value in action.items() if key != "type"} if finish_action else action["arguments"]
+    return {
+        "stopReason": "tool_use", "output": {"message": {"role": "assistant", "content": [
+            {"toolUse": {"toolUseId": tool_id, "name": name, "input": arguments}},
+        ]}},
+        "usage": usage if usage is not None else {"inputTokens": 11, "outputTokens": 4, "cacheReadInputTokens": 0},
+        "metrics": {"latencyMs": 250},
+    }
+
+
+def stub_bedrock(monkeypatch, conversations, *, model="fixture-sonnet"):
+    available = deque(deque(replies) for replies in conversations)
+    sessions = []
+    monkeypatch.setenv("BEDROCK_MODEL_ID", model)
+    monkeypatch.setenv("BEDROCK_REGION", "us-east-1")
+    # The live demo disables retries even if other demos have them configured.
+    monkeypatch.setenv("CLAUDE_MAX_RETRIES", "2")
+
+    class Session:
+        def __init__(self):
+            self.replies = available.popleft()
+            self.requests = []
+            sessions.append(self)
+
+        def client(self, service, *, region_name, config):
+            assert service == "bedrock-runtime" and region_name == "us-east-1"
+            assert config.retries["total_max_attempts"] == 1
+            assert config.read_timeout > 0
+            return StubClient(self.requests, self.replies)
+
+    class StubClient:
+        def __init__(self, requests, replies):
+            self.requests = requests
+            self.replies = replies
+
+        def converse(self, **payload):
+            self.requests.append(payload)
+            result = self.replies.popleft()
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(boto3, "Session", Session)
+    return sessions
+
+
+@pytest.mark.parametrize("case", ["both", "one_cited", "missing_finding", "child_failed", "undelivered"])
+def test_live_recursive_experiment_with_stubbed_converse(snapshot, recursive_demo, monkeypatch, capsys, case):
+    corpus, (old, new, _) = snapshot
+    old_chunk = corpus.read_chunks(old, RISK).items[0]
+    new_chunk = corpus.read_chunks(new, RISK).items[0]
+    first = delegate(SectionTarget(old, RISK))
+    second = delegate(SectionTarget(new, RISK))
+    bad_request = ClientError({"Error": {"Code": "ThrottlingException", "Message": "private payload"}}, "Converse")
+    cite_both = case == "both"
+    finish_action = finish(
+        *([old_chunk.chunk_id, new_chunk.chunk_id] if cite_both else [old_chunk.chunk_id]),
+        used=["child-1:finding-1", "child-2:finding-1"] if cite_both else ["child-1:finding-1"],
+    )
+    conversations = [
+        [converse_reply(first, "old-delegate"), converse_reply(second, "new-delegate"),
+         bad_request if case == "undelivered" else converse_reply(finish_action, "root-finish")],
+        [converse_reply(tool("search_chunks", query="supply", limit=1), "old-search"),
+         converse_reply(finish(findings=[finding(old_chunk)]), "old-finish")],
+        [converse_reply(tool("get_chunk", chunk_id=new_chunk.chunk_id), "new-read"),
+         bad_request if case == "child_failed" else converse_reply(
+             finish(findings=[] if case == "missing_finding" else [finding(new_chunk, status="incomplete")]),
+             "new-finish", usage={"inputTokens": 13, "cacheWriteInputTokens": 3},
+         )],
+    ]
+    sessions = stub_bedrock(monkeypatch, conversations)
+    exit_code = recursive_demo(["--live", "--trace"])
+    out = capsys.readouterr().out
+    assert "private payload" not in out
+    report = json.loads(out)
+    assert exit_code == (0 if cite_both else 1)
+    assert report["status"] == ("success" if cite_both else "incomplete")
+    assert not report["semantic_claims_verified"] and not report["exhaustive_descendant_coverage_rollup"]
+    assert report["actual_maximum_depth"] == 1
+    assert report["region"] == "us-east-1" and report["model_id"] == "fixture-sonnet"
+    assert report["authorized_partitions"] == {
+        "2023": {"document_id": old, "section_id": RISK}, "2024": {"document_id": new, "section_id": RISK},
+    }
+    assert report["limits"]["shared"] == {
+        "max_depth": 1, "max_delegations": 2, "max_provider_attempts": 12, "max_corpus_attempts": 8,
+        "max_partitions": 2, "max_reported_tokens": 60_000, "deadline_seconds": 120,
+    }
+    assert report["limits"]["local"]["deadline_seconds"] == 120
+    assert report["limits"]["local"]["max_response_bytes"] == 6_000
+    assert report["limits"]["provider"]["max_retries"] == 0
+    assert [len(session.requests) for session in sessions] == [3, 2, 2]
+    for index, session in enumerate(sessions):
+        first_request = session.requests[0]
+        assert len(first_request["messages"]) == 1
+        names = {tool["toolSpec"]["name"] for tool in first_request["toolConfig"]["tools"]}
+        assert {"search_chunks", "finish_research"} <= names
+        assert ("delegate_research" in names) == (index == 0)
+    assert "Make two separate delegate_research" in sessions[0].requests[0]["messages"][0]["content"][0]["text"]
+    assert old in sessions[1].requests[0]["messages"][0]["content"][0]["text"]
+    assert new not in sessions[1].requests[0]["messages"][0]["content"][0]["text"]
+    first_result = sessions[0].requests[1]["messages"][-1]["content"][0]["toolResult"]
+    assert first_result["toolUseId"] == "old-delegate"
+    evidence = first_result["content"][0]["json"]["result"]["findings"][0]["evidence"][0]
+    assert evidence["quote"] == QUOTE and evidence["source"]["chunk_id"] == old_chunk.chunk_id
+    assert len(QUOTE) <= len(old_chunk.text)
+    root_trace = report["trace"]
+    first_child, second_child = root_trace["delegations"]
+    assert first_child["child"]["invocation"]["parent_id"] == "root"
+    assert first_child["child"]["evidence_delivered"]["direct_chunk_text_ids"] == [old_chunk.chunk_id]
+    assert root_trace["evidence_delivered"]["direct_chunk_text_ids"] == []
+    assert second_child["child"]["coverage_status"] == ("missing" if case == "child_failed" else "partial")
+    assert report["shared_usage"]["model_sessions"] == 3
+    assert report["shared_usage"]["model_decisions"] == report["provider_usage"]["provider_attempts"] == 7
+    assert report["shared_usage"]["corpus_attempts"] == 2 and report["shared_usage"]["partition_assignments"] == 2
+    assert report["provider_usage"]["provider_retries"] == 0
+    assert report["provider_usage"]["attempts_with_missing_input_or_output"] == (2 if case == "undelivered" else 1)
+    if cite_both:
+        assert all(report["criteria"].values())
+        assert report["shared_usage"]["reported_tokens"] == 106
+        assert report["provider_usage"]["tokens"]["input_tokens"]["reported_total"] == 79
+        assert report["provider_usage"]["tokens"]["output_tokens"]["reported_total"] == 24
+        assert report["provider_usage"]["tokens"]["cache_creation_input_tokens"] == {
+            "reported_total": 3, "missing_attempts": 6,
+        }
+        assert report["provider_usage"]["reported_provider_latency_seconds_sum"] == 1.75
+        assert [ref["fiscal_year"] for ref in report["original_citations"]] == [2023, 2024]
+        assert not any(ref["direct_chunk_text_delivered"] for ref in report["original_citations"])
+        assert all(ref["delegated_excerpts"][0]["quote"] == QUOTE for ref in report["original_citations"])
+    else:
+        assert not report["criteria"]["original_citations_from_used_findings_for_both_years"]
+    if case == "undelivered":
+        assert not second_child["observation_acknowledged"]
+        assert second_child["child"]["findings_generated"] and not second_child["delivered_finding_ids"]
+
+
+def test_direct_both_year_citations_do_not_pass_the_recursive_experiment(
+    snapshot, recursive_demo, monkeypatch, capsys,
+):
+    corpus, (old, new, _) = snapshot
+    chunks = [corpus.read_chunks(doc, RISK).items[0].chunk_id for doc in (old, new)]
+    stub_bedrock(monkeypatch, [[
+        converse_reply(tool("get_chunk", chunk_id=chunks[0]), "read-old"),
+        converse_reply(tool("get_chunk", chunk_id=chunks[1]), "read-new"),
+        converse_reply(finish(*chunks), "finish"),
+    ]], model="arn:aws:bedrock:us-east-1:123456789012:inference-profile/fixture")
+    assert recursive_demo(["--live", "--max-provider-attempts", "3", "--deadline-seconds", "65",
+                           "--finalization-attempts", "0"]) == 1
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert "123456789012" not in output
+    assert report["stop_reason"] == "finished" and report["status"] == "incomplete"
+    assert report["limits"]["shared"]["max_provider_attempts"] == 3
+    assert report["limits"]["local"]["deadline_seconds"] == report["limits"]["shared"]["deadline_seconds"] == 65
+    assert not report["criteria"]["separate_year_delegations"]
+    assert len(report["original_citations"]) == 2
+    assert all(ref["direct_chunk_text_delivered"] for ref in report["original_citations"])
+
+
+def test_live_experiment_reports_budget_exhaustion(recursive_demo, snapshot, monkeypatch, capsys):
+    _, (old, _, _) = snapshot
+    sessions = stub_bedrock(monkeypatch, [[converse_reply(delegate(SectionTarget(old, RISK)), "only-call")], []])
+    assert recursive_demo(["--live", "--max-provider-attempts", "1", "--finalization-attempts", "0"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "incomplete" and report["stop_reason"] == "budget_exhausted"
+    assert report["trace"]["budget_stop"] == "provider_attempt_limit"
+    assert report["provider_usage"]["provider_attempts"] == 1
+    assert list(map(lambda session: len(session.requests), sessions)) == [1, 0]
+
+
+def converse_batch(*actions):
+    reply = converse_reply(actions[0], "batch-1")
+    reply["output"]["message"]["content"].extend(
+        converse_reply(action, f"batch-{index}")["output"]["message"]["content"][0]
+        for index, action in enumerate(actions[1:], 2)
+    )
+    return reply
+
+
+@pytest.mark.parametrize("tool_limit", [1, 4])
+def test_live_recursive_delegations_in_one_bedrock_response(snapshot, recursive_demo, monkeypatch, capsys, tool_limit):
+    corpus, (old, new, _) = snapshot
+    old_chunk = corpus.read_chunks(old, RISK).items[0]
+    new_chunk = corpus.read_chunks(new, RISK).items[0]
+    two_years = tool_limit != 1
+    batch = converse_batch(delegate(SectionTarget(old, RISK)), delegate(SectionTarget(new, RISK)))
+    actions = [
+        [batch, converse_reply(finish(
+            old_chunk.chunk_id, *([new_chunk.chunk_id] if two_years else []),
+            used=["child-1:finding-1", *(["child-2:finding-1"] if two_years else [])],
+        ), "finish")],
+        [converse_reply(tool("get_chunk", chunk_id=old_chunk.chunk_id), "read-old"),
+         converse_reply(finish(findings=[finding(old_chunk)]), "old-finish")],
+    ]
+    if two_years:
+        actions.append([
+            converse_reply(tool("get_chunk", chunk_id=new_chunk.chunk_id), "read-new"),
+            converse_reply(finish(findings=[finding(new_chunk)]), "new-finish"),
+        ])
+    sessions = stub_bedrock(monkeypatch, actions)
+    assert recursive_demo(["--live", "--trace", "--max-tool-calls", str(tool_limit)]) == (0 if two_years else 1)
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == ("success" if two_years else "incomplete")
+    assert report["stop_reason"] == "finished"
+    root_messages = sessions[0].requests[-1]["messages"]
+    assert root_messages[-2] == batch["output"]["message"]
+    assert len(root_messages) == 3
+    results = [block["toolResult"] for block in root_messages[-1]["content"]]
+    assert [item["toolUseId"] for item in results] == ["batch-1", "batch-2"]
+    old_result, new_result = (item["content"][0]["json"] for item in results)
+    assert old_result["result"]["child_invocation_id"] == "child-1"
+    if two_years:
+        assert new_result["result"]["child_invocation_id"] == "child-2"
+        assert old in sessions[1].requests[0]["messages"][0]["content"][0]["text"]
+        assert new in sessions[2].requests[0]["messages"][0]["content"][0]["text"]
+        assert len(report["original_citations"]) == 2
+    else:
+        assert new_result["error"]["code"] == "tool_call_limit"
+        assert report["trace"]["tool_operations"][1]["outcome"] == "skipped"
+        assert len(sessions) == 2 and len(report["original_citations"]) == 1
+    count = 2 if two_years else 1
+    usage = report["shared_usage"]
+    assert usage["corpus_attempts"] == usage["partition_assignments"] == usage["delegated_invocations"] == count
+    assert usage["model_decisions"] == report["provider_usage"]["provider_attempts"] == 2 + count * 2
+    assert usage["reported_tokens"] == (2 + count * 2) * 15
+
+
+@pytest.mark.parametrize("case", ["invalid_peer", "shared_limit", "mixed_finish", "oversized", "envelope", "duplicate"])
+def test_batch_is_bounded_and_only_delivered_evidence_is_citable(snapshot, monkeypatch, case):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (old, new, _) = snapshot
+    first, second = [corpus.read_chunks(doc, RISK).items[0] for doc in (old, new)]
+    first_action, second_action = [tool("get_chunk", chunk_id=chunk.chunk_id) for chunk in (first, second)]
+    if case == "invalid_peer":
+        second_action = tool("get_chunk", chunk_id=5)
+    if case == "mixed_finish":
+        second_action = finish()
+    initial = converse_batch(first_action, second_action)
+    if case == "duplicate":
+        initial["output"]["message"]["content"][1]["toolUse"]["toolUseId"] = "batch-1"
+    replies = [initial]
+    if case not in {"envelope", "duplicate"}:
+        if case == "oversized":
+            replies.append(converse_reply(finish(second.chunk_id), "unseen"))
+        ids = () if case == "mixed_finish" else (first.chunk_id,)
+        replies.append(converse_reply(finish(*ids), "final"))
+    sessions = stub_bedrock(monkeypatch, [replies])
+    limits = RootLimits(max_response_bytes={"oversized": 750, "envelope": 128}.get(case, 6_000))
+    shared = SharedLimits(max_corpus_attempts=1 if case == "shared_limit" else 8)
+    trace = RecursiveResearch(corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+                              local_limits=limits, shared_limits=shared).run("Check a batch.")
+    step = trace.steps[0]
+    assert step.provider_tool_request_count == 2
+    if case in {"duplicate", "envelope"}:
+        assert trace.stop_reason == ("model_error" if case == "duplicate" else "batch_observation_limit")
+        assert trace.shared_budget.corpus_attempts == 0 and len(sessions[0].requests) == 1
+        return
+    assert trace.stop_reason == "finished"
+    outcomes = sessions[0].requests[1]["messages"][-1]["content"]
+    bodies = [item["toolResult"]["content"][0]["json"] for item in outcomes]
+    expected_error = {
+        "invalid_peer": "invalid_arguments", "shared_limit": "corpus_attempt_limit",
+        "mixed_finish": "mixed_finish_batch", "oversized": "batch_observation_limit",
+    }[case]
+    assert bodies[1]["error"]["code"] == expected_error
+    assert bodies[0]["ok"] == (case != "mixed_finish")
+    assert trace.shared_budget.corpus_attempts == (0 if case == "mixed_finish" else 1 if case == "shared_limit" else 2)
+    assert {ref.chunk_id for ref in trace.coverage.visible_chunks} == (set() if case == "mixed_finish" else {first.chunk_id})
+    if case == "oversized":
+        assert step.batch_operations[1].delivery_error == "batch_observation_limit"
+        assert step.batch_operations[1].evidence[0].chunk_id == second.chunk_id
+        assert trace.steps[1].error["code"] == "unseen_citation"
+
+
+def test_child_can_exhaust_provider_budget_before_second_batch_operation(
+    snapshot, recursive_demo, monkeypatch, capsys,
+):
+    corpus, (old, new, _) = snapshot
+    chunk = corpus.read_chunks(old, RISK).items[0]
+    sessions = stub_bedrock(monkeypatch, [
+        [converse_batch(delegate(SectionTarget(old, RISK)), delegate(SectionTarget(new, RISK)))],
+        [converse_reply(tool("get_chunk", chunk_id=chunk.chunk_id), "old-read"),
+         converse_reply(finish(findings=[finding(chunk)]), "old-finish")],
+    ])
+    assert recursive_demo(["--live", "--max-provider-attempts", "3", "--finalization-attempts", "0"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["stop_reason"] == "budget_exhausted"
+    assert report["trace"]["budget_stop"] == "provider_attempt_limit"
+    assert [len(session.requests) for session in sessions] == [1, 2]
+    first, second = report["trace"]["tool_operations"]
+    assert first["outcome"] == "executed" and not first["observation_acknowledged"]
+    assert second["outcome"] == "skipped" and second["error"]["code"] == "provider_attempt_limit"
+    assert report["trace"]["evidence_delivered"]["delegated_excerpts"] == []
+    assert report["shared_usage"]["delegated_invocations"] == 1
+
+
+@pytest.mark.parametrize("protected", [False, True], ids=["reproduce-starvation", "protected-finalization"])
+def test_recursive_demo_with_retrieval_pressure(snapshot, recursive_demo, monkeypatch, capsys, protected):
+    corpus, (old, new, _) = snapshot
+    old_chunk, new_chunk = (corpus.read_chunks(doc, RISK).items[0] for doc in (old, new))
+    delegations = converse_batch(delegate(SectionTarget(old, RISK)), delegate(SectionTarget(new, RISK)))
+    search = tool("search_chunks", query="supply", limit=1)
+    if protected:
+        root_finish = finish(old_chunk.chunk_id, new_chunk.chunk_id,
+                             used=["child-1:finding-1", "child-2:finding-1"])
+        root_replies = [delegations, converse_reply(root_finish, "root-finish")]
+
+        def child_replies(chunk):
+            return [converse_batch(search, search), converse_reply(search, "search-3"),
+                    converse_reply(search, "search-4"),
+                    converse_reply(finish(findings=[finding(chunk)]), "child-finish")]
+        first, second = child_replies(old_chunk), child_replies(new_chunk)
+    else:
+        root_replies = [delegations, converse_reply(search, "blocked-root-search")]
+        first = [converse_reply(search, f"search-{i}") for i in range(1, 5)]
+        first.append(converse_reply(finish(findings=[finding(old_chunk)]), "child-finish"))
+        second = [converse_reply(search, f"search-{i}") for i in range(1, 6)]
+    sessions = stub_bedrock(monkeypatch, [root_replies, first, second])
+    flags = ["--live", "--trace"] + ([] if protected else ["--finalization-attempts", "0"])
+    assert recursive_demo(flags) == (0 if protected else 1)
+    report = json.loads(capsys.readouterr().out)
+    usage = report["shared_usage"]
+    assert usage["corpus_attempts"] == 8 and usage["delegated_invocations"] == 2
+    assert [len(session.requests) for session in sessions] == ([2, 4, 4] if protected else [2, 5, 5])
+    assert usage["provider_attempts"] == (10 if protected else 12)
+    assert usage["model_decisions"] == (10 if protected else 13)
+    assert usage["finalization_provider_attempts"] == (3 if protected else 0)
+    if not protected:
+        assert report["stop_reason"] == "budget_exhausted"
+        assert report["trace"]["budget_stop"] == "provider_attempt_limit"
+        assert report["trace"]["delegations"][1]["child"]["stop_reason"] == "tool_call_limit"
+        assert report["trace"]["tool_operations"][-1]["error"]["code"] == "corpus_attempt_limit"
+        assert report["original_citations"] == []
+        return
+
+    assert report["status"] == "success"
+    assert {item["chunk_id"] for item in report["original_citations"]} == {old_chunk.chunk_id, new_chunk.chunk_id}
+    for session, expected_ids in zip(sessions, [("batch-1", "batch-2"), ("search-4",), ("search-4",)]):
+        final_request = session.requests[-1]
+        tools = [item["toolSpec"]["name"] for item in final_request["toolConfig"]["tools"]]
+        assert tools == ["finish_research"]
+        assert "Finalization only" in final_request["system"][0]["text"]
+        assert [item["toolResult"]["toolUseId"]
+                for item in final_request["messages"][-1]["content"]] == list(expected_ids)
+        assert "local tool slot(s)" in session.requests[0]["system"][0]["text"]
+        assert "shared corpus attempt(s)" in session.requests[0]["system"][0]["text"]
+
+
+@pytest.mark.parametrize("mode", ["search", "batch", "invalid_quote", "unseen_citation", "provider_failure",
+                                  "required_choice_rejected"])
+def test_finalization_rejects_work_and_preserves_validation(snapshot, monkeypatch, mode):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (old, _, _) = snapshot
+    chunk = corpus.read_chunks(old, RISK).items[0]
+    read = tool("get_chunk", chunk_id=chunk.chunk_id)
+    first = converse_reply(read, "first-read")
+    if mode == "search":
+        last = converse_reply(tool("search_chunks", query="supply"), "unexpected-search")
+        expected = "finalization_only"
+    elif mode == "batch":
+        last = converse_batch(read, delegate(SectionTarget(old, RISK)))
+        expected = "finalization_only"
+    elif mode == "invalid_quote":
+        last = converse_reply(finish(findings=[finding(chunk, quote="unseen quote")]), "invalid-quote")
+        expected = "invalid_findings"
+    elif mode == "unseen_citation":
+        last = converse_reply(finish("unseen-id"), "unseen-citation")
+        expected = "unseen_citation"
+    elif mode == "provider_failure":
+        last = ClientError({"Error": {"Code": "ThrottlingException"}}, "Converse")
+        expected = "model_error"
+    else:
+        last = ClientError({"Error": {"Code": "ValidationException", "Message": "private provider detail"}},
+                           "Converse")
+        expected = "model_error"
+    sessions = stub_bedrock(monkeypatch, [[first, last]])
+    monkeypatch.setenv("CLAUDE_MAX_OUTPUT_TOKENS", "1024")
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        local_limits=RootLimits(max_tool_calls=1), shared_limits=SharedLimits(max_delegations=0),
+        finalization=FinalizationPolicy(finalization_tool_choice="required", finalization_max_output_tokens=1792),
+    ).run("Check a risk.")
+    step = trace.steps[-1]
+    assert step.phase == "finalization" and step.finalization_reason == "tool_call_limit"
+    if mode == "batch":
+        assert [op.error["code"] for op in step.batch_operations] == [expected, expected]
+    else:
+        assert step.error["code"] == expected
+    assert trace.answer is None and trace.findings == () and trace.cited_chunk_ids == ()
+    assert trace.stop_reason == ("model_error" if expected == "model_error" else "budget_exhausted")
+    assert trace.shared_budget.corpus_attempts == 1 and trace.shared_budget.delegated_invocations == 0
+    assert trace.shared_budget.finalization_provider_attempts == 1
+    investigation, finalization = sessions[0].requests
+    assert investigation["toolConfig"]["toolChoice"] == {"auto": {}}
+    assert investigation["inferenceConfig"]["maxTokens"] == 1024
+    assert finalization["toolConfig"]["toolChoice"] == {"tool": {"name": "finish_research"}}
+    assert [tool["toolSpec"]["name"] for tool in finalization["toolConfig"]["tools"]] == ["finish_research"]
+    assert finalization["inferenceConfig"]["maxTokens"] == 1792
+    assert "Finalization only" in finalization["system"][0]["text"]
+    assert "retry with that limit" not in finalization["system"][0]["text"]
+    assert finalization["messages"][-1]["content"][0]["toolResult"]["toolUseId"] == "first-read"
+    if mode == "required_choice_rejected":
+        assert step.model_attempts[0].error == "aws_required_finish_validation"
+        assert "private provider detail" not in repr(trace)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single-result", "batched-results"])
+def test_truncated_investigation_replays_only_valid_bedrock_history(snapshot, monkeypatch, batched):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (old, new, _) = snapshot
+    chunk = corpus.read_chunks(old, RISK).items[0]
+    other = corpus.read_chunks(new, RISK).items[0]
+    read = tool("get_chunk", chunk_id=chunk.chunk_id)
+    initial = converse_batch(read, tool("list_sections", document_id=old)) if batched else converse_reply(read, "read")
+    truncated = converse_reply(tool("get_chunk", chunk_id=other.chunk_id), "truncated-read",
+                               usage={"inputTokens": 20, "outputTokens": 1024})
+    truncated["stopReason"] = "max_tokens"
+    if batched:
+        # With no assistant message, acknowledgement must wait for the replay response.
+        truncated["output"]["message"]["content"] = []
+    final = converse_reply(finish(chunk.chunk_id, findings=[finding(chunk)]), "truncated-read")
+    sessions = stub_bedrock(monkeypatch, [[initial, truncated, final]])
+    monkeypatch.setenv("CLAUDE_MAX_OUTPUT_TOKENS", "1024")
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        shared_limits=SharedLimits(max_delegations=0), finalization=FinalizationPolicy(),
+    ).run("Check a risk.")
+
+    _, investigation, recovery = sessions[0].requests
+    assert recovery["messages"] == investigation["messages"]
+    assert recovery["messages"][1] == initial["output"]["message"]
+    expected_ids = ["batch-1", "batch-2"] if batched else ["read"]
+    assert [block["toolResult"]["toolUseId"] for block in recovery["messages"][-1]["content"]] == expected_ids
+    assert investigation["inferenceConfig"]["maxTokens"] == 1024
+    assert recovery["inferenceConfig"]["maxTokens"] == 2048
+    assert recovery["toolConfig"]["toolChoice"] == {"auto": {}}
+    assert trace.steps[1].error["code"] == "truncated_response"
+    assert trace.steps[1].provider_tool_requests == ()
+    assert trace.steps[2].phase == "finalization" and trace.steps[2].finalization_reason == "truncated_response"
+    assert trace.shared_budget.corpus_attempts == len(expected_ids)
+    assert trace.shared_budget.provider_attempts == 3
+    assert trace.shared_budget.investigation_provider_attempts == 2
+    assert trace.shared_budget.finalization_provider_attempts == 1
+    assert trace.shared_budget.reported_tokens == 1074
+    assert trace.model_attempts[1].response_received and trace.model_attempts[1].output_tokens == 1024
+    assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
+    assert {ref.chunk_id for ref in trace.coverage.visible_chunks} == {chunk.chunk_id}
+
+
+@pytest.mark.parametrize("failure", ["truncated", "invalid_quote", "unseen_citation"])
+def test_direct_messages_recovery_uses_named_finish_and_remains_bounded(snapshot, failure):
+    corpus, (old, new, _) = snapshot
+    chunk = corpus.read_chunks(old, RISK).items[0]
+    other = corpus.read_chunks(new, RISK).items[0]
+    partial = {**message("get_chunk", {"chunk_id": other.chunk_id}, ident="partial"), "stop_reason": "max_tokens"}
+    if failure == "truncated":
+        last = partial
+    elif failure == "invalid_quote":
+        last = message("finish_research", {"answer": "answer", "findings": [finding(chunk, quote="invented")]},
+                       ident="finish")
+    else:
+        last = message("finish_research", {"answer": "answer", "cited_chunk_ids": [other.chunk_id]}, ident="finish")
+    transport = Transport(message("get_chunk", {"chunk_id": chunk.chunk_id}), partial, last)
+    trace = RecursiveResearch(
+        corpus, lambda _: ClaudeRootClient(transport, config=ClaudeConfig(max_output_tokens=73)),
+        shared_limits=SharedLimits(max_delegations=0),
+        finalization=FinalizationPolicy(finalization_tool_choice="required", finalization_max_output_tokens=151),
+    ).run("Check a risk.")
+
+    initial, investigation, recovery = [payload for payload, _ in transport.calls]
+    assert initial["tool_choice"] == investigation["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
+    assert recovery["tool_choice"] == {"type": "tool", "name": "finish_research", "disable_parallel_tool_use": True}
+    assert investigation["max_tokens"] == 73 and recovery["max_tokens"] == 151
+    assert investigation["messages"] == recovery["messages"]
+    assert recovery["messages"][-1]["content"][0]["tool_use_id"] == "use-1"
+    assert trace.shared_budget.corpus_attempts == 1 and trace.shared_budget.finalization_provider_attempts == 1
+    assert trace.answer is None and trace.cited_chunk_ids == () and trace.findings == ()
+    if failure == "truncated":
+        assert trace.stop_reason == "model_error" and trace.model_attempts[-1].error == "truncated_response"
+    else:
+        assert trace.budget_stop == "finalization_attempt_limit"
+        assert trace.steps[-1].error["code"] == {"invalid_quote": "invalid_findings",
+                                                 "unseen_citation": "unseen_citation"}[failure]
+
+
+@pytest.mark.parametrize("constraint", ["tokens", "deadline", "unreserved"])
+def test_truncation_does_not_override_remaining_budget(snapshot, constraint):
+    corpus, _ = snapshot
+    now = [0.0]
+
+    class TruncationTransport(Transport):
+        def send(self, payload, *, timeout_seconds):
+            if constraint == "deadline":
+                now[0] = 1.0
+            return super().send(payload, timeout_seconds=timeout_seconds)
+
+    partial = {**message("list_companies", {}, usage={"input_tokens": 2, "output_tokens": 1}),
+               "stop_reason": "max_tokens"}
+    transport = TruncationTransport(partial)
+    trace = RecursiveResearch(
+        corpus, lambda _: ClaudeRootClient(transport, clock=lambda: now[0], config=ClaudeConfig(max_retries=0)),
+        clock=lambda: now[0], shared_limits=SharedLimits(max_delegations=0, deadline_seconds=1.0,
+                                                       max_reported_tokens=3 if constraint == "tokens" else 100),
+        finalization=None if constraint == "unreserved" else FinalizationPolicy(),
+    ).run("Check a risk.")
+    assert trace.stop_reason == {"tokens": "budget_exhausted", "deadline": "deadline", "unreserved": "model_error"}[constraint]
+    if constraint == "tokens":
+        assert trace.budget_stop == "reported_token_limit"
+    assert trace.answer is None and trace.shared_budget.reported_tokens == 3
+    assert len(transport.calls) == 1 and trace.shared_budget.finalization_provider_attempts == 0
+    assert trace.shared_budget.corpus_attempts == 0
+
+
+def test_live_demo_recovers_root_but_reports_failed_child_as_incomplete(snapshot, recursive_demo, monkeypatch, capsys):
+    corpus, (old, new, _) = snapshot
+    old_chunk = corpus.read_chunks(old, RISK).items[0]
+    new_chunk = corpus.read_chunks(new, RISK).items[0]
+    search = tool("search_chunks", query="supply", limit=1)
+    read_new = tool("get_chunk", chunk_id=new_chunk.chunk_id)
+    partial = converse_reply(search, "partial", usage={"inputTokens": 11, "outputTokens": 1024})
+    partial["stopReason"] = "max_tokens"
+    sessions = stub_bedrock(monkeypatch, [
+        [converse_batch(delegate(SectionTarget(old, RISK)), delegate(SectionTarget(new, RISK))),
+         converse_reply(read_new, "root-read"), partial,
+         converse_reply(finish(old_chunk.chunk_id, new_chunk.chunk_id, used=["child-1:finding-1"],
+                               status="incomplete"), "root-finish")],
+        [converse_reply(search, "old-search-1"), converse_reply(search, "old-search-2"),
+         converse_reply(finish(findings=[finding(old_chunk)]), "old-finish")],
+        [converse_reply(read_new, "new-read"), converse_reply(search, "new-search-1"),
+         converse_reply(search, "new-search-2"), converse_reply(search, "new-prohibited")],
+    ])
+    assert recursive_demo(["--live", "--trace", "--finalization-tool-choice", "required"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["limits"]["finalization"]["finalization_tool_choice"] == "required"
+    assert report["stop_reason"] == "finished" and report["status"] == "incomplete"
+    assert report["trace"]["finalization_reason"] == "truncated_response"
+    assert report["shared_usage"]["provider_attempts"] == 11
+    assert report["shared_usage"]["corpus_attempts"] == 6
+    assert report["shared_usage"]["finalization_provider_attempts"] == 2
+    assert report["shared_usage"]["released_child_provider_slots"] == 1
+    old_result, new_result = report["trace"]["delegations"]
+    assert all(result["observation_acknowledged"] for result in (old_result, new_result))
+    assert old_result["delivered_finding_ids"] == ["child-1:finding-1"]
+    assert not new_result["delivered_finding_ids"]
+    assert new_result["child"]["budget_stop"] == "finalization_attempt_limit"
+    assert not report["criteria"]["original_citations_from_used_findings_for_both_years"]
+    assert [ref["direct_chunk_text_delivered"] for ref in report["original_citations"]] == [False, True]
+    assert all(session.requests[-1]["toolConfig"]["toolChoice"] == {"tool": {"name": "finish_research"}}
+               for session in (sessions[0], sessions[2]))
+
+
+def test_child_allocations_are_isolated_and_unused_slots_return_on_failure():
+    budget = SharedBudget(SharedLimits(max_provider_attempts=12, max_delegations=2),
+                          finalization=FinalizationPolicy())
+    with budget.invocation_allocation(root=True):
+        root = budget.active_allocation
+        budget.start_provider_attempt()
+        budget.reserve_child(1, 1)
+        with pytest.raises(RuntimeError, match="setup failed"):
+            with budget.invocation_allocation(root=False):
+                budget.start_provider_attempt()
+                raise RuntimeError("setup failed")
+        assert budget.active_allocation is root and root.investigation_left == 5
+        assert budget.released_child_provider_slots == 3
+        budget.reserve_child(1, 1)
+        with budget.invocation_allocation(root=False):
+            for _ in range(3):
+                budget.start_provider_attempt()
+            with pytest.raises(BudgetExceeded, match="investigation_attempt_limit"):
+                budget.start_provider_attempt()
+            budget.active_allocation.finalizing = True
+            budget.start_provider_attempt()
+            with pytest.raises(BudgetExceeded, match="finalization_attempt_limit"):
+                budget.start_provider_attempt()
+        assert root.finalization_left == 1
+        for _ in range(5):
+            budget.start_provider_attempt()
+        root.finalizing = True
+        budget.start_provider_attempt()
+        with pytest.raises(BudgetExceeded, match="provider_attempt_limit"):
+            budget.start_provider_attempt()
+    assert budget.active_allocation is None and budget.provider_attempts == 12
+
+
+def test_retry_cannot_spend_reserved_finalization_slots(snapshot):
+    corpus, _ = snapshot
+    transport = Transport(ProviderTransportError("retry", retryable=True), ProviderTransportError("retry", retryable=True))
+    now = [0.0]
+
+    def wait(seconds):
+        now[0] += seconds
+
+    trace = RecursiveResearch(
+        corpus, lambda _: ClaudeRootClient(transport, config=ClaudeConfig(max_retries=2),
+                                           clock=lambda: now[0], wait=wait),
+        clock=lambda: now[0], shared_limits=SharedLimits(max_provider_attempts=3, max_delegations=0),
+        finalization=FinalizationPolicy(),
+    ).run("Try retries.")
+    assert trace.budget_stop == "investigation_attempt_limit"
+    assert trace.shared_budget.investigation_provider_attempts == len(transport.calls) == 2
+    assert trace.shared_budget.finalization_provider_attempts == 0
+
+
+def test_remaining_finalization_slot_returns_rejections_for_every_pending_id(snapshot, monkeypatch):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (old, _, _) = snapshot
+    chunk = corpus.read_chunks(old, RISK).items[0]
+    read = tool("get_chunk", chunk_id=chunk.chunk_id)
+    sessions = stub_bedrock(monkeypatch, [[
+        converse_reply(read, "read"),
+        converse_batch(read, delegate(SectionTarget(old, RISK))),
+        converse_reply(finish(chunk.chunk_id, findings=[finding(chunk)]), "finish"),
+    ]])
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        shared_limits=SharedLimits(max_delegations=0), local_limits=RootLimits(max_tool_calls=1),
+        finalization=FinalizationPolicy(finalization_attempts=2),
+    ).run("Check a risk.")
+    results = [block["toolResult"] for block in sessions[0].requests[-1]["messages"][-1]["content"]]
+    assert [result["toolUseId"] for result in results] == ["batch-1", "batch-2"]
+    assert all(result["content"][0]["json"]["error"]["code"] == "finalization_only" for result in results)
+    assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
+    assert trace.shared_budget.corpus_attempts == 1 and trace.shared_budget.delegated_invocations == 0
+
+
+@pytest.mark.parametrize("constraint", ["tokens", "deadline"])
+def test_finalization_reservation_does_not_override_tokens_or_deadline(snapshot, constraint):
+    corpus, (old, _, _) = snapshot
+    now = [0.0]
+    if constraint == "tokens":
+        second = ProviderTransportError("retry", retryable=True, usage={"input_tokens": 5})
+    else:
+        second = message("finish_research", {"answer": "Too late."}, ident="finish")
+
+    class FinalizationTransport(Transport):
+        def send(self, payload, *, timeout_seconds):
+            if self.calls and constraint == "deadline":
+                assert timeout_seconds <= 1.0
+                now[0] = 1.0
+            return super().send(payload, timeout_seconds=timeout_seconds)
+
+    transport = FinalizationTransport(
+        message("list_sections", {"document_id": old}, usage={"input_tokens": 2, "output_tokens": 1}),
+        second,
+    )
+    trace = RecursiveResearch(
+        corpus, lambda _: ClaudeRootClient(transport, clock=lambda: now[0],
+                                           wait=lambda _: pytest.fail("Retry must be blocked")),
+        clock=lambda: now[0], local_limits=RootLimits(max_tool_calls=1),
+        shared_limits=SharedLimits(max_delegations=0, max_reported_tokens=8, deadline_seconds=1.0),
+        finalization=FinalizationPolicy(finalization_attempts=2),
+    ).run("Check a risk.")
+    assert trace.steps[-1].phase == "finalization" and trace.answer is None
+    assert len(transport.calls) == 2
+    if constraint == "tokens":
+        assert trace.budget_stop == "reported_token_limit"
+    else:
+        assert trace.stop_reason == "deadline"

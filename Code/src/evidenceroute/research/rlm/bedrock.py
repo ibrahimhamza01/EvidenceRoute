@@ -13,7 +13,7 @@ from botocore import exceptions as aws_errors
 from pydantic import Field
 
 from evidenceroute.research.rlm.claude import (
-    _SYSTEM,
+    _FINISH,
     _retry_after,
     ClaudeConfig,
     ClaudeModelError,
@@ -28,6 +28,7 @@ class BedrockConfig(ClaudeConfig):
     """An account-specific Converse model or inference profile identifier."""
 
     model: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,2047}$")
+    region: str | None = None
 
 
 def _client_error(error: aws_errors.ClientError) -> ProviderTransportError:
@@ -77,6 +78,9 @@ class BedrockConverseTransport:
                 return client.converse(**payload)
         except aws_errors.ClientError as exc:
             error = _client_error(exc)
+            if (exc.response.get("Error", {}).get("Code") == "ValidationException"
+                    and "tool" in payload.get("toolConfig", {}).get("toolChoice", {})):
+                error = ProviderTransportError("aws_required_finish_validation")
             usage = exc.response.get("usage")
             if isinstance(usage, dict):
                 error.usage = usage
@@ -106,7 +110,7 @@ class BedrockRootClient(ClaudeRootClient):
         super().__init__(transport, config=config, clock=clock, wait=wait)
 
     @classmethod
-    def from_env(cls) -> BedrockRootClient:
+    def from_env(cls, *, disable_retries: bool = False) -> BedrockRootClient:
         if not os.getenv("BEDROCK_MODEL_ID"):
             raise ValueError("Set BEDROCK_MODEL_ID to an inference profile or model authorized for your account.")
         config = BedrockConfig.from_env(model_variable="BEDROCK_MODEL_ID")
@@ -117,20 +121,25 @@ class BedrockRootClient(ClaudeRootClient):
             raise ValueError("Could not load AWS profile configuration.") from None
         if not region:
             raise ValueError("Set BEDROCK_REGION, AWS_REGION, AWS_DEFAULT_REGION, or a region in your AWS profile.")
-        return cls(BedrockConverseTransport(session, region=region), config=config)
+        updates = {"region": region}
+        if disable_retries:
+            updates["max_retries"] = 0
+        return cls(BedrockConverseTransport(session, region=region), config=config.model_copy(update=updates))
 
     def _payload(self, tools: list[dict]) -> dict:
-        inference = {"maxTokens": self.config.max_output_tokens}
+        policy = self._finalization_policy()
+        inference = {"maxTokens": policy.finalization_max_output_tokens if policy else self.config.max_output_tokens}
+        choice = {"tool": {"name": _FINISH}} if policy and policy.finalization_tool_choice == "required" else {"auto": {}}
         if self.config.temperature is not None:
             inference["temperature"] = self.config.temperature
         if self.config.top_p is not None:
             inference["topP"] = self.config.top_p
         return {
             "modelId": self.config.model,
-            "system": [{"text": _SYSTEM}],
+            "system": [{"text": self._system_prompt()}],
             "messages": self._messages,
             "inferenceConfig": inference,
-            "toolConfig": {"toolChoice": {"auto": {}}, "tools": [
+            "toolConfig": {"toolChoice": choice, "tools": [
                 {"toolSpec": {
                     "name": tool["name"], "description": tool["description"],
                     "inputSchema": {"json": tool["input_schema"]},
@@ -144,10 +153,8 @@ class BedrockRootClient(ClaudeRootClient):
         return {"role": "user", "content": [{"text": question}]}
 
     @staticmethod
-    def _result_message(use_id: str, observation: str, body: dict) -> dict:
-        return {"role": "user", "content": [{
-            "toolResult": {"toolUseId": use_id, "content": [{"json": body}]},
-        }]}
+    def _result_block(use_id: str, observation: str, body: dict) -> dict:
+        return {"toolResult": {"toolUseId": use_id, "content": [{"json": body}]}}
 
     @staticmethod
     def _assistant_message(response: dict) -> dict | None:
