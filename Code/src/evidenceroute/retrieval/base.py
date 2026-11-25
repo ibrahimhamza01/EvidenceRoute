@@ -1,3 +1,4 @@
+"""Shared retrieval contracts and deterministic ordering helpers."""
 from __future__ import annotations
 
 from typing import Protocol, Sequence, runtime_checkable
@@ -8,6 +9,7 @@ from evidenceroute.schemas import RetrievalResult
 
 @runtime_checkable
 class Retriever(Protocol):
+    """Every retriever returns validated ``RetrievalResult`` objects, best first."""
 
     def search(self, query: str, top_k: int = 10,
                filters: ChunkFilter | None = None) -> list[RetrievalResult]:
@@ -28,4 +30,5 @@ def is_blank(query: str) -> bool:
 
 
 def rank_results(results: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    """Order by score descending, then ``chunk_id`` ascending (deterministic tie-break)."""
     return sorted(results, key=lambda r: (-r.score, r.chunk.chunk_id))

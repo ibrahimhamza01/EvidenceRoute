@@ -1,3 +1,10 @@
+"""Hybrid retrieval: BM25 + dense rankings fused with Reciprocal Rank Fusion.
+
+``rrf_score(chunk) = sum over rankings of 1 / (rrf_k + rank)``, with 1-based ranks
+(Cormack, Clarke and Buettcher, 2009). Each ranking contributes at most once per
+chunk; duplicates are removed by ``chunk_id``. Ties are broken by the best single
+rank, then by ``chunk_id``, so output order is deterministic.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

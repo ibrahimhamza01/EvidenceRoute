@@ -1,3 +1,9 @@
+"""Deterministic lexical tokenization for BM25.
+
+Lowercased alphanumeric runs. Identifiers such as ``H100``, ``MI300X``, ``3A090``
+and ``1A`` stay intact. Typographic apostrophes are normalized and possessive
+``'s`` is dropped. No stemming, so exact-term queries match exact terms.
+"""
 from __future__ import annotations
 
 import re
