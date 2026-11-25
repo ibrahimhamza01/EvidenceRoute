@@ -1,3 +1,23 @@
+"""Measure retrieval indexing time, index size and query latency on the canonical corpus.
+
+Indexing is reported in three stages: embedding-model loading, document embedding,
+and Qdrant writing (collection creation, upserts and the index manifest). Corpus
+loading and BM25 construction are reported alongside them.
+
+Query latency is measured per retrieval mode over a fixed query set. Warm-up rounds
+are discarded, then every query is repeated ``--repeats`` times and latency is
+summarized as p50/p95 in milliseconds. Each run also checks that repeated searches
+return identical rankings and that every result satisfies the query's filters.
+
+These are engineering measurements, not relevance metrics: the query set has no
+gold evidence. Results are written as JSON under ``data/benchmarks/`` (ignored by Git).
+
+Examples (from the repository root):
+
+    PYTHONPATH=Code/src python Code/scripts/benchmark_retrieval.py --rebuild
+    PYTHONPATH=Code/src python Code/scripts/benchmark_retrieval.py --repeats 10
+    PYTHONPATH=Code/src python Code/scripts/benchmark_retrieval.py --embedder hashing --index-dir /tmp/idx
+"""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +33,15 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
-from evidenceroute.retrieval import BM25Retriever, ChunkFilter, HybridRetriever, load_chunks
+from evidenceroute.retrieval import (
+    BM25Retriever,
+    ChunkFilter,
+    HybridRetriever,
+    RerankConfig,
+    RerankingRetriever,
+    load_chunks,
+)
+from evidenceroute.retrieval.rerank import DEFAULT_RERANKER, SentenceTransformerCrossEncoder
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHUNKS = ROOT / "data/processed/full-v1/chunks.parquet"
@@ -21,6 +49,8 @@ DEFAULT_INDEX_DIR = ROOT / "data/indexes/full-v1"
 DEFAULT_QUERIES = Path(__file__).resolve().parent / "retrieval_queries.json"
 DEFAULT_OUTPUT_DIR = ROOT / "data/benchmarks"
 PACKAGES = ("sentence-transformers", "torch", "qdrant-client", "pyarrow", "numpy")
+DEFAULT_RERANKERS = (DEFAULT_RERANKER, "cross-encoder/ms-marco-MiniLM-L-6-v2")
+DEFAULT_RERANK_CANDIDATES = (50, 100)
 
 
 class TimedEmbedder:
@@ -54,6 +84,24 @@ class TimedEmbedder:
         vector = self.inner.embed_query(text)
         self.query_seconds.append(time.perf_counter() - start)
         return vector
+
+
+class TimedScorer:
+    """Wraps a cross-encoder scorer and records time spent scoring candidates."""
+
+    def __init__(self, inner: Any):
+        self.inner = inner
+        self.seconds: list[float] = []
+
+    @property
+    def model_id(self) -> str:
+        return self.inner.model_id
+
+    def score(self, query: str, passages: Sequence[str]) -> np.ndarray:
+        start = time.perf_counter()
+        scores = self.inner.score(query, passages)
+        self.seconds.append(time.perf_counter() - start)
+        return scores
 
 
 def timed(fn: Callable, *args, **kwargs) -> tuple[Any, float]:
@@ -120,11 +168,13 @@ def embedder_device(embedder: Any) -> str:
 
 
 def benchmark_mode(retriever, queries, *, top_k: int, repeats: int, warmup_rounds: int,
-                   embedder: TimedEmbedder) -> dict:
+                   embedder: TimedEmbedder, scorer: TimedScorer | None = None) -> dict:
     for _ in range(warmup_rounds):
         for item, filters in queries:
             retriever.search(item["query"], top_k, filters)
     embedder.query_seconds.clear()
+    if scorer is not None:
+        scorer.seconds.clear()
 
     all_ms: list[float] = []
     per_query = {}
@@ -149,6 +199,7 @@ def benchmark_mode(retriever, queries, *, top_k: int, repeats: int, warmup_round
         per_query[item["id"]] = {
             "p50_ms": round(float(np.percentile(query_ms, 50)), 3),
             "result_count": len(first_results),
+            "top_chunk_ids": first_ids,
             "top_results": [
                 {"chunk_id": r.chunk.chunk_id, "ticker": r.chunk.ticker,
                  "fiscal_year": r.chunk.fiscal_year, "section_id": r.chunk.section_id,
@@ -159,8 +210,26 @@ def benchmark_mode(retriever, queries, *, top_k: int, repeats: int, warmup_round
     summary = summarize(all_ms)
     if embedder.query_seconds:
         summary["query_embedding"] = summarize([s * 1000 for s in embedder.query_seconds])
+    if scorer is not None and scorer.seconds:
+        summary["rerank_only"] = summarize([s * 1000 for s in scorer.seconds])
     return {"latency": summary, "ranking_consistent": consistent,
             "filters_respected": filters_respected, "queries": per_query}
+
+
+def rerank_changes(reranker: RerankingRetriever, queries, hybrid_mode: dict, top_k: int) -> dict:
+    """How much reranking changed the hybrid top-k (computed outside the timed runs)."""
+    overlaps, promoted, deepest = [], [], 0
+    for item, filters in queries:
+        hits = reranker.search_with_details(item["query"], top_k, filters)
+        hybrid_ids = set(hybrid_mode["queries"][item["id"]]["top_chunk_ids"])
+        overlaps.append(len(hybrid_ids & {h.chunk.chunk_id for h in hits}))
+        promoted.append(sum(h.first_stage_rank > top_k for h in hits))
+        deepest = max([deepest, *(h.first_stage_rank for h in hits)])
+    return {
+        "mean_overlap_with_hybrid_top_k": round(float(np.mean(overlaps)), 2),
+        "mean_promoted_from_beyond_top_k": round(float(np.mean(promoted)), 2),
+        "max_first_stage_rank_promoted": deepest,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -178,10 +247,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmup-rounds", type=int, default=1)
+    parser.add_argument("--rerankers", nargs="*", default=list(DEFAULT_RERANKERS),
+                        help="Cross-encoder models to benchmark; pass the flag with no "
+                             "values to skip reranking")
+    parser.add_argument("--rerank-candidates", nargs="+", type=int,
+                        default=list(DEFAULT_RERANK_CANDIDATES),
+                        help="Candidate depths passed from hybrid retrieval to the reranker")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
     if args.repeats < 1 or args.warmup_rounds < 0 or args.top_k < 1:
         parser.error("--repeats and --top-k must be >= 1 and --warmup-rounds >= 0")
+    if any(k < args.top_k for k in args.rerank_candidates):
+        parser.error("--rerank-candidates must be >= --top-k")
 
     query_set, queries = load_queries(args.queries)
     indexing: dict[str, Any] = {}
@@ -222,6 +299,30 @@ def main(argv: list[str] | None = None) -> int:
         modes[name] = benchmark_mode(retriever, queries, top_k=args.top_k, repeats=args.repeats,
                                      warmup_rounds=args.warmup_rounds, embedder=embedder)
 
+    rerankers = {}
+    for model_name in args.rerankers:
+        # Load failures propagate as RerankerUnavailableError with the underlying cause.
+        inner_scorer, load_s = timed(SentenceTransformerCrossEncoder, model_name,
+                                     device=args.device)
+        scorer = TimedScorer(inner_scorer)
+        rerankers[model_name] = {"model_id": inner_scorer.model_id, "load_s": round(load_s, 3),
+                                 "device": inner_scorer.device}
+        short = model_name.split("/")[-1]
+        for depth in args.rerank_candidates:
+            name = f"rerank[{short}]@{depth}"
+            reranker = RerankingRetriever(retrievers["hybrid"], scorer,
+                                          RerankConfig(candidate_k=depth, model_name=model_name))
+            print(f"[benchmark] {name}: {len(queries)} queries x {args.repeats} repeats",
+                  file=sys.stderr)
+            result = benchmark_mode(reranker, queries, top_k=args.top_k, repeats=args.repeats,
+                                    warmup_rounds=args.warmup_rounds, embedder=embedder,
+                                    scorer=scorer)
+            result["model"] = model_name
+            result["candidate_k"] = depth
+            result["changes_vs_hybrid"] = rerank_changes(reranker, queries, modes["hybrid"],
+                                                         args.top_k)
+            modes[name] = result
+
     now = datetime.now(timezone.utc)
     report = {
         "created_at_utc": now.isoformat(),
@@ -249,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "corpus": {"chunk_count": len(corpus), "fingerprint": fingerprint},
         "indexing": indexing,
+        "rerankers": rerankers,
         "modes": modes,
         "peak_rss_mb": peak_rss_mb(),
     }
@@ -261,11 +363,21 @@ def main(argv: list[str] | None = None) -> int:
     for key, value in indexing.items():
         print(f"  {key:32} {value}")
     print(f"\nQuery latency (ms, {len(queries)} queries x {args.repeats} repeats, top_k={args.top_k})")
-    print(f"  {'mode':8} {'p50':>9} {'p95':>9} {'mean':>9}  consistent  filters_ok")
+    print(f"  {'mode':38} {'p50':>9} {'p95':>9} {'mean':>9}  consistent  filters_ok")
     for name, result in modes.items():
         lat = result["latency"]
-        print(f"  {name:8} {lat['p50_ms']:9.2f} {lat['p95_ms']:9.2f} {lat['mean_ms']:9.2f}  "
+        print(f"  {name:38} {lat['p50_ms']:9.2f} {lat['p95_ms']:9.2f} {lat['mean_ms']:9.2f}  "
               f"{str(result['ranking_consistent']):10}  {result['filters_respected']}")
+    reranked = {n: r for n, r in modes.items() if "changes_vs_hybrid" in r}
+    if reranked:
+        print(f"\nReranking vs hybrid top-{args.top_k}")
+        print(f"  {'mode':38} {'rerank p50':>10} {'overlap':>8} {'promoted':>9} {'max rank':>9}")
+        for name, result in reranked.items():
+            ch = result["changes_vs_hybrid"]
+            print(f"  {name:38} {result['latency']['rerank_only']['p50_ms']:10.2f} "
+                  f"{ch['mean_overlap_with_hybrid_top_k']:8.2f} "
+                  f"{ch['mean_promoted_from_beyond_top_k']:9.2f} "
+                  f"{ch['max_first_stage_rank_promoted']:9d}")
     print(f"\nSaved {output}")
     dense.close()
     return 0
