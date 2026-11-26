@@ -11,13 +11,17 @@ from uuid import uuid4
 from pydantic import Field, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
+from evidenceroute.research.rlm.comparison import Comparison, CorpusScan, resolve_comparison
 from evidenceroute.research.rlm.controller import (
     ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction,
 )
 from evidenceroute.research.rlm.coverage import CoverageReport, ResearchScope, SectionTarget
 from evidenceroute.research.rlm.environment import CorpusEnvironment
-from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingEvidence, PartitionCoverage, partition_status
+from evidenceroute.research.rlm.findings import (
+    AnalysisStatus, Finding, FindingEvidence, PartitionCoverage, SpanEvidenceDraft, partition_status,
+)
 from evidenceroute.research.rlm.scoped import ScopedCorpus
+from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import (
     DispatchResult, EvidenceRef, Identifier, StrictInput, error_observation, observation_json, validation_message,
 )
@@ -62,6 +66,7 @@ class RecursiveResearch:
         shared_limits: SharedLimits | None = None, local_limits: RootLimits | None = None,
         finalization: FinalizationPolicy | None = None,
         child_guidance: str | None = None,
+        comparison_scan: CorpusScan | None = None,
         clock: Callable[[], float] = monotonic,
     ):
         self.corpus = corpus
@@ -71,6 +76,7 @@ class RecursiveResearch:
         self.clock = clock
         self.finalization = finalization
         self.child_guidance = child_guidance
+        self.comparison_scan = comparison_scan
 
     def run(
         self, question: str, *, partitions: tuple[SectionTarget, ...] | None = None,
@@ -117,6 +123,10 @@ class RecursiveResearch:
         if any(model is previous for previous in clients) or not callable(bind):
             raise ValueError("The factory must return a fresh, budget-aware model client.")
         bind(budget)
+        if self.comparison_scan is not None:
+            enable = getattr(model, "enable_comparative_finish", None)
+            if callable(enable):
+                enable()
         clients.append(model)
         budget.model_sessions += 1
         session = RecursiveSession(self, invocation, budget, clients, parent_deadline, root_groups)
@@ -132,14 +142,26 @@ class RecursiveResearch:
             prompt += f"\nInvestigation guidance: {self.child_guidance}"
         if partitions is not None:
             prompt += "\nAuthorized partitions: " + observation_json([vars(pair) for pair in partitions])
+        if self.comparison_scan is not None:
+            shortlist = self.comparison_scan.shortlist(partitions or ())
+            prompt += (
+                "\nLexical candidates (chunk IDs only, at most three per section): " + observation_json(shortlist)
+                + "\nRead candidates and surrounding context as needed. Choose chunk_id and span_id from acknowledged "
+                "evidence to create findings. To compare the same risk, reference your own findings by one-based index "
+                "in comparisons. Evaluate relevance to the topic separately from what the passage supports or contradicts. "
+                "Inspect possible counterevidence in the earlier year. If unclear, use remaining scoped tool calls to "
+                "investigate that specific uncertainty, then report any unresolved conflict or gap. No lexical miss proves absence."
+            )
         if invocation.depth < budget.limits.max_depth:
             prompt += "\nUse delegate_research only for a narrower subproblem."
+        evidence_instruction = ("source span IDs" if self.comparison_scan is not None else "exact quotes")
         prompt += (
-            "\nSubmit findings via finish_research "
-            "with exact quotes and original chunk IDs. Report uncertainty, conflicts and incomplete analysis. "
+            f"\nSubmit findings via finish_research with {evidence_instruction} and original chunk IDs. "
+            "Report uncertainty, conflicts and incomplete analysis. "
             "Name used_finding_ids when synthesizing delegated evidence. Search misses do not establish absence."
         )
-        return RootController(view, model, limits=self.local_limits, clock=self.clock).run(
+        return RootController(view, model, limits=self.local_limits, clock=self.clock,
+                              include_spans=self.comparison_scan is not None).run(
             prompt, scope=scope, _recursive=session,
         )
 
@@ -157,8 +179,10 @@ class RecursiveSession:
         self.parent_deadline = parent_deadline
         self.root_groups = root_groups
         self.direct_ids: set[str] = set()
+        self.direct_spans: dict[str, set[str]] = {}
         self.delivered_findings: dict[str, Finding] = {}
         self.findings: tuple[Finding, ...] = ()
+        self.comparisons: tuple[Comparison, ...] = ()
         self.used_finding_ids: tuple[str, ...] = ()
         self.analysis_status: AnalysisStatus = "incomplete"
 
@@ -238,6 +262,8 @@ class RecursiveSession:
                 "findings": findings,
             },
         }
+        if self.runner.comparison_scan is not None and successful:
+            body["result"]["comparisons"] = child.comparisons
         if not successful:
             body["error"] = {"code": "child_not_finished", "message": "Inspect the child stop reason and coverage."}
         content = observation_json(body)
@@ -256,12 +282,17 @@ class RecursiveSession:
     def record_delivery(self, step: ToolTrace) -> None:
         if step.delegation is None:
             self.direct_ids.update(ref.chunk_id for ref in step.evidence)
+            for chunk_id, spans in (step.observation or {}).get("span_ids", {}).items():
+                self.direct_spans.setdefault(chunk_id, set()).update(spans)
         elif step.delegation.child is not None and step.delegation.status in {"finished", "incomplete"}:
             findings = step.delegation.child.findings
             self.delivered_findings.update((finding.finding_id, finding) for finding in findings)
             step.delegation.delivered_finding_ids = tuple(finding.finding_id for finding in findings)
 
     def finish(self, action: _FinishAction, coverage: CoverageReport) -> str | None:
+        scan = self.runner.comparison_scan
+        if action.comparisons and scan is None:
+            return "Comparisons require comparative mode."
         used = tuple(dict.fromkeys(action.used_finding_ids))
         if any(finding_id not in self.delivered_findings for finding_id in used):
             return "Use only delivered finding IDs."
@@ -276,6 +307,20 @@ class RecursiveSession:
             evidence = []
             for evidence_index, item in enumerate(draft.evidence, start=1):
                 location = f"Finding {index}, evidence {evidence_index}"
+                if isinstance(item, SpanEvidenceDraft):
+                    if scan is None:
+                        return f"{location}: span selection requires comparative mode."
+                    inherited = next((ref for ref in used_evidence if ref.source.chunk_id == item.chunk_id
+                                      and ref.span_id == item.span_id), None)
+                    if item.span_id in self.direct_spans.get(item.chunk_id, ()):
+                        chunk = self.runner.corpus.get_chunk(item.chunk_id)
+                        start, end = passage_spans(chunk.text)[item.span_id]
+                        evidence.append(FindingEvidence(EvidenceRef.from_chunk(chunk), chunk.text[start:end], item.span_id))
+                    elif inherited is not None:
+                        evidence.append(inherited)
+                    else:
+                        return f"{location}: select a span from an acknowledged chunk or a declared delivered finding."
+                    continue
                 if item.chunk_id not in self.direct_ids:
                     if item.chunk_id not in selected_ids:
                         return f"{location}: use an observed chunk or a declared delivered excerpt, or omit it."
@@ -294,13 +339,19 @@ class RecursiveSession:
                    for item in evidence):
                 return "Each finding must cite evidence from one document and section."
             findings.append(Finding(
-                f"{self.invocation.invocation_id}:finding-{index}", chunk.company_name, draft.claim, tuple(evidence),
+                f"{self.invocation.invocation_id}:finding-{index}", self.runner.corpus.get_filing(source.document_id).company_name,
+                draft.claim, tuple(evidence),
                 draft.analysis_status, partition_status(coverage, target), draft.uncertainty, draft.conflict,
             ))
         referenced = cited | {item.source.chunk_id for finding in findings for item in finding.evidence}
         if any(not any(item.source.chunk_id in referenced for item in self.delivered_findings[fid].evidence)
                for fid in used):
             return "Each used finding must contribute a chunk to the answer or a new finding."
+        if scan is not None:
+            try:
+                self.comparisons = tuple(resolve_comparison(draft, findings, scan.years) for draft in action.comparisons)
+            except ValueError as exc:
+                return str(exc)
         self.findings = tuple(findings)
         self.used_finding_ids = used
         self.analysis_status = (action.analysis_status or "incomplete") if referenced else "incomplete"
@@ -322,6 +373,7 @@ class RecursiveSession:
             "shared_limits": self.budget.limits.model_dump(mode="json"),
             "shared_budget": self.budget.snapshot(),
             "findings": self.findings,
+            "comparisons": self.comparisons,
             "used_finding_ids": self.used_finding_ids,
             "analysis_status": self.analysis_status,
             "partition_coverage": partitions,

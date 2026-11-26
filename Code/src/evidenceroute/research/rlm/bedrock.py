@@ -22,6 +22,7 @@ from evidenceroute.research.rlm.claude import (
     ProviderTransportError,
 )
 from evidenceroute.research.rlm.controller import ModelAttempt
+from evidenceroute.research.rlm.tools import TOOL_USE_ID_PATTERN
 
 
 class BedrockConfig(ClaudeConfig):
@@ -102,6 +103,12 @@ class BedrockConverseTransport:
 
 class BedrockRootClient(ClaudeRootClient):
     """Reuse the Claude loop with Converse wire formats and native history."""
+
+    _tool_use_id_pattern = TOOL_USE_ID_PATTERN
+    _known_stop_reasons = frozenset({
+        "end_turn", "tool_use", "max_tokens", "stop_sequence", "guardrail_intervened", "content_filtered",
+        "malformed_model_output", "malformed_tool_use", "model_context_window_exceeded",
+    })
 
     def __init__(
         self, transport: ClaudeTransport, *, config: BedrockConfig,

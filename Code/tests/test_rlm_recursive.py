@@ -768,12 +768,261 @@ def converse_batch(*actions):
     return reply
 
 
+def _large_converse_batch(*actions, prefix="oversized"):
+    response = converse_batch(*actions)
+    for index, block in enumerate(response["output"]["message"]["content"], 1):
+        block["toolUse"]["toolUseId"] = f"{prefix}:{index}.request"
+    return response
+
+
+def _batch_feedback(payload):
+    return [(block["toolResult"]["toolUseId"], block["toolResult"]["content"][0]["json"])
+            for block in payload["messages"][-1]["content"]]
+
+
+@pytest.mark.parametrize(("compact", "count"), [(False, 5), (True, 5), (False, 16)])
+def test_bedrock_oversized_batch_returns_every_id_and_executes_only_the_correction(snapshot, monkeypatch, compact, count):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (old, new, _) = snapshot
+    newer, older = (corpus.read_chunks(doc, RISK).items[0] for doc in (new, old))
+    new_read = tool("get_chunk", chunk_id=newer.chunk_id)
+    old_read = tool("get_chunk", chunk_id=older.chunk_id)
+    first = _large_converse_batch(delegate(SectionTarget(new, RISK)), *([new_read] * (count - 1)))
+    # Bedrock can replay binary redacted reasoning. Recovery must not re-encode the full assistant message.
+    first["output"]["message"]["content"].insert(0, {"reasoningContent": {"redactedContent": b"fixture"}})
+    corrected = converse_batch(old_read, tool("list_companies", limit=1))
+    sessions = stub_bedrock(monkeypatch, [[first, corrected, converse_reply(finish(older.chunk_id), "finish")]])
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        local_limits=RootLimits(max_response_bytes=620 if compact else 6_000),
+    ).run("Inspect one older risk disclosure.")
+
+    first_request, correction, _ = sessions[0].requests
+    assert "Request at most 4 tool operations per model decision." in first_request["system"][0]["text"]
+    assert correction["messages"][-2] == first["output"]["message"]
+    feedback = _batch_feedback(correction)
+    assert [tool_id for tool_id, _ in feedback] == [f"oversized:{i}.request" for i in range(1, count + 1)]
+    for _, result in feedback:
+        assert not result["ok"] and result["error"]["code"] == "tool_batch_limit"
+        assert result["error"]["max_operations"] == 4
+        assert ("message" not in result["error"]) is compact
+    rejected = trace.steps[0]
+    assert rejected.provider_tool_request_count == len(rejected.provider_tool_requests) == count
+    assert rejected.error["requested_operations"] == count
+    assert len(rejected.batch_operations) == count
+    assert all(op.outcome == "rejected" and op.observation_sent and not op.evidence and op.delegation is None
+               for op in rejected.batch_operations)
+    usage = trace.shared_budget
+    assert usage.delegated_invocations == 0 and usage.model_sessions == 1
+    assert usage.provider_attempts == usage.model_decisions == 3 and usage.corpus_attempts == trace.tool_calls == 2
+    assert usage.reported_tokens == 45
+    assert {chunk.chunk_id for chunk in trace.coverage.visible_chunks} == {older.chunk_id}
+    assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (older.chunk_id,)
+
+
+@pytest.mark.parametrize("valid_finish", [True, False])
+def test_repeated_bedrock_oversized_batches_preserve_finalization_and_remain_bounded(snapshot, monkeypatch, valid_finish):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, _ = snapshot
+    read = tool("list_companies")
+    batches = [_large_converse_batch(*([read] * 5), prefix=f"turn-{i}") for i in range(4)]
+    responses = batches[:2] + [converse_reply(finish(status="incomplete"), "finish")] if valid_finish else batches
+    sessions = stub_bedrock(monkeypatch, [responses])
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        shared_limits=SharedLimits(max_delegations=0, max_provider_attempts=4),
+        local_limits=RootLimits(max_iterations=6),
+        finalization=FinalizationPolicy(finalization_attempts=2, finalization_tool_choice="required"),
+    ).run("Look for a disclosure within the budget.")
+
+    requests = sessions[0].requests
+    assert len(requests) == len(responses)
+    assert [req["toolConfig"]["toolChoice"] for req in requests] == (
+        [{"auto": {}}] * 2 + [{"tool": {"name": "finish_research"}}] * (len(responses) - 2)
+    )
+    assert len(_batch_feedback(requests[2])) == 5
+    if valid_finish:
+        assert trace.stop_reason == "finished" and trace.analysis_status == "incomplete"
+    else:
+        assert trace.stop_reason == "budget_exhausted" and trace.budget_stop == "finalization_attempt_limit"
+        assert all(result["error"]["finish_only"] for _, result in _batch_feedback(requests[3]))
+    assert trace.shared_budget.finalization_provider_attempts == len(responses) - 2
+    assert trace.shared_budget.provider_attempts == trace.shared_budget.model_decisions == len(responses)
+    assert trace.tool_calls == trace.shared_budget.corpus_attempts == trace.shared_budget.delegated_invocations == 0
+    assert not trace.coverage.visible_chunks and not trace.cited_chunk_ids
+
+
+@pytest.mark.parametrize(("case", "expected"), [
+    ("duplicate", "invalid_tool_use"), ("invalid_id", "invalid_tool_use"), ("invalid_input", "invalid_tool_use"),
+    ("invalid_number", "invalid_tool_use"),
+    ("protocol_limit", "tool_batch_protocol_limit"), ("byte_cap", None),
+])
+def test_bedrock_unrecoverable_large_batch_fails_closed(snapshot, monkeypatch, case, expected):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+    from evidenceroute.research.rlm.tools import MAX_PROTOCOL_TOOL_BATCH
+
+    corpus, _ = snapshot
+    count = MAX_PROTOCOL_TOOL_BATCH + 1 if case == "protocol_limit" else 5
+    response = _large_converse_batch(*([tool("list_companies")] * count))
+    blocks = response["output"]["message"]["content"]
+    if case == "duplicate":
+        blocks[-1]["toolUse"]["toolUseId"] = blocks[0]["toolUse"]["toolUseId"]
+    elif case == "invalid_id":
+        blocks[-1]["toolUse"]["toolUseId"] = "invalid id"
+    elif case == "invalid_input":
+        blocks[-1]["toolUse"]["input"] = []
+    elif case == "invalid_number":
+        blocks[-1]["toolUse"]["input"] = {"limit": float("nan")}
+    sessions = stub_bedrock(monkeypatch, [[response]])
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        local_limits=RootLimits(max_response_bytes=128 if case == "byte_cap" else 6_000),
+    ).run("Check the catalog.")
+    assert len(sessions[0].requests) == 1 and trace.steps[0].provider_tool_request_count == count
+    assert trace.model_attempts[0].error == expected
+    assert trace.stop_reason == ("batch_observation_limit" if case == "byte_cap" else "model_error")
+    assert trace.tool_calls == trace.shared_budget.corpus_attempts == trace.shared_budget.delegated_invocations == 0
+    assert not trace.coverage.visible_chunks
+
+
+def test_released_child_slots_do_not_consume_protected_comparative_decisions(snapshot, monkeypatch):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+    from evidenceroute.research.rlm.comparison import scan_research_plan
+    from evidenceroute.research.rlm.spans import passage_spans
+
+    corpus, (_, new, _) = snapshot
+    pair = SectionTarget(new, RISK)
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    span = next(iter(passage_spans(chunk.text)))
+    draft = {**finding(chunk), "evidence": [{"chunk_id": chunk.chunk_id, "span_id": span}]}
+    invalid = {**draft, "evidence": [{"chunk_id": chunk.chunk_id, "span_id": "0:999"}]}
+    sessions = stub_bedrock(monkeypatch, [
+        [converse_reply(delegate(pair), "delegate"),
+         converse_reply(tool("get_chunk", chunk_id=chunk.chunk_id), "read"),
+         converse_reply(tool("list_companies"), "companies"), converse_reply(tool("list_filings"), "filings"),
+         converse_reply(finish(findings=[invalid]), "invalid-finish"),
+         converse_reply(finish(chunk.chunk_id, findings=[draft]), "corrected-finish")],
+        [converse_reply(finish(), "child-finish")],
+    ])
+    scan = scan_research_plan(corpus, _company_plan(corpus), ("supply",))
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True), comparison_scan=scan,
+        shared_limits=SharedLimits(max_delegations=1, max_provider_attempts=12),
+        local_limits=RootLimits(max_iterations=6),
+        finalization=FinalizationPolicy(child_provider_attempts=6, finalization_attempts=2,
+                                        finalization_tool_choice="required"),
+    ).run("Compare evidence.", partitions=(pair,))
+    requests = sessions[0].requests
+    schema = next(tool["toolSpec"]["inputSchema"]["json"] for tool in requests[0]["toolConfig"]["tools"]
+                  if tool["toolSpec"]["name"] == "finish_research")
+    assert "comparisons" in schema["properties"] and "SpanEvidenceDraft" in schema["$defs"]
+    assert trace.shared_budget.released_child_provider_slots == 5
+    assert [step.phase for step in trace.steps] == ["investigation"] * 4 + ["finalization"] * 2
+    assert trace.steps[4].finalization_reason == "reserved_local_decisions"
+    feedback = requests[5]["messages"][-1]["content"][0]["toolResult"]
+    assert feedback["toolUseId"] == "invalid-finish" and feedback["content"][0]["json"]["error"]["code"] == "invalid_findings"
+    assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
+
+
 @pytest.fixture(scope="module")
 def planned_corpus():
     try:
         return CorpusEnvironment()
     except FileNotFoundError:
         pytest.skip("Canonical local corpus unavailable")
+
+
+@pytest.fixture
+def comparative_demo(planned_corpus, monkeypatch):
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    monkeypatch.syspath_prepend(str(examples))
+    monkeypatch.setattr("evidenceroute.research.rlm.CorpusEnvironment", lambda: planned_corpus)
+    return runpy.run_path(str(examples / "demo_rlm_comparative.py"))["main"]
+
+
+def test_comparative_bedrock_native_delegation_batch_and_span_round_trip(
+    comparative_demo, planned_corpus, monkeypatch, capsys,
+):
+    from evidenceroute.research.rlm.spans import passage_spans
+
+    pairs = [tuple(SectionTarget(planned_corpus.list_filings(ticker=ticker, fiscal_year=year).items[0].document_id, RISK)
+                   for year in (2023, 2024)) for ticker in ("AAPL", "AMD")]
+    chunks = [planned_corpus.get_chunk(key) for key in ("043757f52188a8c6fb2a2857", "483314af3b949a29920abbbf")]
+    findings = []
+    for chunk in chunks:
+        span_id = next(span_id for span_id, (start, end) in passage_spans(chunk.text).items()
+                       if chunk.text[start:end].startswith("Data centers depend"))
+        findings.append({"claim": "Water or power shortages can limit data-center expansion.",
+                         "analysis_status": "incomplete", "evidence": [{"chunk_id": chunk.chunk_id, "span_id": span_id}]})
+    comparison = {"risk": "Power and water constraints", "same_risk": "yes", "assessments": [
+        {"finding_index": i, "relevance": "infrastructure", "entailment": "supports", "rationale": "Capacity constraint."}
+        for i in (1, 2)
+    ]}
+    first = converse_batch(*(delegate(*group) for group in pairs))
+    ids = ("delegate:aapl.1", "delegate:amd.2")
+    for block, tool_id in zip(first["output"]["message"]["content"], ids):
+        block["toolUse"]["toolUseId"] = tool_id
+    private_marker = "fixture private reasoning must never appear in the report"
+    first["output"]["message"]["content"].insert(0, {
+        "reasoningContent": {"reasoningText": {"text": private_marker, "signature": "fixture-signature"}},
+    })
+    root_finish = finish(*(chunk.chunk_id for chunk in chunks), findings=findings,
+                         used=["child-2:finding-1", "child-2:finding-2"], status="incomplete")
+    child_finish = {**finish(findings=findings, status="incomplete"), "comparisons": [comparison]}
+    bad_finding = {**findings[0], "evidence": [{"chunk_id": chunks[0].chunk_id, "span_id": "0:9999"}]}
+    sessions = stub_bedrock(monkeypatch, [
+        [first, converse_reply({**root_finish, "comparisons": [comparison]}, "finish:root.2")],
+        [converse_reply(finish(status="incomplete"), "finish:aapl.1")],
+        [converse_reply(tool("get_chunk", chunk_id=chunks[0].chunk_id), "read:amd.1"),
+         converse_reply(tool("get_chunk", chunk_id=chunks[1].chunk_id), "read:amd.2"),
+         converse_reply(finish(findings=[bad_finding], status="incomplete"), "finish:amd.3"),
+         converse_reply(child_finish, "finish:amd.4")],
+    ])
+    assert comparative_demo(["--live", "--trace"]) == 0
+    raw_report = capsys.readouterr().out
+    assert private_marker not in raw_report and "fixture-signature" not in raw_report
+    report = json.loads(raw_report)
+    assert report["root_stop_reason"] == "finished" and report["research_status"] == "incomplete"
+    assert report["shared_usage"]["delegated_invocations"] == 2
+    assert report["shared_usage"]["provider_attempts"] == 7 and report["shared_usage"]["corpus_attempts"] == 2
+    assert [item["outcome"] for item in report["root_comparisons"]] == ["comparable_both_years"]
+    assert [item["outcome"] for item in report["acknowledged_comparisons"]] == ["comparable_both_years"]
+    assert {item["chunk_id"] for item in report["original_citations"]} == {chunk.chunk_id for chunk in chunks}
+    assert [(issue["invocation_id"], issue["error"]["code"]) for issue in report["diagnostics"]] == [
+        ("child-2", "invalid_findings"),
+    ]
+    assert [request["tool_use_id"] for request in report["trace"]["steps"][0]["provider_tool_requests"]] == list(ids)
+    messages = sessions[0].requests[-1]["messages"]
+    assert messages[-2] == first["output"]["message"]
+    assert [block["toolResult"]["toolUseId"] for block in messages[-1]["content"]] == list(ids)
+    amd_correction = sessions[2].requests[-1]["messages"][-1]["content"][0]["toolResult"]
+    assert amd_correction["toolUseId"] == "finish:amd.3"
+    assert amd_correction["content"][0]["json"]["error"]["code"] == "invalid_findings"
+    root_findings = report["trace"]["findings_generated"]
+    for chunk, draft, actual in zip(chunks, findings, root_findings):
+        item = actual["evidence"][0]
+        start, end = passage_spans(chunk.text)[draft["evidence"][0]["span_id"]]
+        assert item["quote"] == chunk.text[start:end] and "’" in item["quote"]
+
+
+@pytest.mark.parametrize("detailed", [False, True])
+def test_comparative_reports_provider_decode_failure_without_private_content(comparative_demo, monkeypatch, capsys, detailed):
+    response = converse_reply(tool("list_companies"), "unused")
+    response["stopReason"] = "malformed_tool_use"
+    response["output"]["message"]["content"] = [{"text": "fixture private provider output"}]
+    stub_bedrock(monkeypatch, [[response]])
+    assert comparative_demo(["--live", *(["--trace"] if detailed else [])]) == 1
+    raw_report = capsys.readouterr().out
+    assert "fixture private provider output" not in raw_report
+    report = json.loads(raw_report)
+    assert report["root_stop_reason"] == "model_error" and not report["root_budget_stop"]
+    assert report["diagnostics"][0]["provider_errors"] == [{
+        "code": "unexpected_stop_reason", "response_received": True, "provider_stop_reason": "malformed_tool_use",
+    }]
+    assert report["shared_usage"]["delegated_invocations"] == report["shared_usage"]["corpus_attempts"] == 0
+    assert ("trace" in report) is detailed
 
 
 @pytest.mark.parametrize("missing_year", [False, True])

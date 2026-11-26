@@ -12,11 +12,13 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 from pydantic import ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, BudgetUsage, SharedBudget
+from evidenceroute.research.rlm.comparison import Comparison, ComparisonDraft
 from evidenceroute.research.rlm.coverage import CoverageReport, CoverageTracker, ResearchScope
 from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingDraft, PartitionCoverage
 from evidenceroute.research.rlm.tools import (
     MIN_RESPONSE_BYTES,
+    MAX_PROTOCOL_TOOL_BATCH,
     MAX_TOOL_BATCH,
     TOOL_USE_ID_PATTERN,
     CorpusToolDispatcher,
@@ -52,7 +54,7 @@ class _BatchCall(StrictInput):
 
 class _ToolBatch(StrictInput):
     type: Literal["tool_batch"]
-    calls: list[_BatchCall] = Field(min_length=2, max_length=MAX_TOOL_BATCH)
+    calls: list[_BatchCall] = Field(min_length=2, max_length=MAX_PROTOCOL_TOOL_BATCH)
 
 
 class _FinishAction(StrictInput):
@@ -62,6 +64,7 @@ class _FinishAction(StrictInput):
     findings: list[FindingDraft] = Field(default_factory=list, max_length=8)
     used_finding_ids: list[Identifier] = Field(default_factory=list, max_length=32)
     analysis_status: AnalysisStatus | None = None
+    comparisons: list[ComparisonDraft] = Field(default_factory=list, max_length=3)
 
 
 _ACTION = TypeAdapter(Annotated[_ToolAction | _ToolBatch | _FinishAction, Field(discriminator="type")])
@@ -72,11 +75,16 @@ def action_schema() -> dict:
     return _ACTION.json_schema()
 
 
-def finish_input_schema(*, recursive: bool = False) -> dict:
+def finish_input_schema(*, recursive: bool = False, comparative: bool = False) -> dict:
     """Describe a finish payload whose action type is supplied by the adapter."""
     schema = _FinishAction.model_json_schema()
     del schema["properties"]["type"]
     schema["required"].remove("type")
+    if not comparative:
+        del schema["properties"]["comparisons"]
+        schema["$defs"]["FindingDraft"]["properties"]["evidence"]["items"] = {"$ref": "#/$defs/EvidenceDraft"}
+        for name in ("ComparisonDraft", "EvidenceAssessment", "SpanEvidenceDraft"):
+            schema["$defs"].pop(name, None)
     if not recursive:
         for field in ("findings", "used_finding_ids", "analysis_status"):
             del schema["properties"][field]
@@ -144,6 +152,7 @@ class ModelAttempt:
     response_model: str | None = None
     provider_latency_seconds: float | None = None
     response_received: bool = False
+    provider_stop_reason: str | None = None
 
 
 @dataclass(kw_only=True)
@@ -205,6 +214,7 @@ class ExecutionTrace:
     analysis_status: AnalysisStatus | None = None
     partition_coverage: tuple[PartitionCoverage, ...] = ()
     coverage_status: Literal["unknown", "complete", "partial", "missing"] | None = None
+    comparisons: tuple[Comparison, ...] = ()
 
     @property
     def model_attempts(self) -> tuple[ModelAttempt, ...]:
@@ -216,13 +226,14 @@ class RootController:
 
     def __init__(
         self, corpus: CorpusEnvironment | ScopedCorpus, model: RootModelClient, *,
-        limits: RootLimits | None = None, clock: Callable[[], float] = monotonic,
+        limits: RootLimits | None = None, clock: Callable[[], float] = monotonic, include_spans: bool = False,
     ):
         self._corpus = corpus
         self._model = model
         self._limits = limits if limits is not None else RootLimits()
         self._clock = clock
-        self._dispatcher = CorpusToolDispatcher(corpus, max_response_bytes=self._limits.max_response_bytes)
+        self._dispatcher = CorpusToolDispatcher(corpus, max_response_bytes=self._limits.max_response_bytes,
+                                                include_spans=include_spans)
 
     def run(self, question: str, *, scope: ResearchScope | None = None,
             _recursive: RecursiveSession | None = None) -> ExecutionTrace:
@@ -267,8 +278,8 @@ class RootController:
                         finalization_reason = "tool_call_limit"
                     elif not corpus_slots and not can_delegate:
                         finalization_reason = "corpus_attempt_limit"
-                    elif iteration == self._limits.max_iterations:
-                        finalization_reason = "last_local_decision"
+                    elif self._limits.max_iterations - iteration + 1 <= allocation.finalization_left:
+                        finalization_reason = "reserved_local_decisions"
                 allocation.finalizing = finalization_reason is not None
                 if allocation.finalizing and not allocation.finalization_left:
                     stop, budget_stop = "budget_exhausted", "finalization_attempt_limit"
@@ -383,7 +394,7 @@ class RootController:
                     if failure is not None:
                         pending = self._feedback(step, "invalid_findings", failure)
                         continue
-                elif action.findings or action.used_finding_ids or action.analysis_status is not None:
+                elif action.findings or action.used_finding_ids or action.analysis_status is not None or action.comparisons:
                     pending = self._feedback(step, "invalid_action", "Recursive fields require a research session.")
                     continue
                 answer = action.answer
@@ -460,6 +471,8 @@ class RootController:
             tool_name=trace_data(call.name) if isinstance(call.name, str) else None,
             requested_action=trace_data(call.model_dump()),
         ) for call in batch.calls)
+        if len(batch.calls) > MAX_TOOL_BATCH:
+            return self._reject_oversized_batch(batch, step), calls
         cap = self._limits.max_response_bytes
         overflow = {"ok": False, "error": {"code": "batch_observation_limit"}}
         results = [{"tool_use_id": call.tool_use_id, "observation": overflow} for call in batch.calls]
@@ -494,6 +507,35 @@ class RootController:
                     results[index]["observation"] = overflow
                     operation.delivery_error = "batch_observation_limit"
         return encode(), calls
+
+    def _reject_oversized_batch(self, batch: _ToolBatch, step: StepTrace) -> str | None:
+        error = {"code": "tool_batch_limit", "max_operations": MAX_TOOL_BATCH}
+        if step.phase == "finalization":
+            error["finish_only"] = True
+            instruction = "Call finish_research on its own."
+        else:
+            instruction = f"Request at most {MAX_TOOL_BATCH} operations per decision. Call finish_research on its own."
+        step.error = {**error, "requested_operations": len(batch.calls)}
+
+        content = None
+        for feedback in ({**error, "message": instruction}, error):
+            observation = {"ok": False, "error": feedback}
+            envelope = observation_json({"tool_results": [
+                {"tool_use_id": call.tool_use_id, "observation": observation} for call in batch.calls
+            ]})
+            if len(envelope.encode("utf-8")) <= self._limits.max_response_bytes:
+                content = envelope
+                break
+
+        if content is None:
+            step.error = {"code": "batch_observation_limit", "requested_operations": len(batch.calls)}
+        result = DispatchResult(None, observation_json(observation))
+        for operation in step.batch_operations:
+            operation.outcome = "rejected"
+            operation.record(result)
+            if content is None:
+                operation.delivery_error = "batch_observation_limit"
+        return content
 
     def _execute_batch_call(
         self, call: _BatchCall, operation: ToolTrace, calls: int, deadline: float,

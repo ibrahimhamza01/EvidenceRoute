@@ -47,7 +47,8 @@ def execute_research_plan(
     with preflight.invocation_allocation(root=True):
         allocation = preflight.active_allocation
         investigation_turns = allocation.investigation_left if allocation else limits.max_provider_attempts - 1
-    root_slots = min(local.max_tool_calls, MAX_TOOL_BATCH * min(local.max_iterations - 1, investigation_turns))
+    finish_decisions = allocation.finalization_left if allocation else 1
+    root_slots = min(local.max_tool_calls, MAX_TOOL_BATCH * min(local.max_iterations - finish_decisions, investigation_turns))
 
     unresolved = {entry.company for entry in plan.missing_requirements}
     pending: dict[str, str] = {}

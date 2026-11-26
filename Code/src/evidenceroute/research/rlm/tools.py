@@ -19,6 +19,7 @@ from evidenceroute.research.rlm.environment import (
     SectionWindow,
 )
 from evidenceroute.retrieval import ChunkFilter
+from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.schemas import Chunk, RetrievalResult
 
 if TYPE_CHECKING:
@@ -26,7 +27,10 @@ if TYPE_CHECKING:
 
 MIN_RESPONSE_BYTES = 128
 MAX_TOOL_BATCH = 4
-TOOL_USE_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+# This only bounds protocol recovery. A batch above MAX_TOOL_BATCH never executes.
+MAX_PROTOCOL_TOOL_BATCH = 16
+# Internal batches preserve native IDs, including Bedrock's period and colon.
+TOOL_USE_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,64}$"
 
 
 def trace_data(value):
@@ -191,11 +195,12 @@ class DispatchResult:
 class CorpusToolDispatcher:
     """Validate tool requests and serialize the exact model-facing observation."""
 
-    def __init__(self, corpus: CorpusEnvironment | ScopedCorpus, *, max_response_bytes: int):
+    def __init__(self, corpus: CorpusEnvironment | ScopedCorpus, *, max_response_bytes: int, include_spans: bool = False):
         if type(max_response_bytes) is not int or max_response_bytes < MIN_RESPONSE_BYTES:
             raise ValueError(f"max_response_bytes must be at least {MIN_RESPONSE_BYTES}")
         self._corpus = corpus
         self._max_bytes = max_response_bytes
+        self._include_spans = include_spans
 
     def dispatch(self, name: str, arguments: dict) -> DispatchResult:
         if not isinstance(name, str) or name not in _TOOLS:
@@ -213,9 +218,13 @@ class CorpusToolDispatcher:
         try:
             # Only names in the fixed registry reach attribute lookup.
             result = getattr(self._corpus, name)(**call_args)
-            evidence = self._evidence(name, result)
+            chunks = self._result_chunks(name, result)
+            evidence = tuple(EvidenceRef.from_chunk(chunk) for chunk in chunks)
             discovered = evidence if name == "search_chunks" else ()
-            content = observation_json({"ok": True, "result": result})
+            body = {"ok": True, "result": result}
+            if self._include_spans and chunks:
+                body["span_ids"] = {chunk.chunk_id: list(passage_spans(chunk.text)) for chunk in chunks}
+            content = observation_json(body)
             response_bytes = len(content.encode("utf-8"))
             if response_bytes > self._max_bytes:
                 return self._oversized(name, validated, result, response_bytes, discovered)
@@ -243,14 +252,11 @@ class CorpusToolDispatcher:
         return DispatchResult(arguments, content, search_discovered=discovered)
 
     @staticmethod
-    def _evidence(name: str, result) -> tuple[EvidenceRef, ...]:
+    def _result_chunks(name: str, result) -> tuple[Chunk, ...]:
         if name == "get_chunk":
-            return (EvidenceRef.from_chunk(result),)
+            return (result,)
         if name in {"read_chunks", "search_chunks"}:
-            return tuple(
-                EvidenceRef.from_chunk(item.chunk if isinstance(item, RetrievalResult) else item)
-                for item in result.items
-            )
+            return tuple(item.chunk if isinstance(item, RetrievalResult) else item for item in result.items)
         return ()
 
     def _error(

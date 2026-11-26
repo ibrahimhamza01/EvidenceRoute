@@ -21,9 +21,15 @@ class EvidenceDraft(StrictInput):
     )
 
 
+class SpanEvidenceDraft(StrictInput):
+    chunk_id: Identifier
+    span_id: str = Field(pattern=r"^[0-9]{1,7}:[0-9]{1,7}$",
+                         description="Select a span ID supplied with this chunk or a delivered excerpt.")
+
+
 class FindingDraft(StrictInput):
     claim: str = Field(min_length=1, max_length=700)
-    evidence: list[EvidenceDraft] = Field(min_length=1, max_length=3)
+    evidence: list[EvidenceDraft | SpanEvidenceDraft] = Field(min_length=1, max_length=3)
     analysis_status: AnalysisStatus
     uncertainty: str | None = Field(default=None, max_length=400)
     conflict: str | None = Field(default=None, max_length=400)
@@ -33,6 +39,7 @@ class FindingDraft(StrictInput):
 class FindingEvidence:
     source: EvidenceRef
     quote: str
+    span_id: str | None = None
 
 
 @dataclass(frozen=True)

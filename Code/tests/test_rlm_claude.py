@@ -159,10 +159,9 @@ def test_oversize_call_list_leaves_bounded_redacted_telemetry():
     client = ClaudeRootClient(FakeTransport(message(
         {"type": "thinking", "thinking": "private reasoning fixture", "signature": "fixture"}, *uses,
     )))
-    with pytest.raises(ClaudeModelError, match="tool_batch_limit"):
-        decide(client)
+    assert len(decide(client)["calls"]) == 5
     assert client.last_tool_request_count == 5
-    assert len(client.last_tool_requests) == 4
+    assert len(client.last_tool_requests) == 5
     assert client.last_tool_requests[0] == {
         "tool_use_id": "use-0", "name": "list_filings",
         "arguments": {"authorization": "<redacted>", "account": "<redacted>"},
