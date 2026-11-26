@@ -12,10 +12,10 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 from pydantic import ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, BudgetUsage, SharedBudget
-from evidenceroute.research.rlm.comparison import Comparison, ComparisonDraft
+from evidenceroute.research.rlm.comparison import Comparison, ComparisonDraft, FindingReference, ReferenceComparisonDraft
 from evidenceroute.research.rlm.coverage import CoverageReport, CoverageTracker, ResearchScope
 from evidenceroute.research.rlm.environment import CorpusEnvironment
-from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingDraft, PartitionCoverage
+from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingDraft, PartitionCoverage, SpanEvidenceDraft
 from evidenceroute.research.rlm.tools import (
     MIN_RESPONSE_BYTES,
     MAX_PROTOCOL_TOOL_BATCH,
@@ -67,7 +67,24 @@ class _FinishAction(StrictInput):
     comparisons: list[ComparisonDraft] = Field(default_factory=list, max_length=3)
 
 
-_ACTION = TypeAdapter(Annotated[_ToolAction | _ToolBatch | _FinishAction, Field(discriminator="type")])
+class _NewSpanFinding(FindingDraft):
+    evidence: list[SpanEvidenceDraft] = Field(min_length=1, max_length=3, description="Directly acknowledged root spans in one document and section.")
+
+
+class _ReferenceSynthesis(StrictInput):
+    comparisons: list[ReferenceComparisonDraft] = Field(default_factory=list, max_length=3)
+    new_findings: list[_NewSpanFinding] = Field(default_factory=list, max_length=8)
+    cite_refs: list[FindingReference] = Field(default_factory=list, max_length=8,
+        description="Optional references for evidence outside comparisons. Comparison citations are automatic.")
+    analysis_status: AnalysisStatus | None = None
+
+
+class _ReferenceFinishAction(StrictInput):
+    type: Literal["synthesis"]
+    synthesis: _ReferenceSynthesis
+
+
+_ACTION = TypeAdapter(Annotated[_ToolAction | _ToolBatch | _FinishAction | _ReferenceFinishAction, Field(discriminator="type")])
 
 
 def action_schema() -> dict:
@@ -75,11 +92,13 @@ def action_schema() -> dict:
     return _ACTION.json_schema()
 
 
-def finish_input_schema(*, recursive: bool = False, comparative: bool = False) -> dict:
+def finish_input_schema(*, recursive: bool = False, comparative: bool = False, reference_based: bool = False) -> dict:
     """Describe a finish payload whose action type is supplied by the adapter."""
-    schema = _FinishAction.model_json_schema()
+    schema = (_ReferenceFinishAction if reference_based else _FinishAction).model_json_schema()
     del schema["properties"]["type"]
     schema["required"].remove("type")
+    if reference_based:
+        return schema
     if not comparative:
         del schema["properties"]["comparisons"]
         schema["$defs"]["FindingDraft"]["properties"]["evidence"]["items"] = {"$ref": "#/$defs/EvidenceDraft"}
@@ -227,6 +246,7 @@ class ExecutionTrace:
     coverage_status: Literal["unknown", "complete", "partial", "missing"] | None = None
     comparisons: tuple[Comparison, ...] = ()
     initial_assignment_stop: str | None = None
+    selected_inherited_findings: tuple[Finding, ...] = ()
 
     @property
     def model_attempts(self) -> tuple[ModelAttempt, ...]:
@@ -321,12 +341,17 @@ class RootController:
                     offered_tools = []
                     notice = (
                         f"Finalization only ({finalization_reason}). Call finish_research now using delivered "
-                        "evidence. Keep the answer and findings concise; put quotes in findings without repeating "
-                        "them in the answer. If evidence is insufficient, report an incomplete result or abstain."
+                        "evidence. If evidence is insufficient, report an incomplete result or abstain."
                     )
-                    if replay_reason == "truncated_response" and self._comparative:
-                        notice += (" The previous output was truncated. Give a brief answer and prioritize one comparison "
-                                   "per company using one exact span per finding. Keep each finding in one document and section.")
+                    if _recursive.reference_synthesis:
+                        notice += " Submit comparisons by short finding reference and omit answer prose."
+                        if replay_reason == "truncated_response":
+                            notice += " Prioritize one comparison per company and reference the strongest evidence."
+                    else:
+                        notice += " Keep the answer and findings concise and avoid repeating quotes."
+                        if replay_reason == "truncated_response" and self._comparative:
+                            notice += (" The previous output was truncated. Prioritize one comparison per company "
+                                       "using one exact span per finding. Keep each finding in one document and section.")
                 elif unassigned:
                     offered_tools = [tool for tool in tools if tool["name"] == "delegate_research"]
                     notice = (
@@ -454,10 +479,22 @@ class RootController:
                 stop = "deadline"
                 break
 
-            if isinstance(action, _FinishAction):
+            if isinstance(action, (_FinishAction, _ReferenceFinishAction)):
                 if step.assignment_stage == "assignment":
                     pending = self._feedback(step, "initial_assignment_required", "Attempt each whole group first.")
                     continue
+                if isinstance(action, _ReferenceFinishAction):
+                    if _recursive is None or not _recursive.reference_synthesis:
+                        pending = self._feedback(step, "invalid_action", "Reference synthesis requires a comparative root.")
+                        continue
+                    try:
+                        citations = _recursive.finish_references(action.synthesis, coverage.report())
+                    except ValueError as exc:
+                        pending = self._feedback(step, "invalid_findings", str(exc))
+                        continue
+                    answer = _recursive.render_answer("")
+                    stop = "finished"
+                    break
                 visible = {ref.chunk_id for ref in coverage.report().visible_chunks}
                 if not visible.issuperset(action.cited_chunk_ids):
                     pending = self._feedback(step, "unseen_citation", "Cite only chunks supplied to the model.")

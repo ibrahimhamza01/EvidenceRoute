@@ -52,7 +52,7 @@ class CountedClient(ScriptedModelClient):
 
 
 def runner_for(corpus, plan, *, client=ScriptedModelClient, broken_root=None, broken_child=None,
-               unacknowledged_root=None, **options):
+               unacknowledged_root=None, invalid_synthesis_root=None, **options):
     def factory(inv):
         groups = [group for group in plan.groups if set(group.targets) <= set(inv.partitions)]
         if inv.depth == 0 and any(group.ticker == broken_root for group in groups):
@@ -78,16 +78,21 @@ def runner_for(corpus, plan, *, client=ScriptedModelClient, broken_root=None, br
         delegates = [{"type": "tool", "name": "delegate_research", "arguments": {
             "question": f"Read {group.ticker}.", "goal": "Return excerpt.", "partitions": [asdict(pair) for pair in group.targets],
         }} for group in groups]
+        reference_finish = {"type": "synthesis", "synthesis": {"comparisons": [
+            {**comparison, "assessments": [
+                {"ref": f"d{item['finding_index']}", "relevance": item["relevance"],
+                 "entailment": item["entailment"], "rationale": item["rationale"]}
+                for item in comparison["assessments"]]} for comparison in comparisons
+        ]}}
         if any(group.ticker == unacknowledged_root for group in groups):
-            model = client(delegates)
+            model = client([*delegates, reference_finish])
             model.last_observation_delivered = False
             return model
+        if any(group.ticker == invalid_synthesis_root for group in groups):
+            return client([*delegates, {"type": "synthesis", "synthesis": {"cite_refs": ["d99"]}}])
         if any(group.ticker == broken_child for group in groups):
             return client([*delegates, {"type": "finish", "answer": "No evidence."}])
-        prefix = inv.invocation_id.removesuffix("root")
-        finish.update(cited_chunk_ids=[chunk.chunk_id for chunk in chunks],
-                      used_finding_ids=[f"{prefix}child-{i}:finding-{j}" for i in range(1, len(groups) + 1) for j in (1, 2)])
-        return client([*delegates, finish])
+        return client([*delegates, reference_finish])
 
     return RecursiveResearch(corpus, factory,
                              shared_limits=options.pop("shared_limits", SharedLimits(
@@ -153,7 +158,13 @@ def test_zero_candidates_and_unresolved_subset_keep_original_denominator(corpus)
     assert {item.outcome for item in result.root_comparisons} == {"conflicting"}
     assert {item.outcome for item in result.acknowledged_child_comparisons} == {"comparable_both_years"}
     assert "RAW DRAFT" not in result.answer and "cannot establish absence" in result.answer
-    assert len({finding.finding_id for finding in (*result.root_findings, *result.acknowledged_child_findings)}) == 8
+    assert not result.root_findings
+    assert result.root_selected_inherited_findings == result.acknowledged_child_findings
+    assert len({finding.finding_id for finding in result.root_selected_inherited_findings}) == 4
+    assert all(target.used_finding_ids == target.acknowledged_finding_ids and not target.whole_chunk_ids
+               for target in result.coverage.targets)
+    assert all(node.selected_inherited_finding_ids == node.used_finding_ids for node in result.coverage.invocations
+               if node.invocation.depth == 0)
     assert len({node.invocation.invocation_id for node in result.coverage.invocations}) == 4
     for item in result.evidence:
         chunk = corpus.get_chunk(item.source.chunk_id)
@@ -161,17 +172,20 @@ def test_zero_candidates_and_unresolved_subset_keep_original_denominator(corpus)
         assert item.quote == chunk.text[start:end] and item.source.source_url == chunk.source_url
 
 
-@pytest.mark.parametrize("failure", ["broken_root", "broken_child", "unacknowledged_root"])
+@pytest.mark.parametrize("failure", ["broken_root", "broken_child", "unacknowledged_root", "invalid_synthesis_root"])
 def test_failed_tree_preserves_prior_and_later_evidence(corpus, failure):
     plan = resolve(corpus, ["AAPL", "AMD", "NVDA"])
     result = execute_corpus_research(plan, runner_for(corpus, plan, **{failure: "AMD"}),
                                      limits=overall(), scan_terms=("unlikelyliteralfixture",))
     assert len(result.batches) == 3 and result.execution_status == result.research_status == "incomplete"
-    assert {item.source.ticker for item in result.evidence} == {"AAPL", "NVDA"}
+    expected_evidence = {"AAPL", "AMD", "NVDA"} if failure == "invalid_synthesis_root" else {"AAPL", "NVDA"}
+    assert {item.source.ticker for item in result.evidence} == expected_evidence
     assert {ref.ticker for ref in result.citations} == {"AAPL", "NVDA"}
+    assert {item.evidence[0].source.ticker for item in result.root_selected_inherited_findings} == {"AAPL", "NVDA"}
     assert result.groups[1].pending_reason and result.errors
     retained = result.retained_unacknowledged_child_findings
     if failure == "unacknowledged_root":
+        assert any(code == "invalid_findings" for _, code in result.errors)
         assert len(retained) == 2 and all(item.evidence[0].source.ticker == "AMD" for item in retained)
         for finding in retained:
             evidence = finding.evidence[0]

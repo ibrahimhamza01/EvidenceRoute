@@ -38,6 +38,7 @@ class InvocationOutcome:
     cited_chunk_ids: tuple[str, ...]
     whole_chunk_ids: tuple[str, ...]
     section_windows: tuple[SectionAccess, ...]
+    selected_inherited_finding_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,7 @@ def aggregate_research_trees(
             run.analysis_status if run else None, edge.status if edge else None, edge.error if edge else None,
             acknowledged, findings, delivered, run.used_finding_ids if run else (),
             run.cited_chunk_ids if run else (), tuple(sorted(chunks)), tuple(windows),
+            tuple(finding.finding_id for finding in run.selected_inherited_findings) if run else (),
         ))
         for child, child_acknowledged in children:
             assert child.invocation is not None

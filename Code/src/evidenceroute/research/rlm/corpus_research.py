@@ -83,6 +83,7 @@ class CorpusResearchResult:
     scan: CorpusScan | None
     usage: CorpusUsage
     root_findings: tuple[Finding, ...]
+    root_selected_inherited_findings: tuple[Finding, ...]
     acknowledged_child_findings: tuple[Finding, ...]
     retained_unacknowledged_child_findings: tuple[Finding, ...]
     root_comparisons: tuple[Comparison, ...]
@@ -160,6 +161,7 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
                 operation.update(child_id=edge.invocation.invocation_id, full_observation_bytes=edge.full_observation_bytes,
                                  retained_finding_ids=[item.finding_id for item in edge.child.findings],
                                  offered_finding_ids=edge.offered_finding_ids,
+                                 finding_references=dict(edge.finding_references),
                                  submitted_finding_ids=edge.offered_finding_ids if submitted else (),
                                  acknowledged_finding_ids=edge.delivered_finding_ids,
                                  used_finding_ids=sorted(set(node.used_finding_ids) & set(edge.delivered_finding_ids)))
@@ -260,6 +262,8 @@ def execute_corpus_research(
                    for ticker in plan.requested_companies)
     coverage = aggregate_research_trees(runner.corpus, plan, traces)
     root_findings = tuple(finding for trace in traces if trace.stop_reason == "finished" for finding in trace.findings)
+    selected = tuple(finding for trace in traces if trace.stop_reason == "finished"
+                     for finding in trace.selected_inherited_findings)
     roots = {trace.invocation.invocation_id for trace in traces}
     child_findings = tuple(finding for child in coverage.invocations if child.invocation.parent_id in roots
                            and child.stop_reason == "finished" for finding in child.findings
@@ -323,7 +327,7 @@ def execute_corpus_research(
                    "This result cannot establish absence or answer for the full requested scope."
                    if incomplete else "\n\nResearch conclusions await independent semantic verification.")
     return CorpusResearchResult(plan, limits, run_id, groups, tuple(batches), coverage, scan, usage,
-                                root_findings, child_findings, retained, root_comparisons, child_comparisons, evidence,
+                                root_findings, selected, child_findings, retained, root_comparisons, child_comparisons, evidence,
                                 tuple(citations[key] for key in sorted(citations)), tuple(sorted(assessed)), tuple(errors),
                                 tuple(diagnostics), stop,
                                 "finished" if finished else "incomplete", "incomplete" if incomplete else "unverified", answer)

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from time import monotonic
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field
 
@@ -149,6 +149,41 @@ class ComparisonDraft(StrictInput):
     assessments: list[EvidenceAssessment] = Field(min_length=1, max_length=8)
 
 
+FindingReference = Annotated[str, Field(pattern=r"^(d[1-9][0-9]{0,8}|n[1-8])$")]
+
+
+class ReferenceAssessment(StrictInput):
+    ref: FindingReference = Field(description="Delivered finding ref dN, or new finding nN by one-based position.")
+    relevance: Literal["infrastructure", "other", "uncertain"]
+    entailment: Literal["supports", "contradicts", "uncertain"]
+    rationale: str = Field(min_length=1, max_length=250, description="Briefly explain relevance, entailment, and any AI connection.")
+    ai_specificity: Literal["explicit", "contextual"] | None = None
+    context_ref: FindingReference | None = Field(default=None, description="Optional same-company, same-year AI evidence for a contextual assessment.")
+
+    @property
+    def infrastructure_connection(self) -> str:
+        return self.rationale
+
+    @property
+    def ai_specific_connection(self) -> str | None:
+        return self.rationale if self.ai_specificity else None
+
+
+class ReferenceComparisonDraft(StrictInput):
+    risk: str = Field(min_length=1, max_length=250, description="Neutral mechanism label. Leave novelty to the assessment.")
+    same_risk: Literal["yes", "no", "uncertain"]
+    assessments: list[ReferenceAssessment] = Field(min_length=1, max_length=8)
+
+
+class ResolvedReferenceAssessment(StrictInput):
+    finding_id: Identifier
+    context_finding_id: Identifier | None = None
+    relevance: Literal["infrastructure", "other", "uncertain"]
+    entailment: Literal["supports", "contradicts", "uncertain"]
+    rationale: str
+    ai_specificity: Literal["explicit", "contextual"] | None = None
+
+
 @dataclass(frozen=True)
 class Comparison:
     risk: str
@@ -156,7 +191,7 @@ class Comparison:
     years: tuple[int, int]
     outcome: Literal["comparable_both_years", "possible_new_needs_review", "conflicting", "insufficient"]
     same_risk: str
-    assessments: tuple[EvidenceAssessment, ...]
+    assessments: tuple[EvidenceAssessment | ResolvedReferenceAssessment, ...]
     finding_ids: tuple[str, ...]
     assessed_chunk_ids: tuple[str, ...]
     evidence_years: tuple[int, ...]
@@ -172,7 +207,49 @@ def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: t
     indices = [item.finding_index for item in draft.assessments]
     if len(set(indices)) != len(indices) or any(index > len(findings) for index in indices):
         raise ValueError("Comparison assessments must refer to distinct findings in this finish.")
-    selected = [findings[index - 1] for index in indices]
+    def context(assessment: EvidenceAssessment) -> Finding | None:
+        index = assessment.ai_context_finding_index
+        if index is None:
+            return None
+        if index > len(findings):
+            raise ValueError("AI context must refer to a finding in this finish.")
+        return findings[index - 1]
+
+    return _resolve_comparison(draft, [findings[index - 1] for index in indices], context, years)
+
+
+def resolve_reference_comparison(
+    draft: ReferenceComparisonDraft, findings: Mapping[str, Finding], years: tuple[int, int],
+) -> Comparison:
+    refs = [assessment.ref for assessment in draft.assessments]
+    if len(set(refs)) != len(refs):
+        raise ValueError("Comparison assessments must refer to distinct findings.")
+    selected = []
+    contexts = {}
+    for assessment in draft.assessments:
+        finding = findings.get(assessment.ref)
+        if finding is None:
+            raise ValueError(f"Unknown or unacknowledged finding reference: {assessment.ref}.")
+        selected.append(finding)
+        ref = assessment.context_ref
+        if ref is None:
+            continue
+        context = findings.get(ref)
+        if context is None:
+            raise ValueError(f"Unknown or unacknowledged AI context reference: {ref}.")
+        source = finding.evidence[0].source
+        if assessment.ai_specificity != "contextual" or not _has_ai_context(context, source.ticker, source.fiscal_year):
+            raise ValueError("AI context requires a same-company, same-year finding with an exact AI span.")
+        contexts[assessment.ref] = context
+    return _resolve_comparison(draft, selected, lambda assessment: contexts.get(assessment.ref), years)
+
+
+def _has_ai_context(finding: Finding, ticker: str, year: int) -> bool:
+    return any(item.span_id and item.source.fiscal_year == year and item.source.ticker == ticker
+               and _AI_TEXT.search(item.quote) for item in finding.evidence)
+
+
+def _resolve_comparison(draft, selected, lookup_context, years: tuple[int, int]) -> Comparison:
     sources = [item.source for finding in selected for item in finding.evidence]
     if len({source.ticker for source in sources}) != 1 or any(source.fiscal_year not in years for source in sources):
         raise ValueError("A comparison must use evidence from one company and the requested years.")
@@ -185,7 +262,8 @@ def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: t
                  if assessment.relevance == "infrastructure" and assessment.entailment == "supports"}
     contradicts = any(item.relevance == "infrastructure" and item.entailment == "contradicts"
                       for item in assessments)
-    if (supported and contradicts) or any(f.analysis_status == "conflicting" for f in selected):
+    if (supported and contradicts) or (isinstance(draft, ComparisonDraft)
+                                        and any(f.analysis_status == "conflicting" for f in selected)):
         outcome = "conflicting"
     elif supported == set(years) and draft.same_risk == "yes":
         outcome = "comparable_both_years"
@@ -195,30 +273,34 @@ def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: t
         outcome = "insufficient"
     evidence_years = tuple(sorted({source.fiscal_year for source in sources}))
     explicit, contextual = set(), set()
-    context_indices = set()
+    contexts: dict[str, Finding] = {}
+    resolved = []
     for assessment, finding in zip(assessments, selected):
-        if (assessment.relevance != "infrastructure" or assessment.entailment != "supports"
-                or not assessment.ai_specific_connection):
-            continue
-        year = finding.evidence[0].source.fiscal_year
-        direct = any(_AI_TEXT.search(item.quote) for item in finding.evidence)
-        if assessment.ai_specificity == "explicit" and direct:
-            explicit.add(year)
-        if assessment.ai_specificity == "contextual":
-            index = assessment.ai_context_finding_index
-            if index is not None and index > len(findings):
-                raise ValueError("AI context must refer to a finding in this finish.")
-            context = findings[index - 1].evidence if index is not None else ()
-            anchored = any(item.span_id and item.source.fiscal_year == year and item.source.ticker == sources[0].ticker
-                           and _AI_TEXT.search(item.quote) for item in context)
-            if direct or anchored:
-                contextual.add(year)
-                if anchored and not direct:
-                    context_indices.add(index)
-    referenced = [*selected, *(findings[index - 1] for index in sorted(context_indices) if index not in indices)]
-    return Comparison(draft.risk, sources[0].ticker, years, outcome, draft.same_risk, assessments,
-                      tuple(f.finding_id for f in referenced),
-                      tuple(sorted({item.source.chunk_id for finding in referenced for item in finding.evidence})),
+        context_id = None
+        if (assessment.relevance == "infrastructure" and assessment.entailment == "supports"
+                and assessment.ai_specific_connection):
+            year = finding.evidence[0].source.fiscal_year
+            direct = _has_ai_context(finding, sources[0].ticker, year)
+            if assessment.ai_specificity == "explicit" and direct:
+                explicit.add(year)
+            if assessment.ai_specificity == "contextual":
+                context = lookup_context(assessment)
+                anchored = context is not None and _has_ai_context(context, sources[0].ticker, year)
+                if direct or anchored:
+                    contextual.add(year)
+                if anchored and (not direct or isinstance(assessment, ReferenceAssessment)):
+                    context_id = context.finding_id
+                    contexts[context_id] = context
+        if isinstance(assessment, ReferenceAssessment):
+            resolved.append(ResolvedReferenceAssessment(finding_id=finding.finding_id, context_finding_id=context_id,
+                            **assessment.model_dump(exclude={"ref", "context_ref"})))
+        else:
+            resolved.append(assessment)
+    referenced = {finding.finding_id: finding for finding in selected}
+    referenced.update(contexts)
+    return Comparison(draft.risk, sources[0].ticker, years, outcome, draft.same_risk, tuple(resolved),
+                      tuple(referenced),
+                      tuple(sorted({item.source.chunk_id for finding in referenced.values() for item in finding.evidence})),
                       evidence_years, evidence_years == years, tuple(sorted(explicit)), tuple(sorted(contextual - explicit)))
 
 

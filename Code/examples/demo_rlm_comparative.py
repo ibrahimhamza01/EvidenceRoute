@@ -31,7 +31,7 @@ ROOT_GUIDANCE = (
     "Ask each company investigator to compare the same risk across both years and look for "
     "prior-year counterevidence. Reassess the strongest delivered spans and report each group's result, "
     "including missing years and abstentions. Use separate relevance and entailment judgments. "
-    "Declare the delivered finding IDs you use and cite the original chunks. Finish with a partial synthesis "
+    "Use short delivered finding references so the host can derive original citations. Finish with a partial synthesis "
     "when a company investigation fails. Use the few follow-up calls only for a specific evidence gap."
 )
 
@@ -60,15 +60,13 @@ def _offline_factory(corpus, plan):
                 "goal": "Examine supporting evidence and potential counterevidence.",
                 "partitions": [asdict(pair) for pair in group.targets],
             }} for group in groups]
-            amd_index = next((index for index, group in enumerate(groups, 1) if group.ticker == "AMD"), None)
-            if amd_index is None:
-                return ScriptedModelClient([*actions, {"type": "finish", "answer": "No scripted evidence in scope."}])
-            namespace, separator, _ = invocation.invocation_id.rpartition(".")
-            return ScriptedModelClient([*actions, {"type": "finish", "answer": "Sampled comparative research.",
-                "analysis_status": "incomplete", "cited_chunk_ids": [chunk.chunk_id for chunk in chunks],
-                "used_finding_ids": [f"{namespace}{separator}child-{amd_index}:finding-{number}" for number in (1, 2)],
-                "findings": findings, "comparisons": [comparison],
-            }])
+            if not any(group.ticker == "AMD" for group in groups):
+                return ScriptedModelClient([*actions, {"type": "synthesis", "synthesis": {}}])
+            assessments = [{"ref": f"d{i}", "relevance": "infrastructure", "entailment": "supports",
+                            "rationale": "Power or water shortages can constrain data-center capacity."} for i in (1, 2)]
+            return ScriptedModelClient([*actions, {"type": "synthesis", "synthesis": {"analysis_status": "incomplete",
+                "comparisons": [{**comparison, "assessments": assessments}],
+            }}])
         selected = {pair.document_id for pair in invocation.partitions}
         if any(chunk.document_id not in selected for chunk in chunks):
             return ScriptedModelClient([{"type": "finish", "answer": "No scoped assessment in this scripted example."}])
@@ -156,6 +154,8 @@ def _report(result, scan, live, detailed=False):
                             for status in ("unassigned", "completed", "failed", "unresolved", "not_admitted")}},
         "acknowledged_comparisons": acknowledged,
         "root_comparisons": root_comparisons,
+        "root_findings": trace.findings if trace else (),
+        "root_selected_inherited_findings": trace.selected_inherited_findings if trace else (),
         "assessed_chunk_ids": sorted(assessed), "original_citations": result.citations,
         "root_cited_years_by_company": {group.ticker: sorted({ref.fiscal_year for ref in result.citations
                                                              if ref.ticker == group.ticker}) for group in admitted},

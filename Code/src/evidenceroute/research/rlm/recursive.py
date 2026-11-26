@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Literal
 from uuid import uuid4
@@ -11,14 +11,16 @@ from uuid import uuid4
 from pydantic import Field, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
-from evidenceroute.research.rlm.comparison import CandidatePageRequest, Comparison, CorpusScan, render_comparisons, resolve_comparison
+from evidenceroute.research.rlm.comparison import (
+    CandidatePageRequest, Comparison, CorpusScan, render_comparisons, resolve_comparison, resolve_reference_comparison,
+)
 from evidenceroute.research.rlm.controller import (
-    ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction,
+    ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction, _ReferenceSynthesis,
 )
 from evidenceroute.research.rlm.coverage import CoverageReport, ResearchScope, SectionTarget
 from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import (
-    AnalysisStatus, Finding, FindingEvidence, PartitionCoverage, SpanEvidenceDraft, partition_status,
+    AnalysisStatus, Finding, FindingDraft, FindingEvidence, PartitionCoverage, SpanEvidenceDraft, partition_status,
 )
 from evidenceroute.research.rlm.scoped import ScopedCorpus
 from evidenceroute.research.rlm.spans import passage_spans
@@ -60,6 +62,7 @@ class DelegationTrace:
     offered_finding_ids: tuple[str, ...] = ()
     offered_comparison_indices: tuple[int, ...] = ()
     full_observation_bytes: int | None = None
+    finding_references: tuple[tuple[str, str], ...] = ()
 
 
 class RecursiveResearch:
@@ -145,13 +148,17 @@ class RecursiveResearch:
         if any(model is previous for previous in clients) or not callable(bind):
             raise ValueError("The factory must return a fresh, budget-aware model client.")
         bind(budget)
+        session = RecursiveSession(self, invocation, budget, clients, parent_deadline, root_groups)
         if self.comparison_scan is not None:
             enable = getattr(model, "enable_comparative_finish", None)
             if callable(enable):
                 enable()
+        if session.reference_synthesis:
+            enable_refs = getattr(model, "enable_reference_finish", None)
+            if callable(enable_refs):
+                enable_refs()
         clients.append(model)
         budget.model_sessions += 1
-        session = RecursiveSession(self, invocation, budget, clients, parent_deadline, root_groups)
         partitions = invocation.partitions
         view = self.corpus if partitions is None else ScopedCorpus(self.corpus, partitions)
         scope = ResearchScope() if partitions is None else ResearchScope(
@@ -171,8 +178,7 @@ class RecursiveResearch:
                 + "\nUse get_spans for matching passages and list_candidates with next_offset for more scoped IDs. "
                 "Read promising evidence in each fiscal "
                 "year and check the same risk in both filings. Choose chunk_id and span_id from acknowledged "
-                "evidence to create findings. To compare the same risk, reference your own findings by one-based index "
-                "in comparisons. Evaluate relevance to the topic separately from what the passage supports or contradicts. "
+                "evidence to create findings. Evaluate relevance to the topic separately from what the passage supports or contradicts. "
                 "Accelerator demand alone does not establish an infrastructure risk. Explain the connection in the "
                 "assessment and state separately whether the exact source links it to AI infrastructure. "
                 "Mark relevance other or uncertain where appropriate and abstain if support is insufficient. "
@@ -184,13 +190,19 @@ class RecursiveResearch:
         elif invocation.depth < budget.limits.max_depth:
             prompt += "\nUse delegate_research only for a narrower subproblem."
         evidence_instruction = ("source span IDs" if self.comparison_scan is not None else "exact quotes")
-        if self.comparison_scan is not None:
-            prompt += "\nUse structured comparisons for conclusions and keep the answer field brief."
-        prompt += (
-            f"\nSubmit findings via finish_research with {evidence_instruction} and original chunk IDs. "
-            "Report uncertainty, conflicts and incomplete analysis. "
-            "Name used_finding_ids when synthesizing delegated evidence. Search misses do not establish absence."
-        )
+        if session.reference_synthesis:
+            prompt += ("\nUse the dN references on delivered child findings. Reassess them in synthesis.comparisons. "
+                       "Only create new findings for directly acknowledged root spans, referenced by nN in list order. "
+                       "Keep evidence for each new finding in one document and section. "
+                       "The host derives citations and the answer. Abstain when the evidence is insufficient.")
+        else:
+            if self.comparison_scan is not None:
+                prompt += "\nReference your own findings by one-based index in comparisons and keep the answer brief."
+            prompt += (
+                f"\nSubmit findings via finish_research with {evidence_instruction} and original chunk IDs. "
+                "Report uncertainty, conflicts and incomplete analysis. "
+                "Name used_finding_ids when synthesizing delegated evidence. Search misses do not establish absence."
+            )
         return RootController(view, model, limits=self.local_limits, clock=self.clock,
                               include_spans=self.comparison_scan is not None).run(
             prompt, scope=scope, _recursive=session,
@@ -214,6 +226,10 @@ class RecursiveSession:
         self.direct_ids: set[str] = set()
         self.direct_spans: dict[str, set[str]] = {}
         self.delivered_findings: dict[str, Finding] = {}
+        self.reference_synthesis = invocation.depth == 0 and runner.comparison_scan is not None
+        self.acknowledged_references: dict[str, Finding] = {}
+        self.next_reference = 1
+        self.selected_inherited_findings: tuple[Finding, ...] = ()
         self.findings: tuple[Finding, ...] = ()
         self.comparisons: tuple[Comparison, ...] = ()
         self.used_finding_ids: tuple[str, ...] = ()
@@ -334,12 +350,22 @@ class RecursiveSession:
         )
         status = ("finished" if complete else "incomplete") if successful else "failed"
         findings = child.findings if successful else ()
+        references = {}
+        finding_records = {}
+        for finding in findings:
+            if self.reference_synthesis:
+                ref = f"d{self.next_reference}"
+                self.next_reference += 1
+                references[finding.finding_id] = ref
+                finding_records[finding.finding_id] = {"ref": ref, **asdict(finding)}
+            else:
+                finding_records[finding.finding_id] = finding
         body = {
             "ok": successful, "result": {
                 "child_invocation_id": invocation.invocation_id, "status": status,
                 "stop_reason": child.stop_reason, "budget_stop": child.budget_stop,
                 "analysis_status": child.analysis_status, "coverage": child.partition_coverage,
-                "findings": findings,
+                "findings": tuple(finding_records.values()),
             },
         }
         if self.runner.comparison_scan is not None and successful:
@@ -352,7 +378,7 @@ class RecursiveSession:
         if self.runner.comparison_scan is not None and successful:
             share = min(cap, batch_share) if batch_share is not None else cap
             if delegation.full_observation_bytes > share:
-                content, findings, indices = self._compact_child_result(body["result"], child, share)
+                content, findings, indices = self._compact_child_result(body["result"], child, share, finding_records)
                 delegation.offered_comparison_indices = indices
                 if content is None:
                     delegation.status = "oversized"
@@ -369,11 +395,14 @@ class RecursiveSession:
             )
             return DispatchResult(validated, content), delegation
         delegation.offered_finding_ids = tuple(finding.finding_id for finding in findings)
+        delegation.finding_references = tuple((references[fid], fid) for fid in delegation.offered_finding_ids if fid in references)
         refs = tuple(dict.fromkeys(item.source for finding in findings for item in finding.evidence))
         return DispatchResult(validated, content, refs), delegation
 
     @staticmethod
-    def _compact_child_result(result: dict, child: ExecutionTrace, cap: int) -> tuple[str | None, tuple[Finding, ...], tuple[int, ...]]:
+    def _compact_child_result(
+        result: dict, child: ExecutionTrace, cap: int, finding_records: dict[str, Finding | dict],
+    ) -> tuple[str | None, tuple[Finding, ...], tuple[int, ...]]:
         """Keep whole validated findings and send a bounded summary when the full result cannot fit."""
         findings: list[Finding] = []
         indices: list[int] = []
@@ -381,7 +410,8 @@ class RecursiveSession:
         record = {key: result[key] for key in ("child_invocation_id", "status", "analysis_status")}
 
         def encode() -> str:
-            return observation_json({"ok": True, "result": {**record, "findings": findings, "comparisons": summaries,
+            return observation_json({"ok": True, "result": {**record,
+                "findings": [finding_records[finding.finding_id] for finding in findings], "comparisons": summaries,
                 "omitted_findings": len(child.findings) - len(findings),
                 "omitted_comparisons": len(child.comparisons) - len(summaries)}})
 
@@ -420,6 +450,8 @@ class RecursiveSession:
             findings = [finding for finding in step.delegation.child.findings if finding.finding_id in offered]
             self.delivered_findings.update((finding.finding_id, finding) for finding in findings)
             step.delegation.delivered_finding_ids = tuple(finding.finding_id for finding in findings)
+            self.acknowledged_references.update((ref, self.delivered_findings[fid])
+                                                for ref, fid in step.delegation.finding_references if fid in offered)
 
     def finish(self, action: _FinishAction, coverage: CoverageReport) -> str | None:
         scan = self.runner.comparison_scan
@@ -428,53 +460,16 @@ class RecursiveSession:
         used = tuple(dict.fromkeys(action.used_finding_ids))
         if any(finding_id not in self.delivered_findings for finding_id in used):
             return "Use only delivered finding IDs."
-        used_evidence = [item for finding_id in used for item in self.delivered_findings[finding_id].evidence]
+        used_evidence = tuple(item for finding_id in used for item in self.delivered_findings[finding_id].evidence)
         selected_ids = {item.source.chunk_id for item in used_evidence}
         cited = set(action.cited_chunk_ids)
         if not cited.issubset(self.direct_ids | self.direct_spans.keys() | selected_ids):
             return "Declare the delivered finding IDs used by delegated citations."
 
-        findings = []
-        for index, draft in enumerate(action.findings, start=1):
-            evidence = []
-            for evidence_index, item in enumerate(draft.evidence, start=1):
-                location = f"Finding {index}, evidence {evidence_index}"
-                if isinstance(item, SpanEvidenceDraft):
-                    if scan is None:
-                        return f"{location}: span selection requires comparative mode."
-                    inherited = next((ref for ref in used_evidence if ref.source.chunk_id == item.chunk_id
-                                      and ref.span_id == item.span_id), None)
-                    if item.span_id in self.direct_spans.get(item.chunk_id, ()):
-                        chunk = self.runner.corpus.get_chunk(item.chunk_id)
-                        start, end = passage_spans(chunk.text)[item.span_id]
-                        evidence.append(FindingEvidence(EvidenceRef.from_chunk(chunk), chunk.text[start:end], item.span_id))
-                    elif inherited is not None:
-                        evidence.append(inherited)
-                    else:
-                        return f"{location}: select a span from an acknowledged chunk or a declared delivered finding."
-                    continue
-                if item.chunk_id not in self.direct_ids:
-                    if item.chunk_id not in selected_ids:
-                        return f"{location}: use an observed chunk or a declared delivered excerpt, or omit it."
-                    if not any(item.chunk_id == observed.source.chunk_id and item.quote in observed.quote
-                               for observed in used_evidence):
-                        return (f"{location} (chunk {item.chunk_id}): copy a contiguous quote exactly from "
-                                "the delivered excerpt or omit it.")
-                chunk = self.runner.corpus.get_chunk(item.chunk_id)
-                if item.quote not in chunk.text:
-                    return (f"{location} (chunk {item.chunk_id}): copy a contiguous quote exactly from "
-                            "the delivered chunk text, including punctuation and spacing, or omit it.")
-                evidence.append(FindingEvidence(EvidenceRef.from_chunk(chunk), item.quote))
-            source = evidence[0].source
-            target = SectionTarget(source.document_id, source.section_id)
-            if any((item.source.document_id, item.source.section_id) != (target.document_id, target.section_id)
-                   for item in evidence):
-                return "Each finding must cite evidence from one document and section."
-            findings.append(Finding(
-                f"{self.invocation.invocation_id}:finding-{index}", self.runner.corpus.get_filing(source.document_id).company_name,
-                draft.claim, tuple(evidence),
-                draft.analysis_status, partition_status(coverage, target), draft.uncertainty, draft.conflict,
-            ))
+        try:
+            findings = self._resolve_findings(action.findings, coverage, used_evidence)
+        except ValueError as exc:
+            return str(exc)
         referenced = cited | {item.source.chunk_id for finding in findings for item in finding.evidence}
         if any(not any(item.source.chunk_id in referenced for item in self.delivered_findings[fid].evidence)
                for fid in used):
@@ -488,6 +483,85 @@ class RecursiveSession:
         self.used_finding_ids = used
         self.analysis_status = (action.analysis_status or "incomplete") if referenced and not self.unassigned_groups else "incomplete"
         return None
+
+    def finish_references(self, action: _ReferenceSynthesis, coverage: CoverageReport) -> tuple[str, ...]:
+        scan = self.runner.comparison_scan
+        assert self.reference_synthesis and scan is not None
+        new = self._resolve_findings(action.new_findings, coverage, ())
+        available = {**self.acknowledged_references, **{f"n{i}": f for i, f in enumerate(new, 1)}}
+        selected = {finding.finding_id for finding in new}
+        for ref in action.cite_refs:
+            if ref not in available:
+                raise ValueError(f"Unknown or unacknowledged finding reference: {ref}.")
+            selected.add(available[ref].finding_id)
+        comparisons = tuple(resolve_reference_comparison(draft, available, scan.years) for draft in action.comparisons)
+        selected.update(fid for item in comparisons for fid in item.finding_ids)
+        inherited = tuple(finding for finding in self.acknowledged_references.values() if finding.finding_id in selected)
+        sources = [item.source for finding in (*new, *inherited) for item in finding.evidence]
+        if any(source.fiscal_year not in scan.years or
+               (self.invocation.partitions is not None and
+                SectionTarget(source.document_id, source.section_id) not in self.invocation.partitions)
+               for source in sources):
+            raise ValueError("Selected findings must use authorized partitions and requested fiscal years.")
+        citations = tuple(sorted({source.chunk_id for source in sources}))
+        if len(citations) > 50 or len(inherited) > 32:
+            raise ValueError("Select fewer findings to stay within citation and inherited finding limits.")
+        if not set(citations).issubset(ref.chunk_id for ref in coverage.visible_chunks):
+            raise ValueError("Citations require acknowledged evidence.")
+        self.findings = tuple(new)
+        self.comparisons = comparisons
+        self.selected_inherited_findings = inherited
+        self.used_finding_ids = tuple(item.finding_id for item in inherited)
+        self.analysis_status = (action.analysis_status or "incomplete") if citations and not self.unassigned_groups else "incomplete"
+        return citations
+
+    def _resolve_findings(
+        self, drafts: list[FindingDraft], coverage: CoverageReport, used_evidence: tuple[FindingEvidence, ...],
+    ) -> list[Finding]:
+        scan = self.runner.comparison_scan
+        selected_ids = {item.source.chunk_id for item in used_evidence}
+        findings = []
+        for index, draft in enumerate(drafts, start=1):
+            evidence = []
+            for evidence_index, item in enumerate(draft.evidence, start=1):
+                location = f"Finding {index}, evidence {evidence_index}"
+                if isinstance(item, SpanEvidenceDraft):
+                    if scan is None:
+                        raise ValueError(f"{location}: span selection requires comparative mode.")
+                    inherited = next((ref for ref in used_evidence if ref.source.chunk_id == item.chunk_id
+                                      and ref.span_id == item.span_id), None)
+                    if item.span_id in self.direct_spans.get(item.chunk_id, ()):
+                        chunk = self.runner.corpus.get_chunk(item.chunk_id)
+                        start, end = passage_spans(chunk.text)[item.span_id]
+                        evidence.append(FindingEvidence(EvidenceRef.from_chunk(chunk), chunk.text[start:end], item.span_id))
+                    elif inherited is not None:
+                        evidence.append(inherited)
+                    else:
+                        raise ValueError(f"{location}: select a span from an acknowledged chunk or a declared delivered finding.")
+                    continue
+                if item.chunk_id not in self.direct_ids:
+                    if item.chunk_id not in selected_ids:
+                        raise ValueError(f"{location}: use an observed chunk or a declared delivered excerpt, or omit it.")
+                    if not any(item.chunk_id == observed.source.chunk_id and item.quote in observed.quote
+                               for observed in used_evidence):
+                        raise ValueError(f"{location} (chunk {item.chunk_id}): copy a contiguous quote exactly from "
+                                "the delivered excerpt or omit it.")
+                chunk = self.runner.corpus.get_chunk(item.chunk_id)
+                if item.quote not in chunk.text:
+                    raise ValueError(f"{location} (chunk {item.chunk_id}): copy a contiguous quote exactly from "
+                            "the delivered chunk text, including punctuation and spacing, or omit it.")
+                evidence.append(FindingEvidence(EvidenceRef.from_chunk(chunk), item.quote))
+            source = evidence[0].source
+            target = SectionTarget(source.document_id, source.section_id)
+            if any((item.source.document_id, item.source.section_id) != (target.document_id, target.section_id)
+                   for item in evidence):
+                raise ValueError("Each finding must cite evidence from one document and section.")
+            findings.append(Finding(
+                f"{self.invocation.invocation_id}:finding-{index}", self.runner.corpus.get_filing(source.document_id).company_name,
+                draft.claim, tuple(evidence),
+                draft.analysis_status, partition_status(coverage, target), draft.uncertainty, draft.conflict,
+            ))
+        return findings
 
     def render_answer(self, draft: str) -> str:
         if self.runner.comparison_scan is not None:
@@ -512,6 +586,7 @@ class RecursiveSession:
             "findings": self.findings,
             "comparisons": self.comparisons,
             "used_finding_ids": self.used_finding_ids,
+            "selected_inherited_findings": self.selected_inherited_findings,
             "analysis_status": self.analysis_status,
             "partition_coverage": partitions,
             "coverage_status": coverage_status,

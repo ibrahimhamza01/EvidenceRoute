@@ -1104,8 +1104,8 @@ def test_released_child_slots_do_not_consume_protected_comparative_decisions(sna
         [converse_reply(delegate(pair), "delegate"),
          converse_reply(tool("get_chunk", chunk_id=chunk.chunk_id), "read"),
          converse_reply(tool("list_companies"), "companies"), converse_reply(tool("list_filings"), "filings"),
-         converse_reply(finish(findings=[invalid]), "invalid-finish"),
-         converse_reply(finish(chunk.chunk_id, findings=[draft]), "corrected-finish")],
+         converse_reply({"type": "finish", "synthesis": {"new_findings": [invalid]}}, "invalid-finish"),
+         converse_reply({"type": "finish", "synthesis": {"new_findings": [draft]}}, "corrected-finish")],
         [converse_reply(finish(), "child-finish")],
     ])
     scan = scan_research_plan(corpus, _company_plan(corpus), ("supply",))
@@ -1119,7 +1119,8 @@ def test_released_child_slots_do_not_consume_protected_comparative_decisions(sna
     requests = sessions[0].requests
     schema = next(tool["toolSpec"]["inputSchema"]["json"] for tool in requests[0]["toolConfig"]["tools"]
                   if tool["toolSpec"]["name"] == "finish_research")
-    assert "comparisons" in schema["properties"] and "SpanEvidenceDraft" in schema["$defs"]
+    assert list(schema["properties"]) == ["synthesis"] and "SpanEvidenceDraft" in schema["$defs"]
+    assert "comparisons" in schema["$defs"]["_ReferenceSynthesis"]["properties"]
     assert trace.shared_budget.released_child_provider_slots == 5
     assert [step.phase for step in trace.steps] == ["investigation"] * 4 + ["finalization"] * 2
     assert trace.steps[4].finalization_reason == "reserved_local_decisions"
@@ -1878,7 +1879,8 @@ def test_comparative_delegation_batch_compacts_results_without_losing_sibling(sn
         replies.append([converse_reply(tool("get_spans", chunk_id=chunk.chunk_id, span_ids=[span]), "read"),
                         converse_reply(finish(findings=drafts), "finish")])
     sessions = stub_bedrock(monkeypatch, [[converse_batch(*(delegate(pair) for pair in pairs)),
-        converse_reply(finish(*keys, used=["child-1:finding-1", "child-2:finding-1"]), "root-finish")], *replies])
+        converse_reply({"type": "finish", "synthesis": {"cite_refs": ["d3"]}}, "omitted-finding"),
+        converse_reply({"type": "finish", "synthesis": {"cite_refs": ["d4", "d1", "d4"]}}, "root-finish")], *replies])
     trace = RecursiveResearch(corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
                               comparison_scan=scan_research_plan(corpus, _company_plan(corpus), ("operations",)),
                               local_limits=RootLimits(max_response_bytes=4400)).run("Review risk.", partitions=tuple(pairs))
@@ -1888,12 +1890,59 @@ def test_comparative_delegation_batch_compacts_results_without_losing_sibling(sn
     edges = [op.delegation for op in step.operations]
     assert sum(edge.full_observation_bytes for edge in edges) > 4400
     assert all(edge.full_observation_bytes <= 4400 for edge in edges)
-    for index, ((_, response), edge) in enumerate(zip(_batch_feedback(sessions[0].requests[-1]), edges)):
+    assert trace.steps[1].error["code"] == "invalid_findings" and "d3" in trace.steps[1].error["message"]
+    assert trace.cited_chunk_ids == tuple(sorted(keys))
+    assert trace.used_finding_ids == ("child-1:finding-1", "child-2:finding-1")
+    for index, ((_, response), edge) in enumerate(zip(_batch_feedback(sessions[0].requests[1]), edges)):
         assert response["ok"] and response["result"]["omitted_findings"] > 0
         assert len(edge.child.findings) == 3 and len(edge.delivered_finding_ids) in (1, 2)
         excerpt = response["result"]["findings"][0]["evidence"][0]
         assert excerpt["quote"] == edge.child.findings[0].evidence[0].quote
         assert excerpt["source"]["chunk_id"] == keys[index]
+
+
+def test_reference_only_protected_bedrock_finish_replays_two_child_results(snapshot, monkeypatch):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+    from evidenceroute.research.rlm.comparison import scan_research_plan
+    from evidenceroute.research.rlm.spans import passage_spans
+
+    corpus, (old, new, _) = snapshot
+    pairs = tuple(SectionTarget(doc, RISK) for doc in (old, new))
+    children = []
+    for pair in pairs:
+        chunk = corpus.read_chunks(pair.document_id, RISK, limit=1).items[0]
+        span = next(iter(passage_spans(chunk.text)))
+        draft = {**finding(chunk, status="conflicting"), "evidence": [{"chunk_id": chunk.chunk_id, "span_id": span}]}
+        children.append([converse_reply(tool("get_spans", chunk_id=chunk.chunk_id, span_ids=[span]), "read"),
+                         converse_reply(finish(findings=[draft]), "finish")])
+    synthesis = {"type": "finish", "synthesis": {"comparisons": [{"risk": "Supply", "same_risk": "yes", "assessments": [
+        {"ref": ref, "relevance": "infrastructure", "entailment": "supports", "rationale": "Operational supply constraint."}
+        for ref in ("d2", "d1")]}]}}
+    truncated = converse_reply(synthesis, "truncated-compact")
+    truncated["stopReason"] = "max_tokens"
+    sessions = stub_bedrock(monkeypatch, [[converse_batch(*(delegate(pair) for pair in pairs)), truncated,
+                                         converse_reply(synthesis, "finish")], *children])
+    trace = RecursiveResearch(corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        comparison_scan=scan_research_plan(corpus, _company_plan(corpus), ("supply",)),
+        shared_limits=SharedLimits(max_delegations=2), local_limits=RootLimits(max_tool_calls=2),
+        finalization=FinalizationPolicy(finalization_attempts=2, finalization_tool_choice="required"),
+    ).run("Compare supply constraints.", partitions=pairs)
+    assert trace.stop_reason == "finished" and not trace.findings
+    assert trace.steps[-1].phase == "finalization" and trace.steps[-1].recovery == "truncated_response"
+    assert trace.shared_budget.finalization_provider_attempts == 2
+    request, replay = sessions[0].requests[-2:]
+    assert request["messages"] == replay["messages"]
+    tool_config = replay["toolConfig"]
+    assert tool_config["toolChoice"] == {"tool": {"name": "finish_research"}}
+    assert len(tool_config["tools"]) == 1
+    assert list(tool_config["tools"][0]["toolSpec"]["inputSchema"]["json"]["properties"]) == ["synthesis"]
+    assert [response["result"]["findings"][0]["ref"] for _, response in _batch_feedback(replay)] == ["d1", "d2"]
+    selected = trace.selected_inherited_findings
+    assert selected == tuple(op.delegation.child.findings[0] for op in trace.steps[0].operations)
+    assert trace.used_finding_ids == tuple(f.finding_id for f in selected)
+    assert trace.cited_chunk_ids == tuple(sorted(f.evidence[0].source.chunk_id for f in selected))
+    assert trace.comparisons[0].finding_ids == ("child-2:finding-1", "child-1:finding-1")
+    assert trace.comparisons[0].outcome == "comparable_both_years"
 
 
 @pytest.mark.parametrize("failure", ["truncated", "invalid_quote", "unseen_citation"])

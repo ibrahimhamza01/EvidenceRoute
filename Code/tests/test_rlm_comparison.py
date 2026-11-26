@@ -9,7 +9,10 @@ import pytest
 from pydantic import ValidationError
 
 from evidenceroute.research.rlm import CorpusEnvironment
-from evidenceroute.research.rlm.comparison import ComparisonDraft, render_comparisons, resolve_comparison, scan_research_plan
+from evidenceroute.research.rlm.comparison import (
+    ComparisonDraft, ReferenceComparisonDraft, render_comparisons, resolve_comparison, resolve_reference_comparison,
+    scan_research_plan,
+)
 from evidenceroute.research.rlm.controller import RootLimits, ScriptedModelClient
 from evidenceroute.research.rlm.coverage import SectionTarget
 from evidenceroute.research.rlm.findings import Finding, FindingEvidence
@@ -17,7 +20,7 @@ from evidenceroute.research.rlm.planning import interpret_intent, resolve_resear
 from evidenceroute.research.rlm.profiles import COMPARATIVE_PROFILES, ComparativeProfile
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.spans import passage_spans
-from evidenceroute.research.rlm.tools import EvidenceRef
+from evidenceroute.research.rlm.tools import EvidenceRef, observation_json
 
 
 @pytest.fixture(scope="module")
@@ -142,6 +145,121 @@ def test_explicit_ai_supply_risk_uses_exact_span(corpus):
 def _finish(item, used=()):
     return {"type": "finish", "answer": "Sampled excerpt", "used_finding_ids": list(used),
             "findings": [{"claim": "Risk excerpt", "analysis_status": "incomplete", "evidence": [item]}]}
+
+
+def _span_fixture(corpus, key, phrase, finding_id):
+    chunk = corpus.get_chunk(key)
+    span, quote = next((span, chunk.text[start:end]) for span, (start, end) in passage_spans(chunk.text).items()
+                       if phrase in chunk.text[start:end])
+    return Finding(finding_id, chunk.company_name, "Scoped SEC excerpt", (FindingEvidence(EvidenceRef.from_chunk(chunk), quote, span),),
+                   "incomplete", "partial", None, None)
+
+
+def _draft(finding):
+    return {"claim": finding.claim, "analysis_status": finding.analysis_status,
+            "evidence": [{"chunk_id": item.source.chunk_id, "span_id": item.span_id} for item in finding.evidence]}
+
+
+def _reference_assessment(ref, **overrides):
+    return {"ref": ref, "relevance": "infrastructure", "entailment": "supports", "rationale": "Scoped judgment.", **overrides}
+
+
+def test_root_combines_direct_and_inherited_spans_with_same_year_ai_context(corpus, plan):
+    water = _span_fixture(corpus, "4f9a71476fee75c3bb848dd2", "unavailable power or water supply", "water")
+    context = _span_fixture(corpus, "4f9a71476fee75c3bb848dd2", "demand for AI services", "context")
+    prior = _span_fixture(corpus, "4815881d3fdefcf0a17e31d7", "unavailable power supply", "prior")
+    old, new = (SectionTarget(f.evidence[0].source.document_id, "item_1a") for f in (prior, water))
+    delegate = {"type": "tool", "name": "delegate_research", "arguments": {
+        "question": "Find water and AI context.", "goal": "Select exact spans.", "partitions": [vars(new)],
+    }}
+
+    def read(*findings):
+        evidence = [f.evidence[0] for f in findings]
+        return {"type": "tool", "name": "get_spans", "arguments": {
+            "chunk_id": evidence[0].source.chunk_id, "span_ids": [item.span_id for item in evidence],
+        }}
+
+    def synthesize(context_ref):
+        return {"type": "synthesis", "synthesis": {"new_findings": [_draft(prior)], "comparisons": [
+            {"risk": "Datacenter water supply", "same_risk": "uncertain", "assessments": [
+                _reference_assessment("n1", relevance="other", entailment="uncertain"),
+                _reference_assessment("d1", ai_specificity="contextual", context_ref=context_ref),
+            ]}]
+        }}
+
+    root = [delegate, read(prior), {"type": "synthesis", "synthesis": {"new_findings": [_draft(water)]}},
+            synthesize("n1"), synthesize("d9"), synthesize("d2")]
+    child = [read(water, context), {"type": "finish", "answer": "Scoped excerpts", "findings": [_draft(water), _draft(context)]}]
+    trace = RecursiveResearch(corpus, lambda inv: ScriptedModelClient(child if inv.depth else root),
+        comparison_scan=scan_research_plan(corpus, plan, ("power",), max_chunks=1),
+    ).run("Compare water risk.", partitions=(old, new))
+    assert trace.stop_reason == "finished"
+    assert all(step.error["code"] == "invalid_findings" for step in trace.steps[2:5])
+    assert "same-company, same-year" in trace.steps[3].error["message"]
+    assert "d9" in trace.steps[4].error["message"]
+    assert len(trace.findings) == 1 and trace.findings[0].evidence == prior.evidence
+    assert [f.evidence for f in trace.selected_inherited_findings] == [water.evidence, context.evidence]
+    comparison = trace.comparisons[0]
+    assert comparison.outcome == "possible_new_needs_review" and comparison.ai_contextual_years == (2024,)
+    assert comparison.assessments[1].context_finding_id == "child-1:finding-2"
+    assert comparison.finding_ids == ("root:finding-1", "child-1:finding-1", "child-1:finding-2")
+    assert trace.cited_chunk_ids == ("4815881d3fdefcf0a17e31d7", "4f9a71476fee75c3bb848dd2")
+
+
+def test_reference_comparison_rejects_cross_company_and_out_of_year_evidence(corpus, amd):
+    amazon = _span_fixture(corpus, "4d1474550060251037c5f981", "artificial intelligence infrastructure", "amazon")
+    draft = ReferenceComparisonDraft(risk="Supply", same_risk="uncertain",
+                                     assessments=[_reference_assessment("d1"), _reference_assessment("d2")])
+    with pytest.raises(ValueError, match="one company and the requested years"):
+        resolve_reference_comparison(draft, {"d1": amd[0], "d2": amazon}, (2023, 2024))
+    with pytest.raises(ValueError, match="one company and the requested years"):
+        resolve_reference_comparison(draft, {"d1": amd[0], "d2": amd[1]}, (2024, 2025))
+
+
+def test_reference_finish_does_not_change_noncomparative_finishes(corpus):
+    scripted = [{"type": "synthesis", "synthesis": {}}, {"type": "finish", "answer": "No assessment."}]
+    trace = RecursiveResearch(corpus, lambda _: ScriptedModelClient(scripted)).run("Review risk.")
+    assert trace.steps[0].error["code"] == "invalid_action"
+    assert trace.stop_reason == "finished" and trace.answer == "No assessment."
+
+
+def test_serialized_compact_finish_fixture(corpus, amd):
+    # Reconstruct the two Batch 1 assessments from validation run c00c4eda…, using canonical spans.
+    apple = [_span_fixture(corpus, key, "machine learning and artificial intelligence", f"aapl-{i}") for i, key in enumerate(
+        ("e4bf3d03444b5f8b4e1614e3", "1b31d472397f437ab1975947"), 1)]
+    findings = [*apple, *amd]
+    specs = [
+        ("Regulatory compliance risks related to machine learning and artificial intelligence laws and regulations", "other",
+         ("FY2023 discusses machine learning and AI regulation.", "FY2024 discusses the same regulatory exposure.")),
+        ("Power or water shortages constraining data center capacity expansion and product consumption", "infrastructure",
+         ("The earlier passage links shortages to capacity expansion.", "The later passage supports the same capacity constraint.")),
+    ]
+    full, compact = [], []
+    available = {f"d{i}": finding for i, finding in enumerate(findings, 1)}
+    for offset, (risk, relevance, reasons) in enumerate(specs):
+        assessments = [_reference_assessment(f"d{offset * 2 + i}", relevance=relevance, rationale=reason)
+                       for i, reason in enumerate(reasons, 1)]
+        indexed = [{**{key: value for key, value in assessment.items() if key != "ref"},
+                    "finding_index": int(assessment["ref"][1:]),
+                    **({"infrastructure_connection": assessment["rationale"]} if relevance == "infrastructure" else {})}
+                   for assessment in assessments]
+        new = {"risk": risk, "same_risk": "yes", "assessments": assessments}
+        old = {**new, "assessments": indexed}
+        prior = resolve_comparison(ComparisonDraft.model_validate(old), findings, (2023, 2024))
+        current = resolve_reference_comparison(ReferenceComparisonDraft.model_validate(new), available, (2023, 2024))
+        assert (prior.outcome, prior.finding_ids, prior.assessed_chunk_ids) == (
+            current.outcome, current.finding_ids, current.assessed_chunk_ids)
+        full.append(old)
+        compact.append(new)
+    old_payload = {"answer": "AMD has a comparable capacity risk. Apple excerpts discuss regulation.",
+                   "findings": [_draft(f) for f in findings], "comparisons": full, "analysis_status": "incomplete",
+                   "used_finding_ids": [f"c00c4eda1b6640719a18e4ee87790f4d.batch-1.child-{i // 2 + 1}:finding-{i % 2 + 1}"
+                                        for i in range(4)],
+                   "cited_chunk_ids": [f.evidence[0].source.chunk_id for f in findings]}
+    new_payload = {"synthesis": {"comparisons": compact, "analysis_status": "incomplete"}}
+    before, after = (len(observation_json(payload).encode("utf-8")) for payload in (old_payload, new_payload))
+    print(f"Serialized finish input: {before} → {after} UTF-8 bytes ({(before - after) / before:.1%} smaller)")
+    assert after < before
 
 
 def test_span_ids_require_delivery_and_parent_cannot_expand(corpus, plan, amd):
