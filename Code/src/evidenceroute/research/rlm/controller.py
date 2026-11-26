@@ -15,11 +15,15 @@ from evidenceroute.research.rlm.budget import BudgetExceeded, BudgetUsage, Share
 from evidenceroute.research.rlm.comparison import Comparison, ComparisonDraft, FindingReference, ReferenceComparisonDraft
 from evidenceroute.research.rlm.coverage import CoverageReport, CoverageTracker, ResearchScope
 from evidenceroute.research.rlm.environment import CorpusEnvironment
-from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingDraft, PartitionCoverage, SpanEvidenceDraft
+from evidenceroute.research.rlm.findings import (
+    MAX_FINDINGS, AnalysisStatus, Finding, FindingDraft, FindingValidationError, FindingValidationIssue,
+    PartitionCoverage, SpanFindingDraft, finding_schema_issues,
+)
 from evidenceroute.research.rlm.tools import (
     MIN_RESPONSE_BYTES,
     MAX_PROTOCOL_TOOL_BATCH,
     MAX_TOOL_BATCH,
+    SUBMIT_FINDINGS,
     TOOL_USE_ID_PATTERN,
     CorpusToolDispatcher,
     DispatchResult,
@@ -30,6 +34,7 @@ from evidenceroute.research.rlm.tools import (
     observation_json,
     tool_schemas,
     trace_data,
+    trace_research_action,
     validation_message,
 )
 
@@ -61,21 +66,18 @@ class _FinishAction(StrictInput):
     type: Literal["finish"]
     answer: str = Field(min_length=1, max_length=12_000)
     cited_chunk_ids: list[Identifier] = Field(default_factory=list, max_length=50)
-    findings: list[FindingDraft] = Field(default_factory=list, max_length=8)
+    findings: list[FindingDraft] = Field(default_factory=list, max_length=MAX_FINDINGS)
     used_finding_ids: list[Identifier] = Field(default_factory=list, max_length=32)
     analysis_status: AnalysisStatus | None = None
     comparisons: list[ComparisonDraft] = Field(default_factory=list, max_length=3)
 
 
-class _NewSpanFinding(FindingDraft):
-    evidence: list[SpanEvidenceDraft] = Field(min_length=1, max_length=3, description="Directly acknowledged root spans in one document and section.")
-
-
 class _ReferenceSynthesis(StrictInput):
     comparisons: list[ReferenceComparisonDraft] = Field(default_factory=list, max_length=3)
-    new_findings: list[_NewSpanFinding] = Field(default_factory=list, max_length=8)
-    cite_refs: list[FindingReference] = Field(default_factory=list, max_length=8,
-        description="Optional references for evidence outside comparisons. Comparison citations are automatic.")
+    new_findings: list[SpanFindingDraft] = Field(default_factory=list, max_length=MAX_FINDINGS,
+        description="Optional new findings (nN in list order) from directly acknowledged spans. Prefer accepted sN references.")
+    cite_refs: list[FindingReference] = Field(default_factory=list, max_length=MAX_FINDINGS,
+        description="Select accepted submissions (sN) or acknowledged child findings (dN). Comparison citations are automatic.")
     analysis_status: AnalysisStatus | None = None
 
 
@@ -98,11 +100,14 @@ def finish_input_schema(*, recursive: bool = False, comparative: bool = False, r
     del schema["properties"]["type"]
     schema["required"].remove("type")
     if reference_based:
+        if not comparative:
+            del schema["$defs"]["_ReferenceSynthesis"]["properties"]["comparisons"]
+            for name in ("ReferenceComparisonDraft", "ReferenceAssessment"):
+                schema["$defs"].pop(name, None)
         return schema
     if not comparative:
         del schema["properties"]["comparisons"]
-        schema["$defs"]["FindingDraft"]["properties"]["evidence"]["items"] = {"$ref": "#/$defs/EvidenceDraft"}
-        for name in ("ComparisonDraft", "EvidenceAssessment", "SpanEvidenceDraft"):
+        for name in ("ComparisonDraft", "EvidenceAssessment"):
             schema["$defs"].pop(name, None)
     if not recursive:
         for field in ("findings", "used_finding_ids", "analysis_status"):
@@ -195,6 +200,10 @@ class ToolTrace:
     delivery_error: str | None = None
     observation_bytes: int | None = None
     observation_attempted: bool = False
+    finding_validation: tuple[FindingValidationIssue, ...] = ()
+    accepted_finding_refs: tuple[str, ...] = ()
+    offered_finding_refs: tuple[str, ...] = ()
+    acknowledged_finding_refs: tuple[str, ...] = ()
 
     def record(self, result: DispatchResult) -> None:
         self.validated_arguments = trace_data(result.arguments)
@@ -247,10 +256,15 @@ class ExecutionTrace:
     comparisons: tuple[Comparison, ...] = ()
     initial_assignment_stop: str | None = None
     selected_inherited_findings: tuple[Finding, ...] = ()
+    selected_local_finding_ids: tuple[str, ...] = ()
 
     @property
     def model_attempts(self) -> tuple[ModelAttempt, ...]:
         return tuple(attempt for step in self.steps for attempt in step.model_attempts)
+
+    @property
+    def transferable_findings(self) -> tuple[Finding, ...]:
+        return (*self.findings, *self.selected_inherited_findings)
 
 
 class RootController:
@@ -259,14 +273,16 @@ class RootController:
     def __init__(
         self, corpus: CorpusEnvironment | ScopedCorpus, model: RootModelClient, *,
         limits: RootLimits | None = None, clock: Callable[[], float] = monotonic, include_spans: bool = False,
+        comparative: bool = False,
     ):
         self._corpus = corpus
         self._model = model
         self._limits = limits if limits is not None else RootLimits()
         self._clock = clock
-        self._comparative = include_spans
+        self._comparative = comparative
+        self._include_spans = include_spans or comparative
         self._dispatcher = CorpusToolDispatcher(corpus, max_response_bytes=self._limits.max_response_bytes,
-                                                include_spans=include_spans)
+                                                include_spans=self._include_spans, candidate_search=comparative)
 
     def run(self, question: str, *, scope: ResearchScope | None = None,
             _recursive: RecursiveSession | None = None) -> ExecutionTrace:
@@ -287,7 +303,8 @@ class RootController:
         citations: tuple[str, ...] = ()
         stop: StopReason = "iteration_limit"
         budget_stop = None
-        tools = tool_schemas(max_response_bytes=self._limits.max_response_bytes, comparative=self._comparative)
+        tools = tool_schemas(max_response_bytes=self._limits.max_response_bytes,
+                             include_spans=self._include_spans, comparative=self._comparative)
         if self._comparative and scope.required_sections:
             tools = [tool for tool in tools if tool["name"] not in {"list_companies", "list_filings", "get_filing", "list_sections"}]
         if _recursive is not None:
@@ -296,6 +313,7 @@ class RootController:
             candidate_tool = _recursive.candidate_schema()
             if candidate_tool is not None:
                 tools.append(candidate_tool)
+            tools.append(_recursive.finding_schema())
         finalization_reason = None
         replay_reason = None
         tool_limit = self._limits.max_tool_calls
@@ -310,6 +328,10 @@ class RootController:
             assignment_stage = None
             if _recursive is not None:
                 budget = _recursive.budget
+                if _recursive.reference_synthesis:
+                    enable_refs = getattr(self._model, "enable_reference_finish", None)
+                    if callable(enable_refs):
+                        enable_refs()
                 allocation = budget.active_allocation
                 unassigned = bool(_recursive.unassigned_groups)
                 if _recursive.delegation_first and not unassigned and reinvestigation_limit is not None:
@@ -344,8 +366,8 @@ class RootController:
                         "evidence. If evidence is insufficient, report an incomplete result or abstain."
                     )
                     if _recursive.reference_synthesis:
-                        notice += " Submit comparisons by short finding reference and omit answer prose."
-                        if replay_reason == "truncated_response":
+                        notice += " Select accepted sN and delivered dN finding references. The host renders the answer."
+                        if replay_reason == "truncated_response" and self._comparative:
                             notice += " Prioritize one comparison per company and reference the strongest evidence."
                     else:
                         notice += " Keep the answer and findings concise and avoid repeating quotes."
@@ -463,13 +485,20 @@ class RootController:
 
             try:
                 candidate = json.loads(json.dumps(raw, allow_nan=False))
-                step.requested_action = trace_data(candidate)
+                step.requested_action = trace_research_action(candidate) if _recursive is not None else trace_data(candidate)
                 if self._clock() >= deadline:
                     stop = "deadline"
                     break
                 action = _ACTION.validate_python(candidate)
             except (TypeError, ValueError, RecursionError) as exc:
-                message = validation_message(exc) if isinstance(exc, ValidationError) else "Expected a JSON action."
+                message = "Expected a JSON action."
+                if isinstance(exc, ValidationError):
+                    if _recursive is not None and isinstance(raw, dict) and raw.get("type") in ("finish", "synthesis"):
+                        step.finding_validation = finding_schema_issues(exc)
+                        issue = step.finding_validation[0]
+                        message = f"{issue.path} ({issue.code})"
+                    else:
+                        message = validation_message(exc)
                 pending = self._feedback(step, "invalid_action", message)
                 if self._clock() >= deadline:
                     stop = "deadline"
@@ -485,24 +514,30 @@ class RootController:
                     continue
                 if isinstance(action, _ReferenceFinishAction):
                     if _recursive is None or not _recursive.reference_synthesis:
-                        pending = self._feedback(step, "invalid_action", "Reference synthesis requires a comparative root.")
+                        pending = self._feedback(step, "invalid_action", "Reference synthesis requires a research session with reference support.")
                         continue
                     try:
                         citations = _recursive.finish_references(action.synthesis, coverage.report())
-                    except ValueError as exc:
-                        pending = self._feedback(step, "invalid_findings", str(exc))
+                    except FindingValidationError as exc:
+                        pending = self._finding_feedback(step, exc)
                         continue
                     answer = _recursive.render_answer("")
                     stop = "finished"
                     break
                 visible = {ref.chunk_id for ref in coverage.report().visible_chunks}
                 if not visible.issuperset(action.cited_chunk_ids):
+                    if _recursive is not None:
+                        index = next(i for i, chunk_id in enumerate(action.cited_chunk_ids) if chunk_id not in visible)
+                        step.finding_validation = (FindingValidationIssue(
+                            f"cited_chunk_ids[{index}]", "provenance", "unacknowledged_chunk",
+                        ),)
                     pending = self._feedback(step, "unseen_citation", "Cite only chunks supplied to the model.")
                     continue
                 if _recursive is not None:
-                    failure = _recursive.finish(action, coverage.report())
-                    if failure is not None:
-                        pending = self._feedback(step, "invalid_findings", failure)
+                    try:
+                        _recursive.finish(action, coverage.report())
+                    except FindingValidationError as exc:
+                        pending = self._finding_feedback(step, exc)
                         continue
                 elif action.findings or action.used_finding_ids or action.analysis_status is not None or action.comparisons:
                     pending = self._feedback(step, "invalid_action", "Recursive fields require a research session.")
@@ -567,12 +602,16 @@ class RootController:
         else:
             try:
                 if recursive is not None:
-                    recursive.budget.start_corpus_attempt()
+                    recursive.budget.start_corpus_attempt(finding_submission=action.name == SUBMIT_FINDINGS)
             except BudgetExceeded as exc:
                 operation.outcome = "skipped"
                 return self._feedback(operation, str(exc), "Shared corpus work budget exhausted.")
             if recursive is not None and action.name == "list_candidates":
                 result = recursive.list_candidates(action.arguments)
+            elif recursive is not None and action.name == SUBMIT_FINDINGS:
+                result, operation.accepted_finding_refs, operation.finding_validation = recursive.submit_findings(
+                    action.arguments, coverage.report(), deadline, batch_share=batch_share,
+                )
             else:
                 result = self._dispatcher.dispatch(action.name, action.arguments,
                                                    delivered_chunks=recursive.direct_ids if recursive else None)
@@ -581,6 +620,10 @@ class RootController:
         operation.outcome = ("rejected" if result.arguments is None or
                              (delegation is not None and delegation.status == "rejected") else "executed")
         operation.record(result)
+        if action.name == SUBMIT_FINDINGS:
+            operation.offered_finding_refs = tuple(dict.fromkeys(
+                receipt["ref"] for receipt in operation.observation.get("result", {}).get("findings", ()) if "ref" in receipt
+            ))
         coverage.record_search(result.search_discovered)
         return result.content
 
@@ -591,7 +634,7 @@ class RootController:
         step.batch_operations = tuple(ToolTrace(
             tool_use_id=trace_data(call.tool_use_id),
             tool_name=trace_data(call.name) if isinstance(call.name, str) else None,
-            requested_action=trace_data(call.model_dump()),
+            requested_action=trace_research_action(call.model_dump()),
         ) for call in batch.calls)
         if len(batch.calls) > MAX_TOOL_BATCH:
             return self._reject_oversized_batch(batch, step), calls
@@ -700,6 +743,10 @@ class RootController:
         content = error_observation(code, message, self._limits.max_response_bytes)
         step.record(DispatchResult(None, content))
         return content
+
+    def _finding_feedback(self, step: ToolTrace, error: FindingValidationError) -> str:
+        step.finding_validation = (error.issue,)
+        return self._feedback(step, "invalid_findings", str(error))
 
     @staticmethod
     def _deliver(step: ToolTrace, coverage: CoverageTracker) -> None:

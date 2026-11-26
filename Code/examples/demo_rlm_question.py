@@ -13,6 +13,7 @@ from evidenceroute.research.rlm.interpretation import BedrockIntentInterpreter, 
 from evidenceroute.research.rlm.natural_language import research_question
 from evidenceroute.research.rlm.profiles import COMPARATIVE_PROFILES
 from evidenceroute.research.rlm.recursive import RecursiveResearch
+from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import observation_json, trace_data
 
 
@@ -22,8 +23,7 @@ OFFLINE_CASES = {
         "topic": "AI infrastructure supply risks",
         "phrases": ["AI infrastructure", "semiconductor products", "graphics processing units", "supply constraints"],
         "chunk_id": "4d1474550060251037c5f981",
-        "quote": "For example, we rely on a limited group of suppliers for semiconductor products, "
-                 "including products related to artificial intelligence infrastructure such as graphics processing units.",
+        "anchors": ("we rely on a limited group of suppliers for semiconductor products",),
         "claim": "Amazon discloses reliance on a limited group of semiconductor suppliers for products including GPUs.",
     },
     "What foreign exchange risks does Apple disclose in FY2024?": {
@@ -31,9 +31,9 @@ OFFLINE_CASES = {
         "topic": "Foreign exchange exposure",
         "phrases": ["foreign currency", "exchange rate fluctuations", "foreign exchange"],
         "chunk_id": "cd7988623c9a3bf545f06045",
-        "quote": "The weakening of foreign currencies relative to the U.S. dollar adversely affects the U.S. dollar value "
-                 "of the Company’s foreign currency–denominated sales and earnings, and generally leads the Company to "
-                 "raise international pricing, potentially reducing demand for the Company’s products.",
+        "anchors": ("The weakening of foreign currencies relative to the U.S.",
+                    "dollar adversely affects the U.S.",
+                    "dollar value of the Company’s foreign currency–denominated sales and earnings"),
         "claim": "A stronger U.S. dollar can reduce the translated value of Apple's foreign-currency sales and earnings.",
     },
 }
@@ -60,24 +60,31 @@ class ScriptedInterpretationTransport:
         }
 
 
-def _scripted_research(question):
+def _scripted_research(corpus, question, *, fail_finish=False):
     case = OFFLINE_CASES[question]
     chunk_id = case["chunk_id"]
+    chunk = corpus.get_chunk(chunk_id)
+    spans = [key for key, (start, end) in passage_spans(chunk.text).items()
+             if any(anchor in chunk.text[start:end] for anchor in case["anchors"])]
+    if len(spans) != len(case["anchors"]):
+        raise ValueError("Could not locate the expected offline source spans.")
 
     def factory(invocation):
-        finish = {"type": "finish", "answer": "Scripted review of one source passage.",
-                  "analysis_status": "incomplete", "cited_chunk_ids": [chunk_id]}
         if invocation.depth:
-            read = {"type": "tool", "name": "get_chunk", "arguments": {"chunk_id": chunk_id}}
-            finish["findings"] = [{"claim": case["claim"], "analysis_status": "analyzed",
-                                   "evidence": [{"chunk_id": chunk_id, "quote": case["quote"]}]}]
-            return ScriptedModelClient([read, finish])
+            read = {"type": "tool", "name": "get_spans", "arguments": {"chunk_id": chunk_id, "span_ids": spans}}
+            submit = {"type": "tool", "name": "submit_findings", "arguments": {"findings": [{
+                "claim": case["claim"], "analysis_status": "analyzed",
+                "evidence": [{"chunk_id": chunk_id, "span_id": span} for span in spans],
+            }]}}
+            finish = {"type": "synthesis", "synthesis": {
+                "cite_refs": ["s2" if fail_finish else "s1"], "analysis_status": "incomplete",
+            }}
+            return ScriptedModelClient([read, submit, finish])
         assign = {"type": "tool", "name": "delegate_research", "arguments": {
             "question": question, "goal": "Examine one passage relevant to the question.",
             "partitions": [asdict(pair) for pair in invocation.partitions],
         }}
-        namespace = invocation.invocation_id.removesuffix("root")
-        finish["used_finding_ids"] = [f"{namespace}child-1:finding-1"]
+        finish = {"type": "synthesis", "synthesis": {"cite_refs": ["d1"], "analysis_status": "incomplete"}}
         return ScriptedModelClient([assign, finish])
 
     return factory
@@ -91,9 +98,12 @@ def main(argv=None) -> int:
     parser.add_argument("--interpretation-limits-file", type=Path, help="Optional interpretation-only limits JSON.")
     parser.add_argument("--profile", choices=tuple(COMPARATIVE_PROFILES), default="diagnostic", help="Per-tree profile.")
     parser.add_argument("--trace", action="store_true", help="Include detailed sanitized research diagnostics.")
+    parser.add_argument("--fail-finish", action="store_true", help="Use an invalid child finish in the offline fixture.")
     args = parser.parse_args(argv)
     if args.live and not args.limits_file:
         parser.error("--live requires --limits-file with overall allowances.")
+    if args.live and args.fail_finish:
+        parser.error("--fail-finish is for offline fixtures.")
     if not args.live and args.question not in OFFLINE_CASES:
         parser.error("Offline mode has scripted responses for these exact questions:\n" + "\n".join(OFFLINE_CASES))
     profile = COMPARATIVE_PROFILES[args.profile]
@@ -106,10 +116,11 @@ def main(argv=None) -> int:
         ))
         caps = (InterpretationLimits.model_validate_json(args.interpretation_limits_file.read_bytes())
                 if args.interpretation_limits_file else InterpretationLimits())
+        corpus = CorpusEnvironment()
         factory = ((lambda _: BedrockRootClient.from_env(disable_retries=True)) if args.live
-                   else _scripted_research(args.question))
+                   else _scripted_research(corpus, args.question, fail_finish=args.fail_finish))
         runner = RecursiveResearch(
-            CorpusEnvironment(), factory, shared_limits=shared, local_limits=profile.local_limits,
+            corpus, factory, shared_limits=shared, local_limits=profile.local_limits,
             finalization=profile.finalization, max_root_reinvestigation_calls=profile.max_root_reinvestigation_calls,
         )
         interpreter_factory = None

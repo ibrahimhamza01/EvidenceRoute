@@ -39,6 +39,14 @@ class InvocationOutcome:
     whole_chunk_ids: tuple[str, ...]
     section_windows: tuple[SectionAccess, ...]
     selected_inherited_finding_ids: tuple[str, ...] = ()
+    selected_local_finding_ids: tuple[str, ...] = ()
+    forwarded_findings: tuple[Finding, ...] = ()
+
+    @property
+    def acknowledged_findings(self) -> tuple[Finding, ...]:
+        delivered = set(self.findings_acknowledged_by_parent)
+        return tuple(finding for finding in (*self.findings, *self.forwarded_findings)
+                     if finding.finding_id in delivered)
 
 
 @dataclass(frozen=True)
@@ -121,13 +129,15 @@ def aggregate_research_trees(
                 if pair in access:
                     access[pair].failed.append(invocation.invocation_id)
 
-        for finding in findings:
+        generated = {finding.finding_id for finding in findings}
+        for finding in run.transferable_findings if run else ():
             for item in finding.evidence:
                 source = item.source
                 target = access.get(SectionTarget(source.document_id, source.section_id))
                 if target is None:
                     continue
-                target.generated.add(finding.finding_id)
+                if finding.finding_id in generated:
+                    target.generated.add(finding.finding_id)
                 if finding.finding_id in delivered:
                     target.acknowledged.add(finding.finding_id)
                     target.excerpts.add(source.chunk_id)
@@ -185,6 +195,8 @@ def aggregate_research_trees(
             acknowledged, findings, delivered, run.used_finding_ids if run else (),
             run.cited_chunk_ids if run else (), tuple(sorted(chunks)), tuple(windows),
             tuple(finding.finding_id for finding in run.selected_inherited_findings) if run else (),
+            run.selected_local_finding_ids if run else (),
+            run.selected_inherited_findings if run and invocation.parent_id is not None else (),
         ))
         for child, child_acknowledged in children:
             assert child.invocation is not None

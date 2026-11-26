@@ -153,7 +153,7 @@ def _acknowledged_findings(step):
     if not step.observation_sent or step.delivery_error or delegation is None or delegation.child is None:
         return ()
     delivered = set(delegation.delivered_finding_ids)
-    return tuple(finding for finding in delegation.child.findings if finding.finding_id in delivered)
+    return tuple(finding for finding in delegation.child.transferable_findings if finding.finding_id in delivered)
 
 
 def _evidence_delivery(trace):
@@ -189,10 +189,13 @@ def _invocation_report(trace, detailed):
         "requested_tool_calls": _requested_tool_calls(trace),
         "usage": _usage([trace]),
         "findings_generated": [asdict(finding) for finding in trace.findings],
+        "selected_local_finding_ids": trace.selected_local_finding_ids,
         "declared_used_finding_ids": trace.used_finding_ids,
         "cited_chunk_ids": trace.cited_chunk_ids,
         "evidence_delivered": _evidence_delivery(trace),
-        "step_errors": [{"iteration": step.iteration, "code": step.error["code"]}
+        "step_errors": [{"iteration": step.iteration, "code": step.error["code"],
+                         **({"finding_validation": [asdict(issue) for issue in step.finding_validation]}
+                            if step.finding_validation else {})}
                         for step in trace.steps if step.error],
         "provider_errors": [attempt.error for attempt in trace.model_attempts if attempt.error],
         "delegations": [],
@@ -209,6 +212,7 @@ def _invocation_report(trace, detailed):
             "invocation": asdict(delegation.invocation) if delegation.invocation else None,
             "observation_acknowledged": step.observation_sent,
             "delivery_error": step.delivery_error,
+            "offered_finding_ids": delegation.offered_finding_ids,
             "delivered_finding_ids": delegation.delivered_finding_ids,
             "child": _invocation_report(delegation.child, detailed) if delegation.child else None,
         })
@@ -226,6 +230,8 @@ def _invocation_report(trace, detailed):
         "requested_action": operation.requested_action,
         "validated_arguments": operation.validated_arguments,
         "error": operation.error,
+        **({"finding_validation": [asdict(issue) for issue in operation.finding_validation]}
+           if operation.finding_validation else {}),
         "delivery_error": operation.delivery_error,
         "observation_acknowledged": operation.observation_sent,
         "generated_observation_bytes": operation.observation_bytes,

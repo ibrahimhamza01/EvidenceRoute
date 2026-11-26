@@ -44,11 +44,11 @@ class ComparisonDraft(StrictInput):
     assessments: list[EvidenceAssessment] = Field(min_length=1, max_length=8)
 
 
-FindingReference = Annotated[str, Field(pattern=r"^(d[1-9][0-9]{0,8}|n[1-8])$")]
+FindingReference = Annotated[str, Field(pattern=r"^(d[1-9][0-9]{0,8}|[ns][1-8])$")]
 
 
 class ReferenceAssessment(StrictInput):
-    ref: FindingReference = Field(description="Delivered finding ref dN, or new finding nN by one-based position.")
+    ref: FindingReference = Field(description="Accepted submission sN, delivered child finding dN, or new finding nN.")
     relevance: Literal["infrastructure", "other", "uncertain"]
     entailment: Literal["supports", "contradicts", "uncertain"]
     rationale: str = Field(min_length=1, max_length=250, description="Briefly explain relevance, entailment, and any AI connection.")
@@ -145,6 +145,8 @@ def _has_ai_context(finding: Finding, ticker: str, year: int) -> bool:
 
 
 def _resolve_comparison(draft, selected, lookup_context, years: tuple[int, int]) -> Comparison:
+    if len({finding.finding_id for finding in selected}) != len(selected):
+        raise ValueError("Comparison assessments must refer to distinct findings.")
     sources = [item.source for finding in selected for item in finding.evidence]
     if len({source.ticker for source in sources}) != 1 or any(source.fiscal_year not in years for source in sources):
         raise ValueError("A comparison must use evidence from one company and the requested years.")

@@ -31,6 +31,7 @@ MAX_TOOL_BATCH = 4
 MAX_PROTOCOL_TOOL_BATCH = 16
 # Internal batches preserve native IDs, including Bedrock's period and colon.
 TOOL_USE_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,64}$"
+SUBMIT_FINDINGS = "submit_findings"
 
 
 def trace_data(value):
@@ -53,6 +54,22 @@ def trace_data(value):
             "<redacted>", value,
         )
     return value
+
+
+def trace_research_action(action):
+    """Omit model finding inputs from saved requests. Resolved findings are reported separately."""
+    if not isinstance(action, dict):
+        return trace_data(action)
+    name = action.get("name")
+    if isinstance(name, str) and name.strip() in (SUBMIT_FINDINGS, "finish_research"):
+        return trace_data({key: action[key] for key in ("type", "name", "tool_use_id") if key in action})
+    if action.get("type") in ("finish", "synthesis"):
+        return {"type": action["type"]}
+    if action.get("type") == "tool_batch" and isinstance(action.get("calls"), list):
+        return {"type": "tool_batch", "calls": [trace_research_action(call) for call in action["calls"]]}
+    return trace_data(action)
+
+
 Identifier = Annotated[str, Field(min_length=1, max_length=160)]
 FiscalYear = Annotated[int, Field(ge=1900, le=9999)]
 
@@ -134,18 +151,20 @@ _TOOLS: dict[str, tuple[str, type[StrictInput]]] = {
 }
 
 
-def tool_schemas(*, max_response_bytes: int | None = None, comparative: bool = False) -> list[dict]:
+def tool_schemas(
+    *, max_response_bytes: int | None = None, include_spans: bool = False, comparative: bool = False,
+) -> list[dict]:
     """Return fresh JSON-compatible tool definitions with JSON Schema inputs."""
     tools = [
         {"name": name, "description": description, "input_schema": args.model_json_schema()}
         for name, (description, args) in _TOOLS.items()
     ]
-    if comparative:
+    if include_spans or comparative:
         tools.append({"name": "get_spans", "description": "Read up to four exact passages in one scoped chunk. "
                       "Use span IDs from the lexical shortlist, candidate page, or search results.",
                       "input_schema": _Spans.model_json_schema()})
         for tool in tools:
-            if tool["name"] == "search_chunks":
+            if tool["name"] == "search_chunks" and comparative:
                 tool["description"] = "Rank scoped keyword candidates. Returns IDs and matching span IDs. Use get_spans for text."
             elif tool["name"] == "get_chunk":
                 tool["description"] += " Use get_spans for targeted excerpts. Already delivered chunks are referenced by ID."
@@ -208,12 +227,16 @@ class DispatchResult:
 class CorpusToolDispatcher:
     """Validate tool requests and serialize the exact model-facing observation."""
 
-    def __init__(self, corpus: CorpusEnvironment | ScopedCorpus, *, max_response_bytes: int, include_spans: bool = False):
+    def __init__(
+        self, corpus: CorpusEnvironment | ScopedCorpus, *, max_response_bytes: int, include_spans: bool = False,
+        candidate_search: bool | None = None,
+    ):
         if type(max_response_bytes) is not int or max_response_bytes < MIN_RESPONSE_BYTES:
             raise ValueError(f"max_response_bytes must be at least {MIN_RESPONSE_BYTES}")
         self._corpus = corpus
         self._max_bytes = max_response_bytes
         self._include_spans = include_spans
+        self._candidate_search = include_spans if candidate_search is None else candidate_search
 
     def dispatch(self, name: str, arguments: dict, *, delivered_chunks: set[str] | None = None) -> DispatchResult:
         if not isinstance(name, str):
@@ -245,7 +268,7 @@ class CorpusToolDispatcher:
             discovered = evidence if name == "search_chunks" else ()
             body = {"ok": True, "result": result}
             if self._include_spans and chunks:
-                if name == "search_chunks":
+                if name == "search_chunks" and self._candidate_search:
                     words = set(re.findall(r"\w+", validated["query"].casefold()))
                     body["result"] = {"items": [self._candidate(chunk, ref, words) for chunk, ref in zip(chunks, evidence)],
                                       "total": result.total, "next_offset": result.next_offset}

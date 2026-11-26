@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from evidenceroute.research.rlm.budget import FinalizationPolicy, SharedBudget
 from evidenceroute.research.rlm.controller import ModelAttempt, finish_input_schema
-from evidenceroute.research.rlm.tools import MAX_PROTOCOL_TOOL_BATCH, MAX_TOOL_BATCH, observation_json, trace_data
+from evidenceroute.research.rlm.tools import MAX_PROTOCOL_TOOL_BATCH, MAX_TOOL_BATCH, observation_json, trace_research_action
 
 _FINISH = "finish_research"
 _DELEGATE = "delegate_research"
@@ -236,7 +236,7 @@ class ClaudeRootClient:
         else:
             prompt = _FINISH_SYSTEM if self._finalization_policy() is not None else _SYSTEM
             if self._reference_finish:
-                prompt += " Submit synthesis using delivered finding references. The host assembles citations and the answer."
+                prompt += " Select accepted or delivered finding references. The host assembles citations and the answer."
             else:
                 prompt += " Use original chunk IDs for citations and disclose gaps in the answer."
         return f"{prompt}\n{self._research_budget_notice}" if self._research_budget_notice else prompt
@@ -293,7 +293,7 @@ class ClaudeRootClient:
         if self._finish_allowed:
             description = "Submit the answer and any chunk IDs supplied by the corpus tools."
             if self._reference_finish:
-                description = "Submit compact synthesis using the short references on delivered findings."
+                description = "Submit compact synthesis using short references from finding receipts or child results."
             elif self._comparative:
                 description = ("Submit a brief answer and exact-span findings. Each finding covers one document and "
                                "section. Use comparisons for cross-year relationships. Avoid repeating excerpts.")
@@ -495,7 +495,7 @@ class ClaudeRootClient:
                 json.dumps(calls, allow_nan=False)
             except (TypeError, ValueError, RecursionError):
                 raise ClaudeModelError("invalid_tool_use") from None
-        self.last_tool_requests = tuple(trace_data(call) for call in calls)
+        self.last_tool_requests = tuple(trace_research_action(call) for call in calls)
         ids = tuple(call["tool_use_id"] for call in calls)
         if (any(not isinstance(use_id, str) or not re.fullmatch(self._tool_use_id_pattern, use_id) for use_id in ids)
                 or len(set(ids)) != len(ids) or self._used_ids.intersection(ids)):

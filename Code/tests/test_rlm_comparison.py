@@ -467,3 +467,32 @@ def test_possible_novelty_remains_unresolved_in_public_answer(amd, examples, mon
     assert "The assessed spans support a risk in FY2024. Whether it is new remains unresolved." in answer
     assert "Supported novelty. The validated comparisons establish no novelty conclusion." in answer
     assert "Admitted companies with unresolved assessments. AMD" in answer
+
+
+def test_comparative_child_assesses_incremental_local_refs_then_root_selects_delivered_refs(corpus, plan, amd):
+    pairs = tuple(SectionTarget(finding.evidence[0].source.document_id, "item_1a") for finding in amd)
+    assign = {"type": "tool", "name": "delegate_research", "arguments": {
+        "question": "Compare the same supply risk.", "goal": "Assess both years.", "partitions": [vars(pair) for pair in pairs],
+    }}
+    reads = [{"type": "tool", "name": "get_spans", "arguments": {
+        "chunk_id": item.source.chunk_id, "span_ids": [item.span_id],
+    }} for finding in amd for item in finding.evidence]
+    submit = {"type": "tool", "name": "submit_findings", "arguments": {"findings": [_draft(finding) for finding in amd]}}
+
+    def synthesize(*refs):
+        return {"type": "synthesis", "synthesis": {"comparisons": [{
+            "risk": "Data-center capacity", "same_risk": "yes",
+            "assessments": [_reference_assessment(ref) for ref in refs],
+        }]}}
+
+    scripts = ([assign, synthesize("d1", "d2")], [*reads, submit, synthesize("s1", "s2")])
+    trace = RecursiveResearch(corpus, lambda inv: ScriptedModelClient(scripts[inv.depth]),
+                              comparison_scan=scan_research_plan(corpus, plan, ("water",), max_chunks=1),
+                              ).run("Compare capacity risks.", partitions=pairs)
+    edge = trace.steps[0].delegation
+    assert edge.child.stop_reason == trace.stop_reason == "finished"
+    assert edge.child.selected_local_finding_ids == edge.delivered_finding_ids
+    assert trace.selected_inherited_findings == edge.child.findings
+    assert trace.comparisons[0].outcome == edge.child.comparisons[0].outcome == "comparable_both_years"
+    assert len(trace.cited_chunk_ids) == 2
+    assert trace.shared_budget.finding_submission_attempts == 1 and trace.shared_budget.corpus_attempts == 3

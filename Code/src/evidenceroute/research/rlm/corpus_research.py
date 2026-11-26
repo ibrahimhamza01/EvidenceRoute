@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from copy import copy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Literal
 from uuid import uuid4
 
@@ -14,7 +14,7 @@ from evidenceroute.research.rlm.budget import BudgetUsage, SharedBudget
 from evidenceroute.research.rlm.comparison import Comparison, render_comparative_scope, render_comparisons
 from evidenceroute.research.rlm.discovery import CorpusScan, DiscoverySpec, discover_research_plan, scan_research_plan
 from evidenceroute.research.rlm.controller import ExecutionTrace
-from evidenceroute.research.rlm.findings import Finding, FindingEvidence
+from evidenceroute.research.rlm.findings import Finding, FindingEvidence, render_findings
 from evidenceroute.research.rlm.planned_research import GroupOutcome, admit_company_groups, execute_research_plan
 from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
@@ -71,6 +71,7 @@ class CorpusUsage:
     lexical_metadata_reads: int
     lexical_chunks_scanned: int
     elapsed_seconds: float
+    finding_submission_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -156,11 +157,20 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
                          "error": (op.error or {}).get("code"), "delivery_error": op.delivery_error}
             if detailed:
                 operation.update(tool_use_id=op.tool_use_id, chunk_ids=[ref.chunk_id for ref in op.evidence])
+            if op.finding_validation:
+                operation["finding_validation"] = [asdict(issue) for issue in op.finding_validation]
+            if op.accepted_finding_refs:
+                submitted = (op.observation_attempted or op.observation_sent) and not op.delivery_error
+                operation.update(accepted_finding_refs=op.accepted_finding_refs,
+                                 offered_finding_refs=op.offered_finding_refs,
+                                 submitted_finding_refs=op.offered_finding_refs if submitted else (),
+                                 acknowledged_finding_refs=op.acknowledged_finding_refs)
             edge = op.delegation
             if edge and edge.child:
                 submitted = (op.observation_attempted or op.observation_sent) and not op.delivery_error
                 operation.update(child_id=edge.invocation.invocation_id, full_observation_bytes=edge.full_observation_bytes,
                                  retained_finding_ids=[item.finding_id for item in edge.child.findings],
+                                 child_status=edge.status, child_error=edge.error,
                                  offered_finding_ids=edge.offered_finding_ids,
                                  finding_references=dict(edge.finding_references),
                                  submitted_finding_ids=edge.offered_finding_ids if submitted else (),
@@ -178,9 +188,12 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
         if detailed:
             decision.update(model_seconds=step.model_seconds, requested_tool_count=step.provider_tool_request_count,
                             offered_tool_names=step.offered_tool_names)
+        if step.finding_validation and not step.operations:
+            decision["finding_validation"] = [asdict(issue) for issue in step.finding_validation]
         decisions.append(decision)
     return {"invocation_id": node.invocation.invocation_id, "stop_reason": node.stop_reason,
             "budget_stop": node.budget_stop, "generated_finding_ids": [item.finding_id for item in node.findings],
+            "selected_local_finding_ids": node.selected_local_finding_ids,
             "decisions": decisions}
 
 
@@ -277,18 +290,19 @@ def execute_corpus_research(
                                      pending.get(ticker, stop if scheduled.get(ticker, 0) > len(batches) else None))
                    for ticker in plan.requested_companies)
     coverage = aggregate_research_trees(runner.corpus, plan, traces)
-    root_findings = tuple(finding for trace in traces if trace.stop_reason == "finished" for finding in trace.findings)
+    root_findings = tuple(finding for trace in traces for finding in trace.findings)
+    selected_local_ids = {finding_id for trace in traces for finding_id in trace.selected_local_finding_ids}
     selected = tuple(finding for trace in traces if trace.stop_reason == "finished"
                      for finding in trace.selected_inherited_findings)
     roots = {trace.invocation.invocation_id for trace in traces}
+    unfinished_roots = {trace.invocation.invocation_id for trace in traces if trace.stop_reason != "finished"}
     child_findings = tuple(finding for child in coverage.invocations if child.invocation.parent_id in roots
-                           and child.stop_reason == "finished" for finding in child.findings
-                           if finding.finding_id in child.findings_acknowledged_by_parent)
+                           for finding in child.acknowledged_findings)
     if review_discovery:
         used_ids = {finding_id for trace in traces if trace.stop_reason == "finished" for finding_id in trace.used_finding_ids}
         selected = tuple(finding for finding in child_findings if finding.finding_id in used_ids)
     retained = tuple(finding for child in coverage.invocations if child.invocation.parent_id is not None
-                     and child.stop_reason == "finished" for finding in child.findings
+                     for finding in child.findings
                      if finding.finding_id not in child.findings_acknowledged_by_parent)
     root_comparisons = tuple(item for trace in traces if trace.stop_reason == "finished" for item in trace.comparisons)
     child_comparisons = tuple(item for result in results for item in result.acknowledged_comparisons)
@@ -317,6 +331,7 @@ def execute_corpus_research(
                         lexical_pages_read=scan.pages_read if scan else 0,
                         lexical_metadata_reads=scan.metadata_reads if scan else 0,
                         lexical_chunks_scanned=sum(row.scanned_chunks for row in scan.sections) if scan else 0,
+                        finding_submission_attempts=sum(b.usage.finding_submission_attempts for b in batches),
                         elapsed_seconds=clock() - started)
     evidence = tuple(dict.fromkeys(item for finding in (*root_findings, *child_findings) for item in finding.evidence))
     assessed = {key for item in (*root_comparisons, *child_comparisons) for key in item.assessed_chunk_ids}
@@ -346,13 +361,21 @@ def execute_corpus_research(
         answer += ("\n\nResearch is incomplete. Evidence applies to the passages reviewed. "
                    "This result cannot establish absence or answer for the full requested scope."
                    if incomplete else "\n\nResearch conclusions await independent semantic verification.")
-        if review_discovery and (root_findings or selected):
-            answer += "\n\nFindings selected or submitted by finished roots.\n" + "\n".join(
-                f"{finding.evidence[0].source.ticker} FY{finding.evidence[0].source.fiscal_year}"
-                f" [{finding.analysis_status}] {finding.claim} Evidence chunks "
-                + ", ".join(dict.fromkeys(item.source.chunk_id for item in finding.evidence))
-                for finding in (*root_findings, *selected)
-            )
+        if review_discovery:
+            selected_findings = tuple(finding for finding in root_findings if finding.finding_id in selected_local_ids) + selected
+            partial_ids = {finding.finding_id for trace in traces if trace.stop_reason != "finished"
+                           for finding in trace.findings}
+            partial_ids.update(finding.finding_id for child in coverage.invocations
+                               if child.invocation.parent_id in roots
+                               and (child.stop_reason != "finished" or child.invocation.parent_id in unfinished_roots)
+                               for finding in child.acknowledged_findings)
+            selected_ids = {finding.finding_id for finding in selected_findings}
+            partial_findings = tuple(finding for finding in (*root_findings, *child_findings)
+                                     if finding.finding_id in partial_ids - selected_ids)
+            for heading, findings in (("Findings selected by finished roots.", selected_findings),
+                                      ("Partial findings from unfinished execution.", partial_findings)):
+                if findings:
+                    answer += "\n\n" + heading + "\n" + render_findings(findings)
     return CorpusResearchResult(plan, limits, run_id, groups, tuple(batches), coverage, scan, usage,
                                 root_findings, selected, child_findings, retained, root_comparisons, child_comparisons, evidence,
                                 tuple(citations[key] for key in sorted(citations)), tuple(sorted(assessed)), tuple(errors),

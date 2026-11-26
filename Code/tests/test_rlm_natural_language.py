@@ -580,8 +580,8 @@ def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus
     assert QUESTION in child_prompt and "Foreign exchange exposure" in child_prompt
     assert CHUNK_ID in child_prompt and "AI infrastructure" not in child_prompt
     specs = {tool["toolSpec"]["name"]: tool["toolSpec"] for tool in child_first["toolConfig"]["tools"]}
-    assert "list_candidates" in specs and "get_spans" not in specs
-    assert "comparisons" not in specs["finish_research"]["inputSchema"]["json"]["properties"]
+    assert {"list_candidates", "get_spans", "submit_findings"} <= specs.keys()
+    assert "comparisons" not in specs["finish_research"]["inputSchema"]["json"]["$defs"]["_ReferenceSynthesis"]["properties"]
     research = result.research
     assert research.execution_status == "finished" and research.research_status == "incomplete"
     assert research.plan == result.plan
@@ -632,3 +632,69 @@ def test_two_year_ai_comparison_uses_existing_comparative_execution(corpus):
     assert result.plan.requested_companies == ("AMZN",)
     assert result.research.scan.years == (2023, 2024)
     assert "novelty" in result.research.answer
+
+
+@pytest.mark.parametrize("root_finishes", [True, False])
+def test_apple_review_saves_partial_findings_and_sanitized_validation_diagnostics(corpus, root_finishes):
+    from evidenceroute.research.rlm.spans import passage_spans
+    from evidenceroute.research.rlm.tools import observation_json
+
+    chunk = corpus.get_chunk(CHUNK_ID)
+    spans = ["200:256", "257:290", "291:489"]
+    draft = {
+        "claim": "A stronger dollar can reduce translated sales and earnings.",
+        "analysis_status": "analyzed",
+        "evidence": [{"chunk_id": CHUNK_ID, "span_id": span} for span in spans],
+    }
+    secret = "private provider value"
+
+    def tool(name, **arguments):
+        return {"type": "tool", "name": name, "arguments": arguments}
+
+    def factory(invocation):
+        if invocation.depth:
+            return ScriptedModelClient([
+                tool("list_candidates", document_id=chunk.document_id, section_id=chunk.section_id),
+                tool("submit_findings", findings=[draft]),
+                tool("get_spans", chunk_id=CHUNK_ID, span_ids=spans),
+                tool("submit_findings", findings=[draft, {**draft, secret: secret}]),
+                {"type": "synthesis", "synthesis": {"cite_refs": [secret]}},
+            ])
+        return ScriptedModelClient([
+            tool("delegate_research", question="Review foreign exchange.", goal="Find exact passages.",
+                 partitions=[asdict(pair) for pair in invocation.partitions]),
+            {"type": "synthesis", "synthesis": {"cite_refs": ["d1" if root_finishes else "d2"]}},
+        ])
+
+    result = _run(corpus, MockTransport([_interpretation(_structured())]), research_factory=factory).research
+    assert result.execution_status == result.research_status == "incomplete"
+    assert result.groups[0].outcome.assignment_status == "failed"
+    assert result.groups[0].outcome.findings_acknowledged_by_root
+    assert result.usage.lexical_chunks_scanned == 53 and result.usage.finding_submission_attempts == 2
+    assert result.usage.corpus_attempts == 4 and result.usage.provider_attempts == 0
+    assert len(result.acknowledged_child_findings) == 1
+    evidence = result.acknowledged_child_findings[0].evidence
+    canonical = passage_spans(chunk.text)
+    assert [item.span_id for item in evidence] == spans
+    assert [item.quote for item in evidence] == [chunk.text[slice(*canonical[span])] for span in spans]
+    assert "A stronger dollar" in result.answer
+    assert len(result.citations) == len(result.root_selected_inherited_findings) == int(root_finishes)
+    assert ("Partial findings from unfinished execution." in result.answer) != root_finishes
+
+    root, child = result.diagnostics
+    assert child["stop_reason"] == "model_error"
+    edge = root["decisions"][0]["operations"][0]
+    assert edge["child_status"] == "failed"
+    assert edge["retained_finding_ids"] == list(edge["offered_finding_ids"]) == list(edge["submitted_finding_ids"])
+    assert edge["submitted_finding_ids"] == edge["acknowledged_finding_ids"]
+    assert bool(edge["used_finding_ids"]) == root_finishes
+    assert child["decisions"][1]["operations"][0]["finding_validation"] == [
+        {"path": "findings[0].evidence[0].span_id", "category": "provenance", "code": "unacknowledged_span"},
+    ]
+    assert child["decisions"][3]["operations"][0]["finding_validation"] == [
+        {"path": "findings[1]", "category": "schema", "code": "extra_forbidden"},
+    ]
+    assert child["decisions"][4]["finding_validation"] == [
+        {"path": "synthesis.cite_refs[0]", "category": "schema", "code": "string_pattern_mismatch"},
+    ]
+    assert secret not in observation_json(result)

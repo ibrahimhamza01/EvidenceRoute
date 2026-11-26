@@ -700,7 +700,7 @@ def test_recursive_demo_defaults_to_scripted_without_provider_setup(recursive_de
 
 
 def converse_reply(action, tool_id, *, usage=None):
-    finish_action = action["type"] == "finish"
+    finish_action = action["type"] in ("finish", "synthesis")
     name = "finish_research" if finish_action else action["name"]
     arguments = {key: value for key, value in action.items() if key != "type"} if finish_action else action["arguments"]
     return {
@@ -2155,3 +2155,223 @@ def test_finalization_reservation_does_not_override_tokens_or_deadline(snapshot,
         assert trace.budget_stop == "reported_token_limit"
     else:
         assert trace.stop_reason == "deadline"
+
+
+def _span_draft(chunk, *, span=None, claim="Supply interruptions affect operations."):
+    from evidenceroute.research.rlm.spans import passage_spans
+
+    span = span if span is not None else next(iter(passage_spans(chunk.text)))
+    return {"claim": claim, "analysis_status": "analyzed",
+            "evidence": [{"chunk_id": chunk.chunk_id, "span_id": span}]}
+
+
+def _synthesize(*refs):
+    return {"type": "synthesis", "synthesis": {"cite_refs": list(refs), "analysis_status": "incomplete"}}
+
+
+def test_incremental_submission_retains_valid_items_independently_and_deduplicates(snapshot):
+    corpus, (old, new, _) = snapshot
+    pair = SectionTarget(new, RISK)
+    chunk, other_span_chunk = corpus.read_chunks(new, RISK).items
+    other_year = corpus.read_chunks(old, RISK).items[0]
+    valid = _span_draft(chunk)
+    alternate = _span_draft(other_span_chunk, claim="Additional details.")
+    malformed = valid | {"private provider text": "unvalidated content"}
+    runner, _ = research(corpus, {"root": [
+        tool("read_chunks", document_id=new, section_id=RISK, limit=2),
+        tool("submit_findings", findings=[malformed, valid, _span_draft(other_year), alternate]),
+        tool("submit_findings", findings=[valid, _span_draft(chunk, span="0:1")]),
+        _synthesize("s1", "s1"),
+    ]})
+    trace = runner.run("Review supply risks.", partitions=(pair,))
+
+    first, second = trace.steps[1:3]
+    assert [(issue.path, issue.category, issue.code) for issue in first.finding_validation] == [
+        ("findings[0]", "schema", "extra_forbidden"),
+        ("findings[2].evidence[0].span_id", "provenance", "unacknowledged_span"),
+    ]
+    assert "unvalidated content" not in repr(trace)
+    assert first.accepted_finding_refs == first.acknowledged_finding_refs == ("s1", "s2")
+    assert second.observation["result"]["findings"][0] == {"index": 0, "status": "duplicate", "ref": "s1"}
+    assert second.finding_validation[0].code == "unacknowledged_span"
+    assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
+    assert len(trace.findings) == 2 and trace.selected_local_finding_ids == ("root:finding-1",)
+    assert "Additional details" not in trace.answer
+    resolved = trace.findings[0]
+    assert resolved.coverage_status == "complete" and resolved.company_name == "NVDA Fixture"
+    item = resolved.evidence[0]
+    assert item.quote == QUOTE and item.span_id == valid["evidence"][0]["span_id"]
+    assert item.source.source_url == chunk.source_url and item.source.section_id == RISK
+    assert item.source.ticker == "NVDA" and item.source.fiscal_year == 2024
+    assert trace.tool_calls == trace.shared_budget.corpus_attempts == 3
+    assert trace.shared_budget.finding_submission_attempts == 2
+
+
+def test_incremental_limits_share_local_and_corpus_budgets_with_legacy_finishes(snapshot):
+    corpus, (_, new, _) = snapshot
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    drafts = [_span_draft(chunk, claim=f"Scoped claim {index}.") for index in range(9)]
+    runner, _ = research(corpus, {"root": [
+        tool("get_chunk", chunk_id=chunk.chunk_id),
+        tool("submit_findings", findings=drafts[:5]),
+        tool("submit_findings", findings=drafts[:4]),
+        tool("submit_findings", findings=drafts[4:8]),
+        tool("submit_findings", findings=[drafts[8], drafts[0]]),
+        tool("submit_findings", findings=[drafts[0]]),
+        finish(findings=[drafts[8]]),
+        finish(findings=[drafts[0]]),
+    ]}, shared_limits=SharedLimits(max_corpus_attempts=5))
+    trace = runner.run("Review risks.")
+    assert trace.stop_reason == "finished" and len(trace.findings) == 8
+    assert trace.steps[1].error["code"] == "invalid_arguments"
+    assert trace.steps[4].finding_validation[0].code == trace.steps[6].finding_validation[0].code == "finding_limit"
+    assert trace.steps[4].observation["result"]["findings"][1]["ref"] == "s1"
+    assert trace.steps[5].error["code"] == "corpus_attempt_limit"
+    assert trace.shared_budget.finding_submission_attempts == 4
+    assert trace.shared_budget.corpus_attempts == 5 and trace.tool_calls == 6
+    assert trace.selected_local_finding_ids == ("root:finding-1",)
+
+
+@pytest.mark.parametrize("acknowledge", [False, True])
+def test_incremental_receipt_requires_acknowledgement_and_cannot_use_same_batch_read(snapshot, acknowledge):
+    corpus, (_, new, _) = snapshot
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    draft = _span_draft(chunk)
+
+    class Client(ScriptedModelClient):
+        def next_action(self, *args, **kwargs):
+            self.last_observation_delivered = len(self.observations) != 2 or acknowledge
+            return super().next_action(*args, **kwargs)
+
+    def batched(*actions):
+        return {"type": "tool_batch", "calls": [
+            {"tool_use_id": f"batch-{index}", "name": action["name"], "arguments": action["arguments"]}
+            for index, action in enumerate(actions)
+        ]}
+
+    submit = tool("submit_findings", findings=[draft])
+    model = Client([batched(tool("get_chunk", chunk_id=chunk.chunk_id), submit), submit, _synthesize("s1"), finish()])
+    trace = RecursiveResearch(corpus, lambda _: model).run("Review risks.")
+    assert trace.steps[0].batch_operations[1].finding_validation[0].code == "unacknowledged_span"
+    assert len(trace.findings) == 1
+    assert trace.steps[1].offered_finding_refs == ("s1",)
+    assert trace.steps[1].acknowledged_finding_refs == (("s1",) if acknowledge else ())
+    assert trace.cited_chunk_ids == ((chunk.chunk_id,) if acknowledge else ())
+    if not acknowledge:
+        issue = trace.steps[2].finding_validation[0]
+        assert (issue.path, issue.code) == ("synthesis.cite_refs[0]", "unacknowledged_finding_reference")
+
+
+@pytest.mark.parametrize("failure", ["exhaustion", "timeout", "truncation"])
+def test_failed_bedrock_child_delivers_retained_span_for_compact_parent_finish(snapshot, monkeypatch, failure):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (_, new, _) = snapshot
+    pair = SectionTarget(new, RISK)
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    draft = _span_draft(chunk)
+    truncated = converse_reply(_synthesize("s1"), "partial")
+    truncated["stopReason"] = "max_tokens"
+    truncated["output"]["message"]["content"] = []
+    invalid = converse_reply(_synthesize("s2"), "reject")
+    finishes = {
+        "exhaustion": [truncated, invalid],
+        "truncation": [truncated, {**truncated}],
+        "timeout": [ReadTimeoutError(endpoint_url="https://bedrock.fixture")],
+    }
+    sessions = stub_bedrock(monkeypatch, [
+        [converse_reply(delegate(pair), "assign"), converse_reply(_synthesize("d1"), "synthesize")],
+        [converse_reply(tool("get_spans", chunk_id=chunk.chunk_id, span_ids=[draft["evidence"][0]["span_id"]]), "read"),
+         converse_reply(tool("submit_findings", findings=[draft]), "submit"), *finishes[failure]],
+    ])
+    trace = RecursiveResearch(
+        corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+        shared_limits=SharedLimits(max_delegations=1, max_provider_attempts=10),
+        local_limits=RootLimits(max_tool_calls=2),
+        finalization=FinalizationPolicy(child_provider_attempts=4, finalization_attempts=2,
+                                        finalization_tool_choice="required"),
+    ).run("Review the filing.", partitions=(pair,))
+    edge = trace.steps[0].delegation
+    child = edge.child
+    assert edge.status == "failed" and edge.error == "child_not_finished"
+    expected = "budget_exhausted" if failure == "exhaustion" else "model_error"
+    assert child.stop_reason == expected and child.analysis_status == "incomplete"
+    if failure == "exhaustion":
+        assert child.budget_stop == "finalization_attempt_limit"
+        assert child.steps[-1].finding_validation[0].path == "synthesis.cite_refs[0]"
+    if failure != "timeout":
+        assert child.steps[2].error["code"] == "truncated_response"
+        assert sessions[1].requests[2]["messages"] == sessions[1].requests[3]["messages"]
+    assert child.findings[0].evidence[0].quote == QUOTE
+    assert not child.cited_chunk_ids and not child.selected_local_finding_ids
+    assert edge.offered_finding_ids == edge.delivered_finding_ids == ("child-1:finding-1",)
+    assert trace.steps[0].observation["result"]["stop_reason"] == child.stop_reason
+    assert trace.steps[0].observation_attempted and trace.steps[0].observation_sent
+    assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
+    assert trace.selected_inherited_findings == child.findings and not trace.findings
+    assert trace.shared_budget.finding_submission_attempts == 1 and trace.shared_budget.corpus_attempts == 2
+    config = sessions[0].requests[1]["toolConfig"]
+    schema = next(spec["toolSpec"]["inputSchema"]["json"]
+                  for spec in config["tools"] if spec["toolSpec"]["name"] == "finish_research")
+    assert "synthesis" in schema["properties"]
+    assert "comparisons" not in schema["$defs"]["_ReferenceSynthesis"]["properties"]
+    assert "quote" not in json.dumps(schema)
+
+
+def test_failed_root_retains_accepted_findings_without_terminal_citations(snapshot):
+    corpus, (_, new, _) = snapshot
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    runner, _ = research(corpus, {"root": [
+        tool("get_chunk", chunk_id=chunk.chunk_id),
+        tool("submit_findings", findings=[_span_draft(chunk)]),
+        _synthesize("s2"),
+    ]}, local_limits=RootLimits(max_iterations=3))
+    trace = runner.run("Review the filing.")
+    assert trace.stop_reason == "iteration_limit" and trace.analysis_status == "incomplete"
+    assert len(trace.findings) == 1 and trace.steps[1].acknowledged_finding_refs == ("s1",)
+    assert not trace.cited_chunk_ids and not trace.selected_local_finding_ids
+
+
+def test_recursive_synthesis_can_forward_an_acknowledged_descendant_finding(snapshot):
+    corpus, (old, new, _) = snapshot
+    old_pair, new_pair = SectionTarget(old, RISK), SectionTarget(new, RISK)
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    runner, _ = research(corpus, {
+        "root": [delegate(old_pair, new_pair), _synthesize("d1")],
+        "child-1": [delegate(new_pair), _synthesize("d1")],
+        "child-2": [tool("get_chunk", chunk_id=chunk.chunk_id),
+                    tool("submit_findings", findings=[_span_draft(chunk)]), _synthesize("s1")],
+    })
+    trace = runner.run("Review both years.", partitions=(old_pair, new_pair))
+    first, second = trace.steps[0].delegation, trace.steps[0].delegation.child.steps[0].delegation
+    assert first.delivered_finding_ids == second.delivered_finding_ids == ("child-2:finding-1",)
+    assert not first.child.findings and trace.selected_inherited_findings == second.child.findings
+    assert trace.cited_chunk_ids == (chunk.chunk_id,)
+    coverage = aggregate_research_coverage(corpus, _company_plan(corpus), trace)
+    target = next(target for target in coverage.targets if target.pair == new_pair)
+    assert target.generated_finding_ids == target.acknowledged_finding_ids == target.used_finding_ids == ("child-2:finding-1",)
+    assert coverage.invocations[1].acknowledged_findings == second.child.findings
+
+
+def test_batch_can_keep_a_finding_when_receipt_does_not_fit(snapshot):
+    corpus, (_, new, _) = snapshot
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    draft = _span_draft(chunk)
+    submit = tool("submit_findings", findings=[draft])
+    batch = {"type": "tool_batch", "calls": [
+        {"tool_use_id": f"batch-{index}", "name": action["name"], "arguments": action["arguments"]}
+        for index, action in enumerate([submit] + [tool("list_companies")] * 3)
+    ]}
+    runner, _ = research(corpus, {"root": [
+        tool("get_spans", chunk_id=chunk.chunk_id, span_ids=[draft["evidence"][0]["span_id"]]),
+        batch, submit, _synthesize("s1"),
+    ]}, local_limits=RootLimits(max_response_bytes=550))
+    trace = runner.run("Review risks.")
+    first = trace.steps[1].batch_operations[0]
+    assert first.accepted_finding_refs == ("s1",)
+    assert first.offered_finding_refs == first.acknowledged_finding_refs == ()
+    assert trace.steps[1].envelope_bytes <= 550
+    retry = trace.steps[2]
+    assert retry.observation["result"]["findings"][0]["status"] == "duplicate"
+    assert retry.acknowledged_finding_refs == ("s1",)
+    assert trace.cited_chunk_ids == (chunk.chunk_id,) and len(trace.findings) == 1

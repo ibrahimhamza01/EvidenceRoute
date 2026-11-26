@@ -72,6 +72,7 @@ class BudgetUsage:
     investigation_provider_attempts: int
     finalization_provider_attempts: int
     released_child_provider_slots: int
+    finding_submission_attempts: int = 0
 
 
 class SharedBudget:
@@ -87,6 +88,7 @@ class SharedBudget:
         self.reported_tokens = self.attempts_with_missing_usage = 0
         self.investigation_provider_attempts = self.finalization_provider_attempts = 0
         self.released_child_provider_slots = 0
+        self.finding_submission_attempts = 0
         self.initial_delegations_left = self.initial_partitions_left = 0
         self.finalization = finalization
         self.active_allocation: ProviderAllocation | None = None
@@ -183,11 +185,12 @@ class SharedBudget:
         )
         self.reported_tokens += sum(v for v in counters if v is not None)
 
-    def start_corpus_attempt(self) -> None:
+    def start_corpus_attempt(self, *, finding_submission: bool = False) -> None:
         self.check_work()
         if self.corpus_attempts >= self.limits.max_corpus_attempts:
             raise BudgetExceeded("corpus_attempt_limit")
         self.corpus_attempts += 1
+        self.finding_submission_attempts += finding_submission
 
     def reserve_child(self, depth: int, partitions: int, *, initial_assignment: bool = False) -> int:
         self.check_child(depth, partitions, initial_assignment=initial_assignment)
@@ -216,5 +219,5 @@ class SharedBudget:
             self.reported_tokens, self.attempts_with_missing_usage,
             max(0.0, self.deadline - self.clock()),
             self.investigation_provider_attempts, self.finalization_provider_attempts,
-            self.released_child_provider_slots,
+            self.released_child_provider_slots, self.finding_submission_attempts,
         )

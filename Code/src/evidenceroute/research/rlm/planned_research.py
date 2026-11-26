@@ -71,7 +71,7 @@ class PlannedResearchResult:
             return None
         findings = tuple(finding for child in self.coverage.invocations
                          if child.invocation.parent_id == self.trace.invocation.invocation_id
-                         for finding in child.findings if finding.finding_id in child.findings_acknowledged_by_parent)
+                         for finding in child.acknowledged_findings)
         if not findings:
             return None
         comparisons = self.acknowledged_comparisons
@@ -179,7 +179,7 @@ def execute_research_plan(
         first = delegates[0] if delegates else None
         acknowledged = {child.invocation.invocation_id for child in delegates
                         if child.parent_acknowledged and child.delegation_status in {"finished", "incomplete"}
-                        and (not child.findings or child.findings_acknowledged_by_parent)}
+                        and (not (child.findings or child.forwarded_findings) or child.findings_acknowledged_by_parent)}
         is_admitted = ticker in admitted_tickers
         if ticker in unresolved:
             assignment_status = "unresolved"
