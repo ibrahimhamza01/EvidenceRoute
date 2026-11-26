@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Annotated
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, field_validator
+from pydantic_core import PydanticCustomError
 
 from evidenceroute.research.rlm.coverage import SectionTarget
 from evidenceroute.research.rlm.environment import MAX_CHUNK_ROWS, CorpusEnvironment, SectionMetadata
@@ -31,11 +32,12 @@ class DiscoverySpec(StrictInput):
     phrases: DiscoveryPhrases
     max_candidates_per_section: int = Field(default=16, ge=1, le=50)
 
-    @model_validator(mode="after")
-    def validate_phrases(self):
-        if any(not _normalize(phrase) for phrase in self.phrases):
-            raise ValueError("Every discovery phrase must contain lexical tokens.")
-        return self
+    @field_validator("phrases")
+    @classmethod
+    def validate_phrases(cls, phrases: DiscoveryPhrases) -> DiscoveryPhrases:
+        if any(not _normalize(phrase) for phrase in phrases):
+            raise PydanticCustomError("non_lexical_phrase", "Every discovery phrase must contain lexical tokens.")
+        return phrases
 
     @classmethod
     def from_intent(cls, intent: ResearchIntent, phrases: tuple[str, ...] = (), **limits) -> DiscoverySpec:

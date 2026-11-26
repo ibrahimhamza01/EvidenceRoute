@@ -1,4 +1,4 @@
-"""Interpret SEC research questions with one bounded structured Bedrock decision."""
+"""Interpret SEC research questions with bounded structured Bedrock requests."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from evidenceroute.research.rlm.bedrock import BedrockRootClient
 from evidenceroute.research.rlm.budget import BudgetExceeded, SharedBudget, SharedLimits
@@ -16,7 +16,7 @@ from evidenceroute.research.rlm.claude import ClaudeModelError
 from evidenceroute.research.rlm.controller import ModelAttempt
 from evidenceroute.research.rlm.discovery import DiscoveryPhrases, DiscoverySpec
 from evidenceroute.research.rlm.environment import CorpusEnvironment
-from evidenceroute.research.rlm.planning import IntentRequirements, ResearchIntent, _items
+from evidenceroute.research.rlm.planning import IntentRequirements, ResearchIntent, _items, _name_key
 from evidenceroute.research.rlm.tools import observation_json
 
 
@@ -30,7 +30,9 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   Ask for clarification if company identity or the intended company universe has multiple plausible meanings.
   Use all only for corpus-wide requests, including unqualified "which companies" questions. Such scope is inferred
   unless the corpus universe is explicit. Mark comprehensive for exhaustive/list-all/which-companies requests
-  or when the question requires evaluating every target. Mark comprehensiveness inferred unless explicit.
+  or when the question requires evaluating every target. Every supported two-year comparison requires comprehensive
+  review within the requested scope, including novelty questions phrased as a yes/no question. This setting does
+  not expand the requested companies, years, or sections. Mark comprehensiveness inferred unless explicit.
 - Treat named years as fiscal years for this 10-K corpus. For a review with no year, use the latest fiscal year
   in the corpus, even if it is unavailable for a named company. Mark that default in inferred_fields.
   Ask for clarification for relative periods or comparisons with missing years. Never substitute an available year.
@@ -49,6 +51,14 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   filing text. Prefer short topic variants, synonyms and acronyms. Use inferred_fields for every inferred
   requirement and briefly document assumptions in scope_notes. Use [] if all fields are explicit.
   Provide only structured fields and concise scope notes, without private reasoning."""
+
+_CORRECTION = """
+Host validation rejected the previous submission. Use validation_feedback to correct the listed fields and
+submit a complete tool input from the original question and inventory. Use the schema's exact JSON types and
+include required nullable fields. Remove fields the schema does not declare. Discovery phrases must contain
+words. Keep the requested objective and every
+explicit scope requirement, including unavailable companies, years, and sections. Return a clarification or
+unsupported outcome when warranted by the original question."""
 
 
 class InterpretationLimits(BaseModel):
@@ -82,14 +92,73 @@ class _Interpretation(BaseModel):
     discovery_phrases: DiscoveryPhrases | None
     explanation: str | None = Field(min_length=1, max_length=500)
 
-    @model_validator(mode="after")
-    def check_mode(self):
-        if self.mode in {"ambiguous", "unsupported"}:
-            if self.requirements is not None or self.discovery_phrases is not None or not self.explanation:
-                raise ValueError("Blocked interpretations require only a public scope explanation.")
-        elif self.requirements is None or self.discovery_phrases is None or self.explanation is not None:
-            raise ValueError("Executable interpretations require requirements and phrases.")
-        return self
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    path: str
+    category: Literal["missing_field", "schema", "inconsistent_requirements", "discovery_phrase"]
+    code: str
+
+
+@dataclass(frozen=True)
+class InterpretationValidationFailure:
+    attempt: int
+    issues: tuple[ValidationIssue, ...]
+
+
+class _InvalidInterpretation(ClaudeModelError):
+    def __init__(self, *issues: ValidationIssue):
+        super().__init__("invalid_interpretation")
+        self.issues = issues
+
+
+_REQUIREMENT_ERRORS = {
+    "company_selection_mismatch": "requirements.companies",
+    "comparison_years_required": "requirements.fiscal_years",
+    "scope_notes_required": "requirements.scope_notes",
+}
+_SCHEMA_ERRORS = {
+    "missing", "extra_forbidden", "model_type", "tuple_type", "string_type", "int_type", "bool_type",
+    "literal_error", "too_short", "too_long", "string_too_short", "string_too_long", "string_pattern_mismatch",
+    "greater_than_equal", "less_than_equal", "json_invalid",
+}
+_MAX_ISSUES = 4
+
+
+def _field_path(location: tuple, *, extra: bool) -> str:
+    # Pydantic loc may contain provider-controlled keys. Use only known fields and bounded array indices.
+    location = location[:-1] if extra else location
+    if not location or location[0] not in _Interpretation.model_fields:
+        return "submission"
+    root, *tail = location
+    path = root
+    if root == "requirements" and tail and tail[0] in _Requirements.model_fields:
+        path += "." + tail.pop(0)
+    if tail and type(tail[0]) is int and 0 <= tail[0] < 50:
+        path += f"[{tail[0]}]"
+    return path
+
+
+def _schema_issues(error: ValidationError) -> tuple[ValidationIssue, ...]:
+    issues = []
+    for item in error.errors(include_url=False, include_context=False, include_input=False):
+        code = item["type"]
+        if code in _REQUIREMENT_ERRORS:
+            issue = ValidationIssue(_REQUIREMENT_ERRORS[code], "inconsistent_requirements", code)
+        else:
+            path = _field_path(item["loc"], extra=code == "extra_forbidden")
+            category = ("missing_field" if code == "missing" else
+                        "discovery_phrase" if path.startswith("discovery_phrases") else "schema")
+            issue = ValidationIssue(path, category, code if code in _SCHEMA_ERRORS else "invalid_value")
+        if issue not in issues:
+            issues.append(issue)
+        if len(issues) == _MAX_ISSUES:
+            break
+    return tuple(issues)
+
+
+def _inconsistent(field: str, code: str) -> _InvalidInterpretation:
+    return _InvalidInterpretation(ValidationIssue(field, "inconsistent_requirements", code))
 
 
 @dataclass(frozen=True)
@@ -146,8 +215,83 @@ def _inventory(corpus: CorpusEnvironment, budget: InterpretationBudget) -> dict:
     }
 
 
+_SCOPE_FIELDS = {
+    name: TypeAdapter(_Requirements.model_fields[name].rebuild_annotation(),
+                      config=ConfigDict(strict=True, str_strip_whitespace=True))
+    for name in ("objective", "company_selection", "companies", "fiscal_years", "section_ids", "inferred_fields")
+}
+
+
+def _scope_to_preserve(arguments: dict, latest_year: int) -> dict:
+    """Keep individually valid scope fields from an otherwise rejected ready submission."""
+    mode = arguments.get("mode")
+    requirements = arguments.get("requirements")
+    if mode in ("ambiguous", "unsupported"):
+        return {}
+    if not isinstance(requirements, dict):
+        return {"objective": "year_over_year"} if mode == "ai_infrastructure_comparison" else {}
+    scope = {}
+    for name, adapter in _SCOPE_FIELDS.items():
+        if name in requirements:
+            try:
+                scope[name] = adapter.validate_json(json.dumps(requirements[name], allow_nan=False))
+            except (ValueError, TypeError, RecursionError):
+                # A malformed field can be repaired. It does not authorize a scope value.
+                continue
+    if mode == "ai_infrastructure_comparison":
+        scope["objective"] = "year_over_year"
+    inferred = scope.pop("inferred_fields", ())
+    if "fiscal_years" in inferred and (scope.get("objective") == "year_over_year"
+                                       or set(scope.get("fiscal_years", ())) != {latest_year}):
+        scope.pop("fiscal_years", None)
+    if "section_ids" in inferred and {item.lower() for item in scope.get("section_ids", ())} != {"item_1a"}:
+        scope.pop("section_ids", None)
+    if "company_selection" in inferred and scope.get("company_selection") != "all":
+        scope.pop("company_selection", None)
+    if scope.get("companies"):
+        # A nonempty list is a named scope, including when the selection field was missing or inconsistent.
+        scope["company_selection"] = "explicit"
+    else:
+        # An empty names field does not constrain a correction to a missing or invalid selector.
+        scope.pop("companies", None)
+    return scope
+
+
+def _canonical_selectors(companies: tuple[str, ...], inventory: dict) -> set[str]:
+    tickers = {_name_key(company["ticker"]) for company in inventory["companies"]}
+    names: dict[str, set[str]] = {}
+    for company in inventory["companies"]:
+        for name in company["names"]:
+            names.setdefault(_name_key(name), set()).add(_name_key(company["ticker"]))
+    canonical = set()
+    for selector in map(_name_key, companies):
+        matches = names.get(selector, ())
+        canonical.add(next(iter(matches)) if selector not in tickers and len(matches) == 1 else selector)
+    return canonical
+
+
+def _preserve_scope(intent: ResearchIntent, previous: dict, inventory: dict) -> None:
+    for field, original in previous.items():
+        corrected = getattr(intent, field)
+        if field == "companies":
+            original = _canonical_selectors(original, inventory)
+            corrected = _canonical_selectors(corrected, inventory)
+        elif field == "section_ids":
+            original = {item.lower() for item in original}
+            corrected = {item.lower() for item in corrected}
+        elif field == "fiscal_years":
+            original, corrected = set(original), set(corrected)
+            if previous.get("objective") == "year_over_year" and len(original) == 1 and original <= corrected:
+                continue
+        if original != corrected:
+            raise _inconsistent(f"requirements.{field}", "correction_changed_scope")
+
+
 class BedrockIntentInterpreter(BedrockRootClient):
     """A fresh Converse client that requests scope and discovery phrases together."""
+
+    validation_failures: tuple[InterpretationValidationFailure, ...] = ()
+    correction_attempt: int | None = None
 
     def interpret(
         self, question: str, corpus: CorpusEnvironment, *, budget: InterpretationBudget,
@@ -158,63 +302,113 @@ class BedrockIntentInterpreter(BedrockRootClient):
         inventory = _inventory(corpus, budget)
         # The caller can impose a lower cap without raising the provider's configured cap.
         output_cap = min(limits.max_output_tokens, self.config.max_output_tokens)
-        payload = self._converse_payload(
-            [{"name": _TOOL, "description": "Report the interpretation of this filing research question.",
-              "input_schema": _Interpretation.model_json_schema()}],
-            {"tool": {"name": _TOOL}}, _SYSTEM,
-            [self._question_message(observation_json({"question": question, "corpus_inventory": inventory}))],
-            output_cap,
-        )
-        response = self._request(payload, budget.deadline, output_cap=output_cap)
-        reason = self._record_stop_reason(response)
-        try:
-            if budget.clock() >= budget.deadline:
-                raise ClaudeModelError("deadline")
-            if budget.charged_tokens > budget.token_limit:
-                raise ClaudeModelError("interpretation_token_limit")
-            if reason == "max_tokens":
-                raise ClaudeModelError("truncated_response")
-            assistant = self._assistant_message(response)
-            if reason != "tool_use" or assistant is None:
-                raise ClaudeModelError("missing_structured_interpretation")
-            uses = self._tool_uses(assistant["content"])
-            if len(uses) != 1:
-                raise ClaudeModelError("invalid_interpretation_tool_use")
-            use = uses[0]
-            if (use["name"] != _TOOL or not isinstance(use["input"], dict)
-                    or not isinstance(use["id"], str) or not re.fullmatch(self._tool_use_id_pattern, use["id"])):
-                raise ClaudeModelError("invalid_interpretation_tool_use")
-            parsed = _Interpretation.model_validate_json(json.dumps(use["input"], allow_nan=False))
-            return self._validate_interpretation(question, parsed, inventory["latest_fiscal_year"])
-        except (ValidationError, TypeError, ValueError, RecursionError):
-            self._record_response_error("invalid_interpretation")
-            raise ClaudeModelError("invalid_interpretation") from None
-        except ClaudeModelError as exc:
-            self._record_response_error(str(exc))
-            raise
+        tools = [{"name": _TOOL, "description": "Report the interpretation of this filing research question.",
+                  "input_schema": _Interpretation.model_json_schema()}]
+        content = {"question": question, "corpus_inventory": inventory}
+        previous_scope = {}
+        for correcting in (False, True):
+            # Each request is a new Converse conversation. There is no pending native tool-use ID.
+            payload = self._converse_payload(
+                tools, {"tool": {"name": _TOOL}}, _SYSTEM + (_CORRECTION if correcting else ""),
+                [self._question_message(observation_json(content))], output_cap,
+            )
+            next_attempt = len(self.last_attempts) + 1
+            try:
+                response = self._request(payload, budget.deadline, output_cap=output_cap,
+                                         allow_retries=not correcting)
+            finally:
+                if correcting and len(self.last_attempts) >= next_attempt:
+                    self.correction_attempt = next_attempt
+            reason = self._record_stop_reason(response)
+            try:
+                if budget.clock() >= budget.deadline:
+                    raise ClaudeModelError("deadline")
+                if budget.charged_tokens > budget.token_limit:
+                    raise ClaudeModelError("interpretation_token_limit")
+                arguments = self._tool_arguments(response, reason)
+                outcome = self._validate_interpretation(question, arguments, inventory["latest_fiscal_year"])
+                if correcting and outcome.intent is not None:
+                    _preserve_scope(outcome.intent, previous_scope, inventory)
+                return outcome
+            except _InvalidInterpretation as exc:
+                self._record_response_error(str(exc))
+                self.validation_failures += (InterpretationValidationFailure(len(self.last_attempts), exc.issues),)
+                if correcting:
+                    raise
+                previous_scope = _scope_to_preserve(arguments, inventory["latest_fiscal_year"])
+                content["validation_feedback"] = exc.issues
+            except ClaudeModelError as exc:
+                self._record_response_error(str(exc))
+                raise
+        raise AssertionError("The correction loop must return or raise.")
+
+    def _tool_arguments(self, response: dict, reason: str | None) -> dict:
+        if reason == "max_tokens":
+            raise ClaudeModelError("truncated_response")
+        assistant = self._assistant_message(response)
+        if reason != "tool_use" or assistant is None:
+            raise ClaudeModelError("missing_structured_interpretation")
+        uses = self._tool_uses(assistant["content"])
+        if len(uses) != 1:
+            raise ClaudeModelError("invalid_interpretation_tool_use")
+        use = uses[0]
+        if (use["name"] != _TOOL or not isinstance(use["input"], dict)
+                or not isinstance(use["id"], str) or not re.fullmatch(self._tool_use_id_pattern, use["id"])):
+            raise ClaudeModelError("invalid_interpretation_tool_use")
+        return use["input"]
 
     @staticmethod
-    def _validate_interpretation(question: str, parsed: _Interpretation, latest_year: int) -> InterpretationOutcome:
+    def _validate_interpretation(question: str, arguments: dict, latest_year: int) -> InterpretationOutcome:
+        try:
+            parsed = _Interpretation.model_validate_json(json.dumps(arguments, allow_nan=False))
+        except ValidationError as exc:
+            raise _InvalidInterpretation(*_schema_issues(exc)) from None
+        except (TypeError, ValueError, RecursionError):
+            raise _InvalidInterpretation(ValidationIssue("submission", "schema", "json_invalid")) from None
         if parsed.mode in {"ambiguous", "unsupported"}:
+            if parsed.requirements is not None:
+                raise _inconsistent("requirements", "null_required_for_mode")
+            if parsed.discovery_phrases is not None:
+                raise _inconsistent("discovery_phrases", "null_required_for_mode")
+            if parsed.explanation is None:
+                raise _inconsistent("explanation", "value_required_for_mode")
             return InterpretationOutcome(parsed.mode, parsed.mode, parsed.explanation)
         requirements = parsed.requirements
-        assert requirements is not None and parsed.discovery_phrases is not None
+        if requirements is None:
+            raise _inconsistent("requirements", "value_required_for_mode")
+        if parsed.discovery_phrases is None:
+            raise _InvalidInterpretation(ValidationIssue("discovery_phrases", "discovery_phrase", "value_required_for_mode"))
+        if parsed.explanation is not None:
+            raise _inconsistent("explanation", "null_required_for_mode")
         years = set(requirements.fiscal_years)
         if parsed.mode == "ai_infrastructure_comparison":
             if requirements.objective != "year_over_year":
-                raise ValueError("Inconsistent comparative objective.")
+                raise _inconsistent("requirements.objective", "objective_mode_mismatch")
             if len(years) != 2:
                 return InterpretationOutcome("unsupported", "unsupported_comparison_years",
                                              "Comparative execution requires exactly two fiscal years.")
+            if not requirements.comprehensive:
+                raise _inconsistent("requirements.comprehensive", "comprehensive_required_for_comparison")
         elif requirements.objective != "review":
-            raise ValueError("Inconsistent review objective.")
+            raise _inconsistent("requirements.objective", "objective_mode_mismatch")
         inferred = requirements.inferred_fields
         if "fiscal_years" in inferred and (requirements.objective != "review" or years != {latest_year}):
-            raise ValueError("Inconsistent inferred fiscal years.")
+            raise _inconsistent("requirements.fiscal_years", "invalid_inferred_years")
         if "section_ids" in inferred and {item.lower() for item in requirements.section_ids} != {"item_1a"}:
-            raise ValueError("Inconsistent inferred section.")
+            raise _inconsistent("requirements.section_ids", "invalid_inferred_sections")
         if "company_selection" in inferred and requirements.company_selection != "all":
-            raise ValueError("Inconsistent inferred company selection.")
-        intent = ResearchIntent(question=question, **requirements.model_dump())
-        spec = DiscoverySpec.from_intent(intent, parsed.discovery_phrases)
+            raise _inconsistent("requirements.company_selection", "invalid_inferred_company_selection")
+        try:
+            intent = ResearchIntent(question=question, **requirements.model_dump())
+        except ValidationError:
+            raise _inconsistent("requirements", "invalid_research_intent") from None
+        try:
+            spec = DiscoverySpec(topic=intent.topic, phrases=parsed.discovery_phrases)
+        except ValidationError as exc:
+            issue = exc.errors(include_url=False, include_context=False, include_input=False)[0]
+            if issue["type"] == "non_lexical_phrase":
+                raise _InvalidInterpretation(
+                    ValidationIssue("discovery_phrases", "discovery_phrase", "non_lexical_phrase")
+                ) from None
+            raise _InvalidInterpretation(ValidationIssue("discovery_phrases", "discovery_phrase", "invalid_value")) from None
         return InterpretationOutcome("ready", "interpreted", intent=intent, discovery=spec)

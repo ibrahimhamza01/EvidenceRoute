@@ -12,7 +12,7 @@ from evidenceroute.research.rlm.budget import SharedLimits
 from evidenceroute.research.rlm.claude import ProviderTransportError
 from evidenceroute.research.rlm.controller import ScriptedModelClient
 from evidenceroute.research.rlm.corpus_research import CorpusLimits
-from evidenceroute.research.rlm.interpretation import BedrockIntentInterpreter, InterpretationLimits
+from evidenceroute.research.rlm.interpretation import BedrockIntentInterpreter, InterpretationLimits, ValidationIssue
 from evidenceroute.research.rlm.natural_language import research_question
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 
@@ -184,33 +184,195 @@ def test_explicit_unavailable_scope_remains_in_plan(corpus):
      "How did the company's risk change recently?", "ambiguous", "ambiguous"),
     (_structured(mode="ai_infrastructure_comparison", objective="year_over_year", fiscal_years=[2022, 2023, 2024]),
      "Compare AI infrastructure risks in 2022, 2023 and 2024.", "unsupported", "unsupported_comparison_years"),
-    (_structured(objective="year_over_year", fiscal_years=[2023, 2024]), "Compare disclosure.", "failed", "invalid_interpretation"),
 ])
 def test_blocked_questions_have_explicit_outcomes(corpus, data, question, status, reason):
-    result = _run(corpus, MockTransport([_interpretation(data)]), question=question)
+    transport = MockTransport([_interpretation(data)])
+    result = _run(corpus, transport, question=question)
     assert (result.interpretation.outcome.status, result.interpretation.outcome.stop_reason) == (status, reason)
     assert result.plan is result.research is None
-    assert result.usage.provider_attempts == 1
+    assert result.usage.provider_attempts == len(transport.requests) == 1
+    assert result.interpretation.correction_attempt is None
 
 
-@pytest.mark.parametrize("data", [
-    _structured(fiscal_years=["2024"]),
-    _structured(comprehensive=1),
-    _structured(extra_field="private provider content"),
-    _structured(fiscal_years=[2023], inferred_fields=["fiscal_years"]),
-    _structured(inferred_fields=["section_ids"], scope_notes=None),
-    _structured(phrases=[]),
-    _structured(phrases=["..."]),
-    _structured(phrases=["risk"] * 33),
-    _structured(phrases=["x" * 201]),
+@pytest.mark.parametrize(("data", "issue"), [
+    (_structured(fiscal_years=["2024"]), ValidationIssue("requirements.fiscal_years[0]", "schema", "int_type")),
+    (_structured(comprehensive=1), ValidationIssue("requirements.comprehensive", "schema", "bool_type")),
+    (_structured(extra_field="private provider content"), ValidationIssue("requirements", "schema", "extra_forbidden")),
+    (_structured(fiscal_years=[2023], inferred_fields=["fiscal_years"]),
+     ValidationIssue("requirements.fiscal_years", "inconsistent_requirements", "invalid_inferred_years")),
+    (_structured(inferred_fields=["section_ids"], scope_notes=None),
+     ValidationIssue("requirements.scope_notes", "inconsistent_requirements", "scope_notes_required")),
+    (_structured(companies=[]),
+     ValidationIssue("requirements.companies", "inconsistent_requirements", "company_selection_mismatch")),
+    (_structured(mode="ai_infrastructure_comparison", objective="year_over_year", fiscal_years=[2024]),
+     ValidationIssue("requirements.fiscal_years", "inconsistent_requirements", "comparison_years_required")),
+    (_structured(objective="year_over_year", fiscal_years=[2023, 2024]),
+     ValidationIssue("requirements.objective", "inconsistent_requirements", "objective_mode_mismatch")),
+    (_structured(phrases=[]), ValidationIssue("discovery_phrases", "discovery_phrase", "too_short")),
+    (_structured(phrases=["..."]), ValidationIssue("discovery_phrases", "discovery_phrase", "non_lexical_phrase")),
+    (_structured(phrases=["risk"] * 33), ValidationIssue("discovery_phrases", "discovery_phrase", "too_long")),
+    (_structured(phrases=["x" * 201]), ValidationIssue("discovery_phrases[0]", "discovery_phrase", "string_too_long")),
+    ({**_structured(), "discovery_phrases": None},
+     ValidationIssue("discovery_phrases", "discovery_phrase", "value_required_for_mode")),
+    ({"mode": "review"}, ValidationIssue("requirements", "missing_field", "missing")),
+    (_structured(comprehensive=float("nan")), ValidationIssue("submission", "schema", "json_invalid")),
 ])
-def test_invalid_structured_requirements_and_phrases_fail_closed(corpus, data):
-    result = _run(corpus, MockTransport([_interpretation(data)]))
-    assert result.interpretation.outcome.stop_reason == "invalid_interpretation"
+def test_invalid_structured_requirements_and_phrases_fail_closed(corpus, data, issue):
+    transport = MockTransport([_interpretation(data)])
+    result = _run(corpus, transport, max_provider_attempts=1)
+    assert result.interpretation.outcome.stop_reason == "provider_attempt_limit"
     assert result.interpretation.attempts[0].error == "invalid_interpretation"
-    assert result.usage.provider_attempts == 1
+    assert result.usage.provider_attempts == len(transport.requests) == 1
+    assert result.interpretation.correction_attempt is None
+    failure, = result.interpretation.validation_failures
+    assert failure.attempt == 1 and issue in failure.issues
     assert result.research is None
     assert "private provider content" not in str(result.interpretation)
+
+
+def test_correction_uses_fresh_native_request_and_bounded_sanitized_feedback(corpus):
+    first = _structured(**{"model-generated secret key": "private model-generated value"})
+    first["requirements"].pop("scope_notes")
+    first["private extra field"] = "private top-level value"
+    first["discovery_phrases"] = [0, 1, 2, 3, 4, 5]
+    corrected = _structured(companies=["AAPL"], phrases=["foreign currency", "exchange rate fluctuations"])
+    transport = MockTransport([_interpretation(first), _interpretation(corrected)])
+    result = _run(corpus, transport, max_batches=0)
+    assert result.plan.requested_companies == ("AAPL",)
+    assert result.plan.intent.fiscal_years == (2024,)
+    assert not result.plan.intent.comprehensive
+    assert result.interpretation.outcome.discovery.phrases == ("foreign currency", "exchange rate fluctuations")
+    assert result.interpretation.correction_attempt == 2
+    failure, = result.interpretation.validation_failures
+    assert failure.attempt == 1 and len(failure.issues) == 4
+    assert ValidationIssue("requirements.scope_notes", "missing_field", "missing") in failure.issues
+    original, correction = (request for request, _ in transport.requests)
+    assert original["inferenceConfig"] == correction["inferenceConfig"]
+    assert original["toolConfig"] == correction["toolConfig"]
+    assert [message["role"] for message in correction["messages"]] == ["user"]
+    first_input = json.loads(original["messages"][0]["content"][0]["text"])
+    second_input = json.loads(correction["messages"][0]["content"][0]["text"])
+    assert second_input.pop("validation_feedback") == [asdict(issue) for issue in failure.issues]
+    assert first_input == second_input
+    for value in (correction, result.interpretation):
+        assert all(secret not in str(value) for secret in (
+            "private provider content", "test.tool:1", "model-generated secret key", "private model-generated value",
+            "private extra field", "private top-level value",
+        ))
+    assert result.interpretation.reported_tokens == result.interpretation.charged_tokens == 250
+    assert result.usage.provider_attempts == 2 and result.usage.reported_tokens == 250
+    assert result.research.limits.max_provider_attempts == 7
+    assert result.research.limits.max_reported_tokens == 29_750
+
+
+def test_invalid_correction_stops_after_one_correction_even_with_a_spare_attempt(corpus):
+    transport = MockTransport([_interpretation(_structured(phrases=["..."])), _interpretation({"mode": "review"})])
+    result = _run(corpus, transport, interpretation_limits=InterpretationLimits(max_provider_attempts=3))
+    report = result.interpretation
+    assert report.outcome.stop_reason == "invalid_interpretation"
+    assert report.correction_attempt == 2
+    assert [item.attempt for item in report.validation_failures] == [1, 2]
+    assert report.validation_failures[0].issues[0].code == "non_lexical_phrase"
+    assert report.validation_failures[1].issues[0].code == "missing"
+    assert len(transport.requests) == result.usage.provider_attempts == 2 and result.plan is result.research is None
+
+
+@pytest.mark.parametrize("steps", [2, 3])
+def test_initial_transport_retry_and_correction_share_attempt_limits(corpus, steps):
+    retry = ProviderTransportError("aws_unavailable", retryable=True, usage={"inputTokens": 21, "outputTokens": 0})
+    transport = MockTransport([retry, _interpretation(_structured(phrases=["!"])), _interpretation(_structured())])
+    result = _run(corpus, transport, max_batches=0, interpretation_limits=InterpretationLimits(max_provider_attempts=steps))
+    report = result.interpretation
+    assert report.validation_failures[0].attempt == 2
+    assert report.attempts[0].error == "aws_unavailable"
+    assert len(transport.requests) == result.usage.provider_attempts == steps
+    if steps == 2:
+        assert report.outcome.stop_reason == "provider_attempt_limit"
+        assert report.correction_attempt is None and result.research is None
+    else:
+        assert report.outcome.status == "ready"
+        assert report.correction_attempt == 3 and report.charged_tokens == 271
+        assert result.research.limits.max_provider_attempts == 6
+
+
+def test_correction_does_not_retry_transport_failure(corpus):
+    retryable = ProviderTransportError("aws_throttled", retryable=True)
+    transport = MockTransport([_interpretation(_structured(phrases=["!"])), retryable, _interpretation(_structured())])
+    result = _run(corpus, transport, interpretation_limits=InterpretationLimits(max_provider_attempts=3))
+    report = result.interpretation
+    assert report.outcome.stop_reason == "aws_throttled"
+    assert report.correction_attempt == 2 and len(transport.requests) == 2
+    assert report.attempts_with_missing_usage == 1
+    assert report.charged_tokens == 125 + report.attempts[1].estimated_tokens
+    assert result.research is None
+
+
+def test_correction_is_blocked_when_remaining_tokens_cannot_cover_its_estimate(corpus):
+    invalid = _interpretation(_structured(phrases=["..."]))
+    invalid["usage"]["inputTokens"] = 4_500
+    transport = MockTransport([invalid])
+    result = _run(corpus, transport, interpretation_limits=InterpretationLimits(max_tokens=7_000))
+    report = result.interpretation
+    assert report.outcome.stop_reason == "interpretation_token_limit"
+    assert report.validation_failures[0].issues[0].code == "non_lexical_phrase"
+    assert report.charged_tokens == 4_525 and report.correction_attempt is None
+    assert len(transport.requests) == 1 and result.research is None
+
+
+def test_correction_shares_deadline_and_rejects_late_response(corpus):
+    clock = Clock()
+    transport = MockTransport([_interpretation(_structured(phrases=["!"])), _interpretation(_structured())],
+                              clock=clock, latency=0.6)
+    result = _run(corpus, transport, clock=clock, deadline_seconds=1.0)
+    report = result.interpretation
+    assert report.outcome.stop_reason == "deadline"
+    assert report.correction_attempt == 2 and report.attempts[1].error == "deadline"
+    assert [timeout for _, timeout in transport.requests] == pytest.approx([1.0, 0.4])
+    assert result.usage.reported_tokens == 250 and result.usage.elapsed_seconds == 1.2
+    assert result.research is None
+
+
+@pytest.mark.parametrize(("field", "change"), [
+    ("companies", ["AMZN"]),
+    ("fiscal_years", [2022, 2024]),
+    ("section_ids", ["item_7"]),
+    ("objective", "review"),
+])
+def test_correction_cannot_narrow_or_substitute_previously_valid_explicit_scope(corpus, field, change):
+    question = "Did Amazon and Unlisted Corp. disclose a new AI infrastructure risk in FY2024 versus FY2023 Item 1A?"
+    scope = {"companies": ["AMZN", "Unlisted Corp."], "fiscal_years": [2023, 2024], "section_ids": ["item_1a"],
+             "objective": "year_over_year", "inferred_fields": [], "scope_notes": None}
+    first = _structured(mode="ai_infrastructure_comparison", **scope)
+    mode = "review" if field == "objective" else "ai_infrastructure_comparison"
+    corrected = _structured(mode=mode, comprehensive=True, **(scope | {field: change}))
+    result = _run(corpus, MockTransport([_interpretation(first), _interpretation(corrected)]), question=question)
+    report = result.interpretation
+    assert report.outcome.stop_reason == "invalid_interpretation"
+    assert report.validation_failures[0].issues[0].code == "comprehensive_required_for_comparison"
+    assert report.validation_failures[1].issues == (
+        ValidationIssue(f"requirements.{field}", "inconsistent_requirements", "correction_changed_scope"),
+    )
+    assert result.plan is result.research is None
+
+
+def test_inconsistent_inferred_default_can_be_repaired(corpus):
+    first = _structured(fiscal_years=[2023], inferred_fields=["fiscal_years", "section_ids"])
+    corrected = _structured(fiscal_years=[2024], inferred_fields=["fiscal_years", "section_ids"],
+                            scope_notes="Use the latest snapshot year and Item 1A.")
+    result = _run(corpus, MockTransport([_interpretation(first), _interpretation(corrected)]), max_batches=0,
+                  question="What foreign exchange risks does Apple disclose?")
+    assert result.plan.intent.fiscal_years == (2024,)
+    assert result.interpretation.validation_failures[0].issues[0].code == "invalid_inferred_years"
+
+
+def test_correction_cannot_downgrade_an_incomplete_comparison_envelope(corpus):
+    first = {"mode": "ai_infrastructure_comparison"}
+    result = _run(corpus, MockTransport([_interpretation(first), _interpretation(_structured())]),
+                  question="Did Apple introduce any new AI infrastructure risks in FY2024 compared with FY2023?")
+    assert result.plan is result.research is None
+    assert result.interpretation.validation_failures[1].issues == (
+        ValidationIssue("requirements.objective", "inconsistent_requirements", "correction_changed_scope"),
+    )
 
 
 @pytest.mark.parametrize(("reply", "failure"), [
@@ -300,7 +462,8 @@ def test_interpretation_consumes_tree_attempt_reservation(corpus):
     assert result.usage.provider_attempts == 1 and not result.research.batches
 
 
-def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus):
+@pytest.mark.parametrize("needs_correction", [False, True])
+def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus, needs_correction):
     clock = Clock()
     chunk = corpus.get_chunk(CHUNK_ID)
     outside = corpus.get_chunk("4d1474550060251037c5f981")
@@ -329,7 +492,12 @@ def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus
         transport = transports[invocation.depth] = MockTransport(replies, clock=clock, latency=0.1)
         return BedrockRootClient(transport, config=CONFIG, clock=clock)
 
-    result = _run(corpus, MockTransport([_interpretation(_structured())]), research_factory=factory, clock=clock)
+    replies = [_interpretation(_structured())]
+    if needs_correction:
+        incomplete = _structured()
+        incomplete["requirements"].pop("scope_notes")
+        replies.insert(0, _interpretation(incomplete))
+    result = _run(corpus, MockTransport(replies), research_factory=factory, clock=clock, max_provider_attempts=10)
     child_first = transports[1].requests[0][0]
     child_prompt = child_first["messages"][0]["content"][0]["text"]
     assert QUESTION in child_prompt and "Foreign exchange exposure" in child_prompt
@@ -347,7 +515,10 @@ def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus
     assert {code for _, code in research.errors} == {"unknown_id", "unseen_citation"}
     assert "A stronger dollar" in research.answer
     assert research.root_comparisons == ()
-    assert result.usage.provider_attempts == 8 and result.usage.reported_tokens == 1_000
+    assert result.interpretation.correction_attempt == (2 if needs_correction else None)
+    assert result.usage.provider_attempts == 7 + len(replies)
+    assert result.usage.reported_tokens == 875 + 125 * len(replies)
+    assert research.limits.max_reported_tokens == 30_000 - 125 * len(replies)
     assert result.usage.estimated_tokens == research.usage.estimated_tokens + result.interpretation.estimated_tokens
     assert result.usage.corpus_attempts == 3
 
@@ -355,6 +526,11 @@ def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus
 def test_two_year_ai_comparison_uses_existing_comparative_execution(corpus):
     data = _structured(mode="ai_infrastructure_comparison", objective="year_over_year", fiscal_years=[2023, 2024],
                        companies=["AMZN"], topic="AI infrastructure supply risk", phrases=["semiconductor products"])
+    corrected = {
+        **data, "requirements": {**data["requirements"], "comprehensive": True,
+                                 "inferred_fields": ["section_ids", "comprehensive"],
+                                 "scope_notes": "Use Item 1A and review both years to evaluate novelty."},
+    }
 
     def factory(invocation):
         if invocation.depth:
@@ -366,9 +542,16 @@ def test_two_year_ai_comparison_uses_existing_comparative_execution(corpus):
         }}
         return ScriptedModelClient([assign, {"type": "synthesis", "synthesis": {}}])
 
-    result = _run(corpus, MockTransport([_interpretation(data)]), research_factory=factory,
-                  question="Did Amazon add an AI infrastructure supply risk in FY2024 compared with FY2023?")
+    result = _run(
+        corpus, MockTransport([_interpretation(data), _interpretation(corrected)]), research_factory=factory,
+        question="Did Amazon add an AI infrastructure supply risk in FY2024 compared with FY2023?",
+        max_provider_attempts=10,
+    )
     assert result.research.execution_status == "finished" and result.research.research_status == "incomplete"
     assert result.plan.intent.objective == "year_over_year"
+    assert result.plan.intent.comprehensive and "comprehensive" in result.plan.intent.inferred_fields
+    assert result.interpretation.correction_attempt == 2
+    assert result.interpretation.validation_failures[0].issues[0].code == "comprehensive_required_for_comparison"
+    assert result.plan.requested_companies == ("AMZN",)
     assert result.research.scan.years == (2023, 2024)
     assert "novelty" in result.research.answer

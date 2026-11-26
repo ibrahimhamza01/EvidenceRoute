@@ -14,6 +14,7 @@ from evidenceroute.research.rlm.corpus_research import (
 )
 from evidenceroute.research.rlm.interpretation import (
     BedrockIntentInterpreter, InterpretationBudget, InterpretationLimits, InterpretationOutcome,
+    InterpretationValidationFailure,
 )
 from evidenceroute.research.rlm.planning import ResearchPlan, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
@@ -28,6 +29,8 @@ class InterpretationReport:
     charged_tokens: int
     attempts_with_missing_usage: int
     elapsed_seconds: float
+    validation_failures: tuple[InterpretationValidationFailure, ...] = ()
+    correction_attempt: int | None = None
 
 
 @dataclass(frozen=True)
@@ -92,8 +95,12 @@ def research_question(
                 if interpreter is not None and budget.provider_attempts else ())
     estimated = sum(attempt.estimated_tokens or 0 for attempt in attempts)
     settled = clock()
-    interpretation = InterpretationReport(outcome, attempts, budget.reported_tokens, estimated, budget.charged_tokens,
-                                          budget.attempts_with_missing_usage, settled - started)
+    interpretation = InterpretationReport(
+        outcome, attempts, budget.reported_tokens, estimated, budget.charged_tokens,
+        budget.attempts_with_missing_usage, settled - started,
+        interpreter.validation_failures if attempts else (),
+        interpreter.correction_attempt if attempts else None,
+    )
     remaining_seconds = deadline - settled
     result = None
     if plan is not None and remaining_seconds > 0:

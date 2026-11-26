@@ -758,7 +758,7 @@ To reproduce this checkpoint with authorized Bedrock credentials, use the refere
 
 ### Natural-language question interpretation
 
-`natural_language.research_question(question, runner, limits=...)` accepts the original question and an existing recursive runner. `BedrockIntentInterpreter` requests one forced Converse tool use for both requirements and discovery phrases. It sends recorded company names and tickers, available fiscal years per company, and the set of filing section IDs and titles. The request contains no filing excerpts. The host validates the native tool response, constructs a `ResearchIntent`, checks 1–32 lexical phrases through `DiscoverySpec`, and uses the existing deterministic planner and canonical corpus IDs. The result includes the original question, scope assumptions, unresolved requirements, and execution telemetry.
+`natural_language.research_question(question, runner, limits=...)` accepts the original question and an existing recursive runner. `BedrockIntentInterpreter` requests a forced Converse tool use for both requirements and discovery phrases. It sends recorded company names and tickers, available fiscal years per company, and the set of filing section IDs and titles. The request contains no filing excerpts. The host validates the native tool response, constructs a `ResearchIntent`, checks 1–32 lexical phrases through `DiscoverySpec`, and uses the existing deterministic planner and canonical corpus IDs. The result includes the original question, scope assumptions, unresolved requirements, and execution telemetry.
 
 | Question or requirement | Interpretation policy |
 | --- | --- |
@@ -766,9 +766,9 @@ To reproduce this checkpoint with authorized Bedrock credentials, use the refere
 | Corpus-wide scope | Apply all corpus companies to explicit corpus-wide requests and unqualified “which companies” questions. Mark the latter company universe as inferred. Mark comprehensiveness for questions that require evaluating every requested target. |
 | Unspecified or relative fiscal years | A descriptive review with no year uses the latest fiscal year in the snapshot, FY2024 here, as an inferred requirement even when it is unavailable for a named company. Relative periods and missing comparison years call for clarification. |
 | Unspecified or ambiguous section or company | Use Item 1A for risk-factor questions as an inferred section. Ask for clarification when company scope or identity is ambiguous or when the appropriate section is unclear. Requests for full filings or all sections are unsupported because the corpus contains selected sections. |
-| Objective | Descriptive SEC disclosure reviews use the generic evidence pipeline with scoped candidate pages and exact quotes. The comparative engine supports AI infrastructure risk comparisons across exactly two distinct fiscal years. Other comparison topics, predictions, recommendations, and objectives requiring external data return an unsupported outcome. |
+| Objective | Descriptive SEC disclosure reviews use the generic evidence pipeline with scoped candidate pages and exact quotes. Supported AI infrastructure risk comparisons require exactly two distinct fiscal years and comprehensive review within the requested scope, including yes/no novelty questions. Other comparison topics, predictions, recommendations, and objectives requiring external data return an unsupported outcome. |
 
-Defaults must appear in `inferred_fields` with a concise `scope_notes` explanation. The host checks that inferred years and sections follow policy and that the execution mode matches the objective. Ambiguous, unsupported, unavailable, invalid, truncated, and exhausted interpretations return explicit outcomes without starting research. Schema and corpus checks establish shape and resolvability. Fidelity to the wording of the question, including alias judgments and scope extraction, still depends on the model.
+Defaults must appear in `inferred_fields` with a concise `scope_notes` explanation. The host checks that inferred years and sections follow policy and that the execution mode matches the objective. Only a valid executable interpretation reaches plan resolution. Schema and corpus checks establish shape and resolvability. Fidelity to the wording of the question, including alias judgments and scope extraction, still depends on the model.
 
 Interpretation defaults to at most two attempts, 1,024 output tokens per attempt within the configured Claude cap, a 16,000-token charge threshold, and a 30-second cooperative deadline. The phase uses the lower of its limits and the overall allowances. The existing Converse transport applies the configured retry policy, credential chain, timeout caps, and sanitized error codes. Each attempt records transport latency, available provider latency and reported token counters, estimated tokens, output cap, stop reason, and errors. A missing input or output counter charges the larger of the request estimate or the available reported usage. Admission checks the estimate before each request, and an observed overage blocks research. Estimates use the existing request-byte heuristic. A blocking SDK operation can overrun the deadline.
 
@@ -787,7 +787,45 @@ For a future authorized Bedrock run, add `--live --limits-file rlm-discovery-lim
 
 Verification passed **294 focused RLM tests** (28 for the question path) and **53 related retrieval, provenance, and corpus integrity regressions**, each with the existing AnyIO deprecation warning. Use the focused and related commands in the earlier verification section. The planning, planned research, recursive, discovery, both comparative modes, full and limited corpus research, Amazon–Alphabet subset, and Standard RAG demos also ran offline. The limited corpus demo returned its expected partial result and exit code 1.
 
-Mocked responses verify request construction, validation, budget settlement, scoped candidate access, and original evidence provenance. Live interpretation accuracy, latency, token usage, and retrieval quality remain unmeasured. Independent semantic verification and durable findings remain future work.
+Mocked responses verify request construction, validation, budget settlement, scoped candidate access, and original evidence provenance. The following checkpoint records the first live observations. Independent semantic verification and durable findings remain future work.
+
+#### First live question experiments
+
+The two saved reports use Bedrock Claude Sonnet 4.5 at `91b9cce`, with the expanded research profile and the root-level `rlm-question-limits.json` and `rlm-interpretation-limits.json` files. The overall ceiling was 38 attempts, 216,000 reported tokens, and 330 seconds. Interpretation could use two attempts, 16,000 charged tokens, and 30 seconds, with a 1,024-output-token cap per request.
+
+| Measure | A · Amazon–Alphabet novelty comparison | B · Apple foreign exchange review |
+| --- | ---: | ---: |
+| Interpretation attempts | 1 | 1 |
+| Interpretation reported / charged tokens | 3,298 / 3,298 | 3,243 / 3,243 |
+| Interpretation output tokens | 329 | 282 |
+| Interpretation elapsed seconds | 4.59 | 4.01 |
+| Research attempts / reported tokens | 23 / 167,651 | 0 / 0 |
+| Research corpus attempts / elapsed seconds | 26 / 103.26 | 0 / — |
+| Overall attempts / reported tokens / elapsed seconds | 24 / 170,949 / 107.85 | 1 / 3,243 / 4.01 |
+
+**A.** Run `b26afad5f7b2444a8231971a83e648b4` in `rlm-question-comparative-validation.json` resolved AMZN and GOOGL, FY2023–FY2024, inferred Item 1A, and selected the year-over-year objective. Its 20 generated phrases produced 33 candidates from 208 chunks, covering six of the seven known two-company regression targets. The matched scope allows a descriptive comparison with the earlier 19-candidate, seven-target discovery run. The phrase sets, investigation sequences, and finalization outcomes differed, so these observations do not establish general recall or causal effects on retrieval, cost, or latency.
+
+Amazon accessed relevant evidence in both years. It exhausted its protected finishes after a truncation at 2,048 output tokens and an `invalid_findings` rejection at 1,328. Alphabet and the root finished. The root recovered from `invalid_findings` on its second protected finish, acknowledged and selected five Alphabet findings, added zero findings, and returned seven evidence spans from four original citation chunks. Execution and research remained incomplete. Alphabet's child treated the third-party equipment and infrastructure dependency for AI deployment as comparable in both years. The root treated it as insufficient and judged the evidence to concern different risks. The interpreter returned `comprehensive=false` even though resolving novelty requires review across the requested scope.
+
+**B.** In `rlm-question-foreign-exchange-validation.json`, Bedrock returned `tool_use` and the interpreter stopped at `invalid_interpretation`. The response was neither truncated nor a transport failure. The saved report contains no rejected structured payload or field-level diagnostic, so the exact validation failure is unknown. Plan resolution, discovery, and recursive research never started.
+
+#### Interpretation validation and correction
+
+The old `invalid_interpretation` code covered JSON and schema errors, inconsistent scope requirements, and invalid discovery phrases. The report now links up to four unique diagnostics to each rejected attempt. Each diagnostic uses a known schema path and a fixed category and code. Extra fields identify their parent path. The diagnostic excludes submitted values, unknown keys, provider messages, and reasoning.
+
+A response with a valid native tool envelope and invalid structured input can receive one correction request. The new Converse conversation uses the original question, inventory, and forced schema with sanitized feedback. Rejected assistant content is discarded. The host validates the new submission in full and checks it against the recoverable scope from the first response. A repair can fix invalid inferred defaults or complete missing fields. Previously validated company, year, and section requirements and the comparative objective are protected from replacement. Interpreting the original wording remains a model judgment.
+
+The correction uses the remaining attempt, estimated-token, output, and time allowances. Initial transport retries use the same attempt pool, and the correction has one transport send. The report records the correction attempt number when a send occurs, and the overall totals include its usage even when it fails. Valid ambiguous or unsupported outcomes, truncation, and native protocol failures end interpretation without a correction. Research starts only after successful validation and budget settlement.
+
+Experiment A exposed that the original scope rule allowed `comprehensive=false` for a novelty question. The interpreter now requires comprehensive review for the supported two-year comparison mode within the requested companies, years, and sections. Descriptive reviews retain their existing policy. The flag describes the evidence needed to answer, while execution limits and incomplete-research semantics still govern what the run can establish.
+
+```bash
+PYTHONPATH=Code/src python -m pytest -q Code/tests/test_rlm_natural_language.py -k 'correction or two_year_ai'
+```
+
+The mocked Apple review exercises a missing-field repair and passes the corrected plan into scoped research, ending with one original citation. Verification passed 313 focused RLM tests and 53 related regressions, each with the existing AnyIO warning. Both question demos and the earlier planning, recursive, discovery, comparative, corpus, and Standard RAG demos ran offline. The limited corpus demo returned its expected partial result and exit code 1.
+
+The exact live Apple rejection and live correction success rate remain unknown. Amazon's protected finalization failures and the root–child disagreement on the Alphabet comparison remain open.
 
 ## Ongoing engineering record
 

@@ -11,6 +11,7 @@ from pydantic import (
     BaseModel, ConfigDict, Field, StrictBool, StrictInt, StringConstraints, ValidationError, field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from evidenceroute.research.rlm.budget import SharedLimits
 from evidenceroute.research.rlm.coverage import SectionTarget
@@ -44,11 +45,11 @@ class IntentRequirements(BaseModel):
     @model_validator(mode="after")
     def check_scope(self) -> IntentRequirements:
         if bool(self.companies) != (self.company_selection == "explicit"):
-            raise ValueError("Supply company names or tickers only for explicit selection.")
+            raise PydanticCustomError("company_selection_mismatch", "Supply company names or tickers only for explicit selection.")
         if self.objective == "year_over_year" and len(set(self.fiscal_years)) < 2:
-            raise ValueError("A year-over-year comparison requires at least two distinct fiscal years.")
+            raise PydanticCustomError("comparison_years_required", "A year-over-year comparison requires at least two distinct fiscal years.")
         if self.inferred_fields and self.scope_notes is None:
-            raise ValueError("Explain any inferred requirements in scope_notes.")
+            raise PydanticCustomError("scope_notes_required", "Explain any inferred requirements in scope_notes.")
         return self
 
 

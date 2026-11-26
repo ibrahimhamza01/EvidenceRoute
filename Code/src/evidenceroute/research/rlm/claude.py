@@ -392,19 +392,24 @@ class ClaudeRootClient:
             "content": observation, "is_error": not body["ok"],
         }
 
-    def _request(self, payload: dict, deadline: float, *, output_cap: int | None = None) -> dict:
+    def _request(
+        self, payload: dict, deadline: float, *, output_cap: int | None = None, allow_retries: bool = True,
+    ) -> dict:
         policy = self._finalization_policy()
         timeout = self.config.timeout_seconds
         if policy and policy.finalization_timeout_seconds is not None:
             timeout = policy.finalization_timeout_seconds
         timeout_retries = policy.finalization_timeout_retries if policy else 0
+        transport_retries = self.config.max_retries
+        if not allow_retries:
+            transport_retries = timeout_retries = 0
         if output_cap is None:
             output_cap = policy.finalization_max_output_tokens if policy else self.config.max_output_tokens
         request_bytes = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                                        default=_encode_request_blob).encode("utf-8"))
         # Admission estimate only. The provider's serialization and tokenizer can differ.
         estimate = (request_bytes + 2) // 3 + output_cap
-        for attempt in range(max(self.config.max_retries, timeout_retries) + 1):
+        for attempt in range(max(transport_retries, timeout_retries) + 1):
             started = self._clock()
             remaining = deadline - started
             if remaining <= 0:
@@ -420,7 +425,7 @@ class ClaudeRootClient:
                 self._record_error(started, code, exc.usage, **telemetry)
                 delay = max(0.25 * 2**attempt, exc.retry_after or 0.0)
                 retry_timeout = attempt < timeout_retries and code in {"aws_timeout", "aws_connect_timeout"}
-                retry_transport = exc.retryable and attempt < self.config.max_retries
+                retry_transport = exc.retryable and attempt < transport_retries
                 if not (retry_timeout or retry_transport) or delay >= deadline - self._clock():
                     raise ClaudeModelError(code) from None
                 if self._budget is not None:
