@@ -23,6 +23,7 @@ from evidenceroute.research.rlm.tools import (
     MIN_RESPONSE_BYTES,
     MAX_PROTOCOL_TOOL_BATCH,
     MAX_TOOL_BATCH,
+    READ_PRIOR_FINDINGS,
     SUBMIT_FINDINGS,
     TOOL_USE_ID_PATTERN,
     CorpusToolDispatcher,
@@ -204,6 +205,8 @@ class ToolTrace:
     accepted_finding_refs: tuple[str, ...] = ()
     offered_finding_refs: tuple[str, ...] = ()
     acknowledged_finding_refs: tuple[str, ...] = ()
+    prior_finding_references: tuple[tuple[str, str], ...] = ()
+    acknowledged_prior_finding_ids: tuple[str, ...] = ()
 
     def record(self, result: DispatchResult) -> None:
         self.validated_arguments = trace_data(result.arguments)
@@ -313,6 +316,8 @@ class RootController:
             candidate_tool = _recursive.candidate_schema()
             if candidate_tool is not None:
                 tools.append(candidate_tool)
+            if _recursive.prior_findings:
+                tools.append(_recursive.prior_findings_schema())
             tools.append(_recursive.finding_schema())
         finalization_reason = None
         replay_reason = None
@@ -608,6 +613,8 @@ class RootController:
                 return self._feedback(operation, str(exc), "Shared corpus work budget exhausted.")
             if recursive is not None and action.name == "list_candidates":
                 result = recursive.list_candidates(action.arguments)
+            elif recursive is not None and action.name == READ_PRIOR_FINDINGS and recursive.prior_findings:
+                result, operation.prior_finding_references = recursive.read_prior_findings(action.arguments, batch_share)
             elif recursive is not None and action.name == SUBMIT_FINDINGS:
                 result, operation.accepted_finding_refs, operation.finding_validation = recursive.submit_findings(
                     action.arguments, coverage.report(), deadline, batch_share=batch_share,

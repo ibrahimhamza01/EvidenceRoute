@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
+from hashlib import sha256
 from pathlib import Path
 from typing import Generic, TypeVar
 
@@ -133,6 +134,21 @@ class CorpusEnvironment:
             or section.text[chunk.char_start:chunk.char_end] != chunk.text
         ):
             raise CorpusError(f"Chunk text conflicts with section offsets: {chunk.chunk_id}")
+
+    @cached_property
+    def snapshot_identity(self) -> str:
+        """Fingerprint loaded canonical records independently of file paths and Parquet encoding."""
+        digest = sha256(b"EvidenceRoute canonical corpus v1\0")
+        records = (sorted(self._filings.values(), key=lambda item: item.document_id),
+                   [section for key in sorted(self._sections) for _, section in sorted(self._sections[key].items())],
+                   sorted(self._chunks, key=lambda item: item.chunk_id))
+        for collection in records:
+            digest.update(len(collection).to_bytes(8, "big"))
+            for record in collection:
+                data = record.model_dump_json().encode("utf-8")
+                digest.update(len(data).to_bytes(8, "big"))
+                digest.update(data)
+        return f"sha256:{digest.hexdigest()}"
 
     @cached_property
     def _searcher(self) -> BM25Retriever:

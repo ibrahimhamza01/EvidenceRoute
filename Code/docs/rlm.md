@@ -866,7 +866,38 @@ python Code/examples/demo_rlm_comparative.py
 python -m pytest -q Code/tests/test_rlm_*.py
 ```
 
-Submitting during investigation spends a tool operation and can consume a provider decision within the same ceilings. A small observation may defer receipts or omit child findings while the retained records stay available in the trace. Retention is in memory. Independent verification of claim entailment, exhaustive coverage, durable checkpoints and targeted resumption remain open. The scripted runs measure execution and provenance. Live reliability and token savings remain unmeasured for this change.
+Submitting during investigation spends a tool operation and can consume a provider decision within the same ceilings. A small observation may defer receipts or omit child findings while the retained records stay available in the trace.
+
+#### Live Apple validation
+
+Run `09a6ea22e5cf4784a6b892ab73bb870f` in `rlm-apple-incremental-live-validation.json` interpreted the AAPL FY2024 Item 1A review on its first attempt. Interpretation reported and charged 3,368 tokens in 3.31 seconds and generated 15 discovery phrases. The scan examined all 53 chunks and found five candidates. The child received four candidates and one additional chunk as whole text.
+
+The child submitted `s1`–`s4` at decision five and `s5` at decision six. All five were accepted and acknowledged. The child finished by reference with 104 output tokens, and the root's protected finish used 79. The 6,726-byte child observation delivered all five findings. The root acknowledged and selected all five, added zero new findings, and cited seven exact spans from three original chunks. Of the three submission operations, two accepted child findings and one rejected four root drafts with `unacknowledged_span`. Two subsequent root reads were skipped at the reinvestigation tool limit.
+
+Research used 11 provider attempts, 84,343 reported tokens and 12 corpus operations in 37.81 seconds. Overall usage was 12 attempts and 87,711 reported tokens in 41.12 seconds. Both invocations and execution finished, and research remained incomplete. The previous Apple run used 13 overall attempts and 77,539 reported tokens in 76.08 seconds and returned zero accepted findings or citations. These two runs used different discovery phrases and investigation sequences. The observed differences do not isolate a performance effect. Failed-child retention was exercised offline because the live child finished.
+
+The selected spans include fragments such as “dollar value of the gross margins” and “dollar, while generally beneficial”. The strengthening-currency finding also claims increased component costs and adverse margin effects, while its selected excerpt describes international pricing and derivative losses. The component-cost consequence appears in the adjacent, unselected span. These cases motivate independent entailment checks for fragments and each part of compound claims.
+
+### Durable checkpoints and targeted continuation
+
+The API in `evidenceroute.research.rlm.checkpoint` captures a settled corpus or question result with `create_checkpoint`, writes it with `save_checkpoint`, and validates it with `load_checkpoint`. Version 1 keeps the original intent and resolved plan, accepted findings with stable IDs, recorded evidence deliveries and selections, coverage, comparisons, assignments, citations, and per-run allowances and usage. A question checkpoint also records the interpretation charge. The UTF-8 JSON format is capped at 16 MiB and 64 run records. Saves sync a private temporary file beside the destination and replace the destination atomically.
+
+Loading checks the version and schema, compares a fingerprint of the loaded canonical filing, section and chunk records, and resolves the stored intent against that snapshot. It verifies each excerpt, citation, span and filing-section identity against canonical data and checks the consistency of recorded access and invocation scope. The fingerprint identifies the snapshot. Historical acknowledgement remains a record from a trusted local artifact, and claim entailment remains unverified.
+
+`plan_continuation` selects unresolved executions in plan order. Completed groups with partial semantic coverage stay out of the default selection. Explicit company selection and an optional goal can direct investigation of a gap within a resolved whole group. Missing requirements remain pending against the original denominator. Each `continue_research` call requires an explicit `CorpusLimits` allowance and uses the existing scheduler and runner. The checkpoint preserves prior successes and failures, unions evidence and access by identity, and reports current, historical and cumulative usage.
+
+Historical findings enter a new invocation through `read_prior_findings`. The operation charges a local tool slot and a shared corpus attempt, offers up to four whole findings from that invocation's authorized scope within the existing byte limits, and grants reference access after delivery is acknowledged. A historical excerpt grants access to its own text and source. Coverage counts acknowledged chunks, spans and ranges once across runs.
+
+```bash
+export PYTHONPATH=Code/src AWS_EC2_METADATA_DISABLED=true HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+python Code/examples/demo_rlm_checkpoint.py --initial-checkpoint rlm-checkpoint-initial.json \
+  --continued-checkpoint rlm-checkpoint-continued.json > rlm-checkpoint-offline-report.json
+python -m pytest -q Code/tests/test_rlm_checkpoint.py
+```
+
+The offline demo saved and reloaded a two-company FY2024 Item 1A review after Apple finished and Amazon's child failed. It resumed Amazon alone, delivered its retained finding to the new child, and added a second Amazon span. The merged state preserved Apple's finding ID, two required targets, three findings and two original citation chunks. Initial and continuation runs charged four and three corpus attempts, respectively. Overall execution finished and measured coverage stayed partial. The continuation tests also exercised a zero-allowance run and a comparative round trip with counted provider stubs. Verification passed 32 checkpoint tests within 368 RLM tests, plus 53 related regressions. The test runs reported the existing AnyIO deprecation warning. All work for this checkpoint used zero paid provider calls.
+
+Version 1 checkpoints settled runs through explicit saves. Conversation history, automatic crash recovery, cross-snapshot migration, concurrent writer coordination and semantic verification are outside this format. The merged research status remains incomplete after a focused continuation.
 
 ## Ongoing engineering record
 

@@ -165,6 +165,13 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
                                  offered_finding_refs=op.offered_finding_refs,
                                  submitted_finding_refs=op.offered_finding_refs if submitted else (),
                                  acknowledged_finding_refs=op.acknowledged_finding_refs)
+            if op.prior_finding_references:
+                offered = tuple(fid for _, fid in op.prior_finding_references)
+                submitted = (op.observation_attempted or op.observation_sent) and not op.delivery_error
+                operation.update(offered_prior_finding_ids=offered,
+                                 submitted_prior_finding_ids=offered if submitted else (),
+                                 acknowledged_prior_finding_ids=op.acknowledged_prior_finding_ids,
+                                 used_prior_finding_ids=sorted(set(node.used_finding_ids) & set(op.acknowledged_prior_finding_ids)))
             edge = op.delegation
             if edge and edge.child:
                 submitted = (op.observation_attempted or op.observation_sent) and not op.delivery_error
@@ -201,6 +208,7 @@ def execute_corpus_research(
     plan: ResearchPlan, runner: RecursiveResearch, *, limits: CorpusLimits, max_groups: int = 2,
     scan_terms: tuple[str, ...] | None = None, root_guidance: str | None = None,
     detailed_trace: bool = False, discovery: DiscoverySpec | None = None, _deadline: float | None = None,
+    _target_companies: tuple[str, ...] | None = None,
 ) -> CorpusResearchResult:
     """Run a resolved plan in ticker order, settling one tree before admitting the next."""
     if runner.comparison_scan is not None or runner.discovery_scan is not None:
@@ -217,17 +225,30 @@ def execute_corpus_research(
     if _deadline is not None:
         deadline = min(deadline, _deadline)
     run_id = uuid4().hex
-    schedule, pending = _schedule(plan, runner, max_groups)
+    work_plan = plan
+    if _target_companies is not None:
+        selected_companies = set(_target_companies)
+        if not selected_companies.issubset(group.ticker for group in plan.groups):
+            raise ValueError("Targeted companies must be resolved in the original plan.")
+        work_plan = replace(plan, groups=tuple(group for group in plan.groups if group.ticker in selected_companies),
+                            requested_companies=tuple(ticker for ticker in plan.requested_companies if ticker in selected_companies),
+                            missing_requirements=tuple(row for row in plan.missing_requirements if row.company in selected_companies))
+    schedule, pending = _schedule(work_plan, runner, max_groups)
+    pending.update(dict.fromkeys(set(plan.requested_companies) - set(work_plan.requested_companies), "not_selected"))
     scheduled = {group.ticker: number for number, groups in enumerate(schedule, 1) for group in groups}
     scan = None
     remaining_seconds = deadline - clock()
-    if (comparative or review_discovery) and remaining_seconds > 0:
+    scan_allowed = _target_companies is None or (
+        bool(schedule) and limits.max_batches > 0
+        and all(getattr(runner.shared_limits, cap) <= getattr(limits, cap) for cap in _RESOURCES)
+    )
+    if scan_allowed and (comparative or review_discovery) and remaining_seconds > 0:
         options = dict(max_chunks=limits.max_scan_chunks, max_pages=limits.max_scan_pages,
                        deadline_seconds=min(limits.scan_deadline_seconds, remaining_seconds), clock=clock)
         if discovery is not None:
-            scan = discover_research_plan(runner.corpus, plan, discovery, **options)
+            scan = discover_research_plan(runner.corpus, work_plan, discovery, **options)
         else:
-            scan = scan_research_plan(runner.corpus, plan, scan_terms, **options)
+            scan = scan_research_plan(runner.corpus, work_plan, scan_terms, **options)
         runner = copy(runner)
         if comparative:
             runner.comparison_scan = scan
@@ -300,7 +321,8 @@ def execute_corpus_research(
                            for finding in child.acknowledged_findings)
     if review_discovery:
         used_ids = {finding_id for trace in traces if trace.stop_reason == "finished" for finding_id in trace.used_finding_ids}
-        selected = tuple(finding for finding in child_findings if finding.finding_id in used_ids)
+        selected = tuple({finding.finding_id: finding for finding in (*selected, *child_findings, *runner._prior_findings)
+                          if finding.finding_id in used_ids}.values())
     retained = tuple(finding for child in coverage.invocations if child.invocation.parent_id is not None
                      for finding in child.findings
                      if finding.finding_id not in child.findings_acknowledged_by_parent)
@@ -333,7 +355,7 @@ def execute_corpus_research(
                         lexical_chunks_scanned=sum(row.scanned_chunks for row in scan.sections) if scan else 0,
                         finding_submission_attempts=sum(b.usage.finding_submission_attempts for b in batches),
                         elapsed_seconds=clock() - started)
-    evidence = tuple(dict.fromkeys(item for finding in (*root_findings, *child_findings) for item in finding.evidence))
+    evidence = tuple(dict.fromkeys(item for finding in (*root_findings, *child_findings, *selected) for item in finding.evidence))
     assessed = {key for item in (*root_comparisons, *child_comparisons) for key in item.assessed_chunk_ids}
     assessed.update(item.source.chunk_id for finding in (*root_findings, *child_findings)
                     if finding.analysis_status in {"analyzed", "conflicting"} for item in finding.evidence)

@@ -12,6 +12,7 @@ from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import AnalysisStatus, Finding
 from evidenceroute.research.rlm.planning import MissingRequirement, ResearchPlan
 from evidenceroute.research.rlm.recursive import DelegationTrace, Invocation
+from evidenceroute.research.rlm.tools import READ_PRIOR_FINDINGS
 
 AccessStatus = Literal["none", "partial", "complete"]
 
@@ -41,6 +42,8 @@ class InvocationOutcome:
     selected_inherited_finding_ids: tuple[str, ...] = ()
     selected_local_finding_ids: tuple[str, ...] = ()
     forwarded_findings: tuple[Finding, ...] = ()
+    direct_span_ids: tuple[tuple[str, str], ...] = ()
+    acknowledged_prior_finding_ids: tuple[str, ...] = ()
 
     @property
     def acknowledged_findings(self) -> tuple[Finding, ...]:
@@ -147,6 +150,8 @@ def aggregate_research_trees(
                         target.used.add(finding.finding_id)
 
         chunks: set[str] = set()
+        spans: set[tuple[str, str]] = set()
+        prior_ids: set[str] = set()
         windows: list[SectionAccess] = []
         children = []
         for step in run.steps if run else ():
@@ -187,7 +192,22 @@ def aggregate_research_trees(
                         target = access.get(SectionTarget(ref.document_id, ref.section_id))
                         if target is not None:
                             target.direct_spans.add(ref.chunk_id)
-                            target.spans.update((ref.chunk_id, span) for span in observation["span_ids"][ref.chunk_id])
+                            delivered_spans = {(ref.chunk_id, span) for span in observation["span_ids"][ref.chunk_id]}
+                            target.spans.update(delivered_spans)
+                            spans.update(delivered_spans)
+                elif operation.tool_name == READ_PRIOR_FINDINGS:
+                    prior_ids.update(operation.acknowledged_prior_finding_ids)
+                    for record in observation["result"]["findings"]:
+                        fid = record["finding_id"]
+                        for item in record["evidence"]:
+                            source = item["source"]
+                            target = access[SectionTarget(source["document_id"], source["section_id"])]
+                            target.acknowledged.add(fid)
+                            target.excerpts.add(source["chunk_id"])
+                            if item["span_id"] is not None:
+                                target.spans.add((source["chunk_id"], item["span_id"]))
+                            if fid in run.used_finding_ids:
+                                target.used.add(fid)
 
         outcomes.append(InvocationOutcome(
             invocation, run.stop_reason if run else None, run.budget_stop if run else None,
@@ -197,6 +217,7 @@ def aggregate_research_trees(
             tuple(finding.finding_id for finding in run.selected_inherited_findings) if run else (),
             run.selected_local_finding_ids if run else (),
             run.selected_inherited_findings if run and invocation.parent_id is not None else (),
+            tuple(sorted(spans)), tuple(sorted(prior_ids)),
         ))
         for child, child_acknowledged in children:
             assert child.invocation is not None
@@ -211,6 +232,12 @@ def aggregate_research_trees(
         admitted.update(trace.invocation.partitions)
         visit(trace.invocation, trace)
 
+    return ResearchCoverage(_target_coverage(corpus, access, admitted), plan.missing_requirements,
+                            tuple(outcomes), tuple(rejected))
+
+
+def _target_coverage(corpus: CorpusEnvironment, access: dict[SectionTarget, _Access],
+                     admitted: set[SectionTarget]) -> tuple[TargetCoverage, ...]:
     targets = []
     for pair, seen in access.items():
         meta = corpus.get_section(pair.document_id, pair.section_id, limit=1).metadata
@@ -225,4 +252,38 @@ def aggregate_research_trees(
             tuple(sorted(seen.generated)),
             tuple(sorted(seen.acknowledged)), tuple(sorted(seen.used)), tuple(sorted(seen.spans)),
         ))
-    return ResearchCoverage(tuple(targets), plan.missing_requirements, tuple(outcomes), tuple(rejected))
+    return tuple(targets)
+
+
+def merge_research_coverage(
+    corpus: CorpusEnvironment, plan: ResearchPlan, reports: Iterable[ResearchCoverage],
+) -> ResearchCoverage:
+    """Union access over the original filing-section denominator."""
+    access = {pair: _Access() for pair in plan.resolved_targets}
+    admitted: set[SectionTarget] = set()
+    invocations: dict[str, InvocationOutcome] = {}
+    rejected = []
+    for report in reports:
+        for node in report.invocations:
+            invocation_id = node.invocation.invocation_id
+            if invocation_id in invocations:
+                raise ValueError("Duplicate invocation in coverage history.")
+            invocations[invocation_id] = node
+        rejected.extend(report.rejected_delegations)
+        for row in report.targets:
+            seen = access[row.pair]
+            if row.admitted:
+                admitted.add(row.pair)
+            seen.chunks.update(row.whole_chunk_ids)
+            seen.discovered.update(row.discovered_chunk_ids)
+            seen.ranges.extend(row.character_ranges)
+            seen.excerpts.update(row.delegated_excerpt_chunk_ids)
+            seen.direct_spans.update(row.direct_span_chunk_ids)
+            seen.assigned.extend(row.assigned_child_ids)
+            seen.failed.extend(row.failed_invocation_ids)
+            seen.generated.update(row.generated_finding_ids)
+            seen.acknowledged.update(row.acknowledged_finding_ids)
+            seen.used.update(row.used_finding_ids)
+            seen.spans.update(row.delivered_span_ids)
+    return ResearchCoverage(_target_coverage(corpus, access, admitted), plan.missing_requirements,
+                            tuple(invocations.values()), tuple(rejected))

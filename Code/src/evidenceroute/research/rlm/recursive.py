@@ -26,7 +26,7 @@ from evidenceroute.research.rlm.findings import (
 from evidenceroute.research.rlm.scoped import ScopedCorpus
 from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import (
-    SUBMIT_FINDINGS, DispatchResult, EvidenceRef, Identifier, StrictInput, error_observation, observation_json,
+    READ_PRIOR_FINDINGS, SUBMIT_FINDINGS, DispatchResult, EvidenceRef, Identifier, StrictInput, error_observation, observation_json,
     validation_message,
 )
 
@@ -40,6 +40,11 @@ class _Delegate(StrictInput):
     question: str = Field(min_length=1, max_length=1_500)
     goal: str = Field(min_length=1, max_length=750)
     partitions: list[_Partition] = Field(min_length=1, max_length=500)
+
+
+class _PriorFindingPage(StrictInput):
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=2, ge=1, le=4)
 
 
 FindingKey = tuple[str, frozenset[FindingEvidence], AnalysisStatus, str | None, str | None]
@@ -92,6 +97,7 @@ class RecursiveResearch:
         self.child_guidance = child_guidance
         self.comparison_scan = comparison_scan
         self.discovery_scan = discovery_scan
+        self._prior_findings: tuple[Finding, ...] = ()
         if max_root_reinvestigation_calls is not None and (
             type(max_root_reinvestigation_calls) is not int or max_root_reinvestigation_calls < 0
         ):
@@ -209,6 +215,9 @@ class RecursiveResearch:
         if self.comparison_scan is not None:
             prompt += (" Reassess short references in synthesis.comparisons. In a legacy finish, use one-based "
                        "finding indices for comparisons.")
+        if session.prior_findings:
+            prompt += (" Use read_prior_findings to inspect retained excerpts for your assigned scope. "
+                       "Acknowledge their delivery before selecting their dN references.")
         return RootController(view, model, limits=self.local_limits, clock=self.clock,
                               include_spans=True, comparative=self.comparison_scan is not None).run(
             prompt, scope=scope, _recursive=session,
@@ -232,6 +241,12 @@ class RecursiveSession:
         self.direct_ids: set[str] = set()
         self.direct_spans: dict[str, set[str]] = {}
         self.delivered_findings: dict[str, Finding] = {}
+        authorized = set(invocation.partitions or ())
+        self.prior_findings = {
+            finding.finding_id: finding for finding in runner._prior_findings
+            if all(SectionTarget(item.source.document_id, item.source.section_id) in authorized for item in finding.evidence)
+        }
+        self.prior_refs: dict[str, str] = {}
         self.reference_synthesis = runner.discovery_scan is not None or (
             invocation.depth == 0 and runner.comparison_scan is not None
         )
@@ -313,6 +328,49 @@ class RecursiveSession:
                            "Use returned sN references in finish_research; citations and source details are derived.",
             "input_schema": SubmitFindings.model_json_schema(),
         }
+
+    @staticmethod
+    def prior_findings_schema() -> dict:
+        return {
+            "name": READ_PRIOR_FINDINGS,
+            "description": "Page through retained findings from earlier runs in the authorized scope. "
+                           "Use next_offset to continue. Select returned dN references in finish_research.",
+            "input_schema": _PriorFindingPage.model_json_schema(),
+        }
+
+    def read_prior_findings(self, arguments: dict, batch_share: int | None) -> tuple[DispatchResult, tuple[tuple[str, str], ...]]:
+        cap = self.runner.local_limits.max_response_bytes
+        try:
+            request = _PriorFindingPage.model_validate(arguments)
+        except ValidationError as exc:
+            return DispatchResult(None, error_observation("invalid_arguments", validation_message(exc), cap)), ()
+        validated = request.model_dump()
+        share = cap if batch_share is None else min(cap, batch_share)
+        page = tuple(self.prior_findings.values())[request.offset:request.offset + request.limit]
+        records = []
+        offered = []
+        content = None
+        for finding in page:
+            ref = self.prior_refs.get(finding.finding_id, f"d{self.next_reference}")
+            records.append({"ref": ref, **asdict(finding)})
+            end = request.offset + len(records)
+            candidate = observation_json({"ok": True, "result": {
+                "findings": records, "next_offset": end if end < len(self.prior_findings) else None,
+            }})
+            if len(candidate.encode("utf-8")) > share:
+                break
+            if finding.finding_id not in self.prior_refs:
+                self.prior_refs[finding.finding_id] = ref
+                self.next_reference += 1
+            offered.append((ref, finding.finding_id))
+            content = candidate
+        if not page:
+            content = observation_json({"ok": True, "result": {"findings": [], "next_offset": None}})
+        if content is None:
+            return DispatchResult(validated, error_observation("response_too_large", "No prior finding fits this observation.", cap)), ()
+        self.reference_synthesis |= bool(offered)
+        refs = tuple(dict.fromkeys(item.source for _, fid in offered for item in self.prior_findings[fid].evidence))
+        return DispatchResult(validated, content, refs), tuple(offered)
 
     def submit_findings(
         self, arguments: dict, coverage: CoverageReport, deadline: float, *, batch_share: int | None,
@@ -518,6 +576,10 @@ class RecursiveSession:
         if not (step.observation or {}).get("ok"):
             return
         if step.delegation is None:
+            if step.tool_name == READ_PRIOR_FINDINGS:
+                step.acknowledged_prior_finding_ids = tuple(fid for _, fid in step.prior_finding_references)
+                self._acknowledge_findings(step.prior_finding_references, self.prior_findings)
+                return
             if step.tool_name == SUBMIT_FINDINGS:
                 step.acknowledged_finding_refs = step.offered_finding_refs
                 self.acknowledged_references.update((ref, self.submitted_findings[ref])
@@ -530,10 +592,13 @@ class RecursiveSession:
         elif step.delegation.child is not None:
             offered = set(step.delegation.offered_finding_ids)
             findings = [finding for finding in step.delegation.child.transferable_findings if finding.finding_id in offered]
-            self.delivered_findings.update((finding.finding_id, finding) for finding in findings)
+            records = {finding.finding_id: finding for finding in findings}
             step.delegation.delivered_finding_ids = tuple(finding.finding_id for finding in findings)
-            self.acknowledged_references.update((ref, self.delivered_findings[fid])
-                                                for ref, fid in step.delegation.finding_references if fid in offered)
+            self._acknowledge_findings(step.delegation.finding_references, records)
+
+    def _acknowledge_findings(self, references: tuple[tuple[str, str], ...], records: dict[str, Finding]) -> None:
+        self.delivered_findings.update((fid, records[fid]) for _, fid in references)
+        self.acknowledged_references.update((ref, records[fid]) for ref, fid in references)
 
     def finish(self, action: _FinishAction, coverage: CoverageReport) -> None:
         scan = self.runner.comparison_scan

@@ -32,6 +32,7 @@ MAX_PROTOCOL_TOOL_BATCH = 16
 # Internal batches preserve native IDs, including Bedrock's period and colon.
 TOOL_USE_ID_PATTERN = r"^[A-Za-z0-9_.:-]{1,64}$"
 SUBMIT_FINDINGS = "submit_findings"
+READ_PRIOR_FINDINGS = "read_prior_findings"
 
 
 def trace_data(value):
