@@ -4,11 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
-from demo_rlm_comparative import GUIDANCE, ROOT_GUIDANCE, TERMS, _offline_factory
+from demo_rlm_comparative import DISCOVERY_PHRASES, GUIDANCE, ROOT_GUIDANCE, TERMS, _offline_factory
 from demo_rlm_plan import QUESTION, scripted_interpretation
 from evidenceroute.research.rlm import CorpusEnvironment
 from evidenceroute.research.rlm.bedrock import BedrockRootClient
 from evidenceroute.research.rlm.corpus_research import CorpusLimits, execute_corpus_research
+from evidenceroute.research.rlm.discovery import DiscoverySpec
 from evidenceroute.research.rlm.planning import interpret_intent, resolve_research_plan
 from evidenceroute.research.rlm.profiles import COMPARATIVE_PROFILES
 from evidenceroute.research.rlm.recursive import RecursiveResearch
@@ -19,6 +20,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=tuple(COMPARATIVE_PROFILES), default="diagnostic")
     parser.add_argument("--company", action="append", help="Request a ticker or company name. Repeat for multiple companies.")
+    parser.add_argument("--term", action="append", help="Replace the example phrases. Repeat for variants.")
+    parser.add_argument("--fixed-terms", action="store_true", help="Reproduce the literal-term baseline.")
     budget_options = parser.add_mutually_exclusive_group()
     budget_options.add_argument("--limited", action="store_true", help="Stop after the first allotted tree's partition work.")
     budget_options.add_argument("--limits-file", type=Path, help="JSON corpus-level limits.")
@@ -50,8 +53,11 @@ def main(argv=None) -> int:
         runner = RecursiveResearch(corpus, factory, shared_limits=shared, local_limits=profile.local_limits,
                                    finalization=profile.finalization, child_guidance=GUIDANCE,
                                    max_root_reinvestigation_calls=profile.max_root_reinvestigation_calls)
-        result = execute_corpus_research(plan, runner, limits=limits, max_groups=profile.max_groups, scan_terms=TERMS,
-                                         root_guidance=ROOT_GUIDANCE, detailed_trace=args.trace)
+        scan_terms = tuple(args.term or TERMS) if args.fixed_terms else None
+        discovery = None if args.fixed_terms else DiscoverySpec.from_intent(plan.intent, tuple(args.term or DISCOVERY_PHRASES))
+        result = execute_corpus_research(plan, runner, limits=limits, max_groups=profile.max_groups,
+                                         scan_terms=scan_terms, discovery=discovery, root_guidance=ROOT_GUIDANCE,
+                                         detailed_trace=args.trace)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     report = {

@@ -9,7 +9,8 @@ from demo_rlm_plan import QUESTION, scripted_interpretation
 from demo_rlm_recursive import _invocation_report, _usage, _walk
 from evidenceroute.research.rlm import CorpusEnvironment
 from evidenceroute.research.rlm.bedrock import BedrockRootClient
-from evidenceroute.research.rlm.comparison import render_comparative_scope, scan_research_plan
+from evidenceroute.research.rlm.comparison import render_comparative_scope
+from evidenceroute.research.rlm.discovery import DiscoverySpec, discover_research_plan, scan_research_plan
 from evidenceroute.research.rlm.controller import ScriptedModelClient
 from evidenceroute.research.rlm.planned_research import execute_research_plan
 from evidenceroute.research.rlm.planning import interpret_intent, resolve_research_plan
@@ -20,6 +21,10 @@ from evidenceroute.research.rlm.tools import observation_json, trace_data
 
 TERMS = ("data center", "data centre", "power shortages", "water shortages", "reliable energy",
          "computing infrastructure", "AI infrastructure", "AI accelerators")
+DISCOVERY_PHRASES = (
+    *TERMS, "artificial intelligence infrastructure", "datacenter", "datacenters", "power supply", "water supply",
+    "AI technologies", "supply constraints", "AI services",
+)
 GUIDANCE = (
     "Analyze the same possible AI infrastructure risk across both fiscal years. Explain how the evidence relates "
     "to AI infrastructure or mark it other or uncertain. Look for a specific risk mechanism, such as a capacity, "
@@ -133,6 +138,7 @@ def _report(result, scan, live, detailed=False):
         rows.append({"ticker": row.ticker, "fiscal_year": row.fiscal_year, "target": asdict(row.pair),
                      "inventory_chunks": row.inventory_chunks, "scanned_chunks": row.scanned_chunks,
                      "candidate_chunks": len(row.candidates),
+                     "matched_chunks": row.matched_chunks,
                      "candidate_spans": sum(len(hit.matching_span_ids) for hit in row.candidates),
                      "delivered_chunks": len(delivered), "whole_chunks_delivered": len(target.whole_chunk_ids),
                      "direct_span_chunks_delivered": len(target.direct_span_chunk_ids),
@@ -146,7 +152,9 @@ def _report(result, scan, live, detailed=False):
         "semantic_review_status": "model_assessed" if root_comparisons or acknowledged else "unassessed",
         "research_status": result.answer_status, "independent_semantic_verification": False,
         "scan": {"terms": scan.terms, "pages": scan.pages_read, "characters": scan.characters_scanned,
-                 "elapsed_seconds": scan.elapsed_seconds, "stop_reason": scan.stop_reason, "by_company_year": rows},
+                 "metadata_reads": scan.metadata_reads, "unvisited_targets": scan.unvisited_targets,
+                 "discovery": scan.discovery, "elapsed_seconds": scan.elapsed_seconds, "stop_reason": scan.stop_reason,
+                 "by_company_year": rows},
         "groups": result.groups, "coverage": result.coverage,
         "group_counts": {"admitted": len(admitted),
                          "attempted": sum(group.initial_invocation_id is not None for group in admitted),
@@ -178,8 +186,10 @@ def main(argv=None) -> int:
     profiles = parser.add_mutually_exclusive_group()
     profiles.add_argument("--profile", choices=tuple(COMPARATIVE_PROFILES), default="diagnostic")
     profiles.add_argument("--profile-file", type=Path, help="JSON comparative budget profile.")
-    parser.add_argument("--term", action="append", help="Replace default scan terms. Repeat to add terms.")
+    parser.add_argument("--term", action="append", help="Replace the example phrases. Repeat for variants.")
+    parser.add_argument("--fixed-terms", action="store_true", help="Reproduce the literal-term baseline.")
     parser.add_argument("--max-scan-chunks", type=int, default=30_000)
+    parser.add_argument("--max-scan-pages", type=int)
     parser.add_argument("--scan-deadline-seconds", type=float, default=30.0)
     args = parser.parse_args(argv)
     try:
@@ -187,8 +197,13 @@ def main(argv=None) -> int:
                    else COMPARATIVE_PROFILES[args.profile])
         corpus = CorpusEnvironment()
         plan = resolve_research_plan(interpret_intent(QUESTION, scripted_interpretation), corpus)
-        scan = scan_research_plan(corpus, plan, tuple(args.term or TERMS), max_chunks=args.max_scan_chunks,
-                                  deadline_seconds=args.scan_deadline_seconds)
+        options = dict(max_chunks=args.max_scan_chunks, max_pages=args.max_scan_pages,
+                       deadline_seconds=args.scan_deadline_seconds)
+        if args.fixed_terms:
+            scan = scan_research_plan(corpus, plan, tuple(args.term or TERMS), **options)
+        else:
+            spec = DiscoverySpec.from_intent(plan.intent, tuple(args.term or DISCOVERY_PHRASES))
+            scan = discover_research_plan(corpus, plan, spec, **options)
         factory = (lambda _: BedrockRootClient.from_env(disable_retries=True)) if args.live else _offline_factory(corpus, plan)
         runner = RecursiveResearch(
             corpus, factory, comparison_scan=scan, child_guidance=GUIDANCE,

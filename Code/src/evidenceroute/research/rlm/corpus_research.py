@@ -11,9 +11,8 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from evidenceroute.research.rlm.budget import BudgetUsage, SharedBudget
-from evidenceroute.research.rlm.comparison import (
-    Comparison, CorpusScan, render_comparative_scope, render_comparisons, scan_research_plan,
-)
+from evidenceroute.research.rlm.comparison import Comparison, render_comparative_scope, render_comparisons
+from evidenceroute.research.rlm.discovery import CorpusScan, DiscoverySpec, discover_research_plan, scan_research_plan
 from evidenceroute.research.rlm.controller import ExecutionTrace
 from evidenceroute.research.rlm.findings import Finding, FindingEvidence
 from evidenceroute.research.rlm.planned_research import GroupOutcome, admit_company_groups, execute_research_plan
@@ -36,6 +35,7 @@ class CorpusLimits(BaseModel):
     max_partitions: int = Field(ge=0)
     deadline_seconds: float = Field(gt=0)
     max_scan_chunks: int = Field(default=30_000, ge=1)
+    max_scan_pages: int | None = Field(default=None, ge=0)
     scan_deadline_seconds: float = Field(default=30.0, gt=0)
 
 
@@ -68,6 +68,7 @@ class CorpusUsage:
     delegated_invocations: int
     partition_assignments: int
     lexical_pages_read: int
+    lexical_metadata_reads: int
     lexical_chunks_scanned: int
     elapsed_seconds: float
 
@@ -186,11 +187,16 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
 def execute_corpus_research(
     plan: ResearchPlan, runner: RecursiveResearch, *, limits: CorpusLimits, max_groups: int = 2,
     scan_terms: tuple[str, ...] | None = None, root_guidance: str | None = None,
-    detailed_trace: bool = False,
+    detailed_trace: bool = False, discovery: DiscoverySpec | None = None,
 ) -> CorpusResearchResult:
     """Run a resolved plan in ticker order, settling one tree before admitting the next."""
     if runner.comparison_scan is not None:
-        raise ValueError("Pass scan_terms so the lexical scan is charged to this corpus execution.")
+        raise ValueError("Pass discovery or scan_terms so the lexical scan is charged to this corpus execution.")
+    if discovery is not None and scan_terms is not None:
+        raise ValueError("Choose either normalized discovery or the literal-term baseline.")
+    comparative = discovery is not None or scan_terms is not None
+    if comparative and (plan.intent.objective != "year_over_year" or len(set(plan.intent.fiscal_years)) != 2):
+        raise ValueError("Comparative execution requires a two-year comparison.")
     clock = runner.clock
     started = clock()
     deadline = started + limits.deadline_seconds
@@ -199,9 +205,13 @@ def execute_corpus_research(
     scheduled = {group.ticker: number for number, groups in enumerate(schedule, 1) for group in groups}
     scan = None
     remaining_seconds = deadline - clock()
-    if scan_terms is not None and remaining_seconds > 0:
-        scan = scan_research_plan(runner.corpus, plan, scan_terms, max_chunks=limits.max_scan_chunks,
-                                  deadline_seconds=min(limits.scan_deadline_seconds, remaining_seconds), clock=clock)
+    if comparative and remaining_seconds > 0:
+        options = dict(max_chunks=limits.max_scan_chunks, max_pages=limits.max_scan_pages,
+                       deadline_seconds=min(limits.scan_deadline_seconds, remaining_seconds), clock=clock)
+        if discovery is not None:
+            scan = discover_research_plan(runner.corpus, plan, discovery, **options)
+        else:
+            scan = scan_research_plan(runner.corpus, plan, scan_terms, **options)
         runner = copy(runner)
         runner.comparison_scan = scan
 
@@ -296,6 +306,7 @@ def execute_corpus_research(
     usage = CorpusUsage(**used, attempts_with_missing_usage=sum(b.usage.attempts_with_missing_usage for b in batches),
                         estimated_tokens=sum(estimates), attempts_with_missing_estimate=used["provider_attempts"] - len(estimates),
                         lexical_pages_read=scan.pages_read if scan else 0,
+                        lexical_metadata_reads=scan.metadata_reads if scan else 0,
                         lexical_chunks_scanned=sum(row.scanned_chunks for row in scan.sections) if scan else 0,
                         elapsed_seconds=clock() - started)
     evidence = tuple(dict.fromkeys(item for finding in (*root_findings, *child_findings) for item in finding.evidence))
@@ -304,7 +315,7 @@ def execute_corpus_research(
                     if finding.analysis_status in {"analyzed", "conflicting"} for item in finding.evidence)
     finished = bool(batches) and all(group.pending_reason is None for group in groups)
     comparable = {item.ticker for item in root_comparisons if item.outcome == "comparable_both_years"}
-    unresolved_comparisons = scan_terms is not None and (
+    unresolved_comparisons = comparative and (
         comparable != set(plan.requested_companies) or any(item.outcome != "comparable_both_years" for item in root_comparisons)
     )
     incomplete = not finished or unresolved_comparisons or any(result.answer_status == "incomplete" for result in results)
@@ -314,7 +325,7 @@ def execute_corpus_research(
               f"Pending execution or scope. {pending_groups}")
     if retained:
         answer += f"\nRetained child findings without parent acknowledgement. {len(retained)}."
-    if scan_terms is not None:
+    if comparative:
         assessment = "Batch-root comparisons.\n" + render_comparisons(root_comparisons)
         if child_comparisons:
             assessment += "\n\nAcknowledged child comparisons.\n" + render_comparisons(child_comparisons)

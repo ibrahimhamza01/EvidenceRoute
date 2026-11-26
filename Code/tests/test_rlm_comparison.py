@@ -416,7 +416,7 @@ def test_canonical_demo_reinvestigates_prior_year_under_corpus_budget(corpus, ex
     monkeypatch.setattr("evidenceroute.research.rlm.bedrock.BedrockRootClient.from_env",
                         lambda **_: pytest.fail("Offline demo must not make provider requests"))
     demo = runpy.run_path(str(examples / "demo_rlm_comparative.py"))
-    assert demo["main"]([]) == 0
+    assert demo["main"](["--fixed-terms"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["research_status"] == "incomplete" and not report["independent_semantic_verification"]
     assert report["execution_status"] == report["recursive_comparative_status"] == "success"

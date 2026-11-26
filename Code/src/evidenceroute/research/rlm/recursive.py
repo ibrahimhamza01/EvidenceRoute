@@ -11,9 +11,8 @@ from uuid import uuid4
 from pydantic import Field, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
-from evidenceroute.research.rlm.comparison import (
-    CandidatePageRequest, Comparison, CorpusScan, render_comparisons, resolve_comparison, resolve_reference_comparison,
-)
+from evidenceroute.research.rlm.comparison import Comparison, render_comparisons, resolve_comparison, resolve_reference_comparison
+from evidenceroute.research.rlm.discovery import CandidatePageRequest, CorpusScan
 from evidenceroute.research.rlm.controller import (
     ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction, _ReferenceSynthesis,
 )
@@ -176,6 +175,7 @@ class RecursiveResearch:
             prompt += (
                 "\nLexical candidates (IDs and span hints, at most three per section): " + observation_json(shortlist)
                 + "\nUse get_spans for matching passages and list_candidates with next_offset for more scoped IDs. "
+                "Use scoped search_chunks for gaps or different wording, including sections with no candidates. "
                 "Read promising evidence in each fiscal "
                 "year and check the same risk in both filings. Choose chunk_id and span_id from acknowledged "
                 "evidence to create findings. Evaluate relevance to the topic separately from what the passage supports or contradicts. "

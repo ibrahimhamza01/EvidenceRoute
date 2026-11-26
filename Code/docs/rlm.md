@@ -325,7 +325,7 @@ Durable finding storage, independent semantic verification, automated reinvestig
 
 ### Systematic comparative research
 
-The comparative demo scans the full resolved inventory in canonical company, year, section, and chunk order. It counts case-insensitive literal matches for configurable terms under separate local chunk and time limits. Children receive up to three candidate IDs per authorized section with span hints and a cursor. `list_candidates` returns up to ten IDs for a scoped section. Comparative `search_chunks` returns ranked candidate IDs and span hints. Each call uses one local tool slot and one shared corpus attempt. Candidate IDs grant no evidence or access credit. `get_spans` supplies up to four exact passages from one scoped chunk. `get_chunk` supplies the full text when context is needed.
+The original comparative demo scanned the resolved inventory for case-insensitive literal matches. Children receive up to three candidate IDs per authorized section with span hints and a cursor. `list_candidates` returns up to ten IDs for a scoped section. Comparative `search_chunks` returns ranked candidate IDs and span hints. Each call uses one local tool slot and one shared corpus attempt. Candidate IDs grant no evidence or access credit. `get_spans` supplies up to four exact passages from one scoped chunk. `get_chunk` supplies the full text when context is needed.
 
 Comparative chunk observations include compact span IDs alongside the original text. An ID is a pair of character offsets within one canonical chunk. The model selects the pair and Python copies the exact source characters. Selection is limited to acknowledged span IDs or the identical span from a declared, acknowledged child finding. This preserves Unicode and prevents a parent from expanding a delegated excerpt. The existing observation byte cap applies and the legacy exact-quote interface remains available.
 
@@ -335,7 +335,7 @@ Children submit structured relevance and entailment assessments over selected sp
 PYTHONPATH=Code/src python Code/examples/demo_rlm_comparative.py
 ```
 
-With the default terms, the offline demo scanned **3,038 chunks in 50 Item 1A sections across 25 companies** using 328 local pages and 4,603,503 chunk characters, including overlap. It identified **87 candidate chunks and 118 matching spans**. FY2023/FY2024 candidate chunk counts were **1/1 for AAPL** and **4/6 for AMD**. The AMD script read the FY2024 water-and-power passage and then the canonical FY2023 counterpart. Two chunks were delivered and assessed, both original citations reached the root, and the scripted root classified the constraint as comparable across both years. The FY2024 excerpt explicitly adds a potential revenue impact. The selected passages concern data centers generally and leave the AI-specific link unestablished. This demonstration used 3 sessions, 7 decisions, 2 corpus attempts, and zero provider attempts. Corpus-wide research remained incomplete.
+With the original eight literal terms, the offline demo scanned **3,038 chunks in 50 Item 1A sections across 25 companies** using 328 local pages and 4,603,503 chunk characters, including overlap. It identified **87 candidate chunks and 118 matching spans**. FY2023/FY2024 candidate chunk counts were **1/1 for AAPL** and **4/6 for AMD**. The AMD script read the FY2024 water-and-power passage and then the canonical FY2023 counterpart. Two chunks were delivered and assessed, both original citations reached the root, and the scripted root classified the constraint as comparable across both years. The FY2024 excerpt explicitly adds a potential revenue impact. The selected passages concern data centers generally and leave the AI-specific link unestablished. This demonstration used 3 sessions, 7 decisions, 2 corpus attempts, and zero provider attempts. Corpus-wide research remained incomplete.
 
 The baseline live runs below used scripted intent, a two-group cap, 18 provider attempts, 12 corpus attempts, protected finalization, and zero provider retries.
 
@@ -682,7 +682,58 @@ PYTHONPATH=Code/src python Code/examples/demo_rlm_corpus_research.py
 
 Verification passed **260 focused RLM tests** and **53 related regressions**, with the existing AnyIO warning. The Bedrock stub replayed a truncated compact finish with the same tool-result IDs and used two original child findings without regenerating either one. Offline corpus-wide, limited, six-company, comparative, planning, recursive, and Standard RAG demos passed with zero provider attempts.
 
-Aliases add a small amount to child observations, which still fit or compact under the existing byte limit. The compact form does not guarantee that a protected finish fits its output cap. Live validation, generalized candidate discovery, and independent semantic verification remain open.
+Aliases add a small amount to child observations, which still fit or compact under the existing byte limit. The compact form does not guarantee that a protected finish fits its output cap.
+
+#### Targeted live reference synthesis
+
+Run `d34a62a374c647e18f50f3c257f36cf5` (`rlm-reference-synthesis-validation.json`) repeated the Amazon–Alphabet scope from Batch 2 of `c00c4eda1b6640719a18e4ee87790f4d` with the same per-tree ceilings. Both children finished in each run.
+
+| Measure | Earlier Batch 2 | Reference synthesis |
+| --- | ---: | ---: |
+| Root | Failed | Finished |
+| Provider attempts | 22 | 20 |
+| Reported tokens | 179,036 | 156,778 |
+| Elapsed seconds (approximate) | 126.47 | 83.04 |
+| Root reported tokens | 31,710 | 11,403 |
+
+The earlier root had three truncated responses, including two protected finishes. The new root finished in investigation with **843 output tokens** under the ordinary 1,024-token cap. It selected all six acknowledged child findings, generated zero new root findings, and cited seven original chunks. The run recorded zero errors. Execution finished and research remained incomplete. The 12,790-byte delegation envelope carried both full results, and the root finished without replay. These are two observations with different investigation and synthesis call sequences, which preclude attribution of the time and token differences to the compact format alone. The earlier batch's metrics come from the previously reviewed baseline. Its raw report was absent from this checkout.
+
+From the repository root with authorized Bedrock credentials, use the expanded profile and the one-tree limits file from the experiment (`max_batches` 1, `max_provider_attempts` 36, `max_reported_tokens` 200000, `max_corpus_attempts` 30, `max_delegations` 2, `max_partitions` 4, `deadline_seconds` 300, `max_scan_chunks` 30000, and `scan_deadline_seconds` 30).
+
+```bash
+BEDROCK_REGION=us-east-1 \
+  BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
+  CLAUDE_TIMEOUT_SECONDS=20 CLAUDE_MAX_OUTPUT_TOKENS=1024 PYTHONPATH=Code/src \
+  python Code/examples/demo_rlm_corpus_research.py --live --trace --profile expanded --fixed-terms \
+    --limits-file rlm-two-company-limits.json --company AMZN --company GOOGL \
+    > rlm-reference-synthesis-validation-rerun.json
+```
+
+### Question-dependent candidate discovery
+
+The targeted live run scanned **208 chunks** and found **15** initial candidates with the fixed terms. Five of its seven assessed chunks were outside that set. Subsequent scoped exploration found the missing passages, including both Amazon semiconductor-supply chunks and Alphabet's references to third-party infrastructure. The earlier six-company run likewise recovered Microsoft evidence after a zero-candidate scan.
+
+`DiscoverySpec` validates the intent topic and up to 32 caller-supplied phrases, including spelling, acronym, and word-form variants. When phrases are omitted, the leading clause of the topic supplies the search phrase. The scanner reuses the BM25 tokenizer's case, Unicode compatibility, and punctuation normalization with stop words preserved, then matches contiguous token phrases. This catches formatting variants such as hyphenation. Fused words, abbreviations, and inflections still need suitable phrases. Ranking favors the longest matched phrase, then the number of distinct matches, then the original chunk ID. Each section retains at most 16 candidates by default and reports its total matches separately. The example phrase set lives in the demo. The engine works with any resolved plan, including the one-year review below.
+
+Reads interleave exact filing sections and divide the remaining chunk allowance across the current round. A large filing or high candidate count cannot take another section's candidate allowance. The scanner records section metadata reads, page reads, scanned chunks, unvisited targets, and deadline or limit stops. The page cap defaults to the chunk cap and can be set lower with `max_scan_pages` in corpus limits. Metadata lookups have a separate upper bound of one per resolved section, and all discovery runs inside the existing scan and overall deadlines. A budget too small for one round can leave some sections unscanned. The deadline is cooperative at corpus-call boundaries.
+
+The initial scan makes zero provider calls or extra BM25 passes. BM25 remains the scoped `search_chunks` follow-up under the existing model tool and corpus limits. Its token-based ranking can surface passages that lack a contiguous configured phrase. Zero-candidate groups stay eligible for investigation. Candidate IDs and span hints confer no citation authority. Exact span delivery, reference-based synthesis, and source verification still use their existing paths. Missing or differently scoped prior-year evidence still cannot establish contradiction or novelty.
+
+| Offline canonical scope | Scan | Chunks / page reads / metadata reads | Candidate chunks | Known targets recovered |
+| --- | --- | ---: | ---: | ---: |
+| Amazon, Alphabet, Microsoft FY2023–FY2024 Item 1A | Eight literal terms | 321 / 35 / 6 | 15 | 2 of 9 |
+| Same sections | Normalized example phrases | 321 / 35 / 6 | 40 | 9 of 9 |
+| Apple and NVIDIA FY2024 Item 1A | Foreign currency phrases | 133 / 14 / 2 | 6 | No labeled set |
+
+The offline AI check uses seven assessed chunks from the Amazon–Alphabet validation and two Microsoft excerpts from the earlier investigation. The known targets informed the example phrases, so the comparison measures regression-target recovery. It does not estimate corpus recall, precision, or semantic correctness. The broader example produced more candidates and can surface incidental matches. The unrelated review found five candidates for Apple and one for NVIDIA without model assessment.
+
+```bash
+PYTHONPATH=Code/src python Code/examples/demo_rlm_discovery.py
+PYTHONPATH=Code/src python Code/examples/demo_rlm_comparative.py
+PYTHONPATH=Code/src python Code/examples/demo_rlm_comparative.py --fixed-terms
+```
+
+The research demos use normalized discovery by default. Repeat `--term` to supply phrases, or use `--fixed-terms` for the literal baseline. Verification passed **266 focused RLM tests** and **53 related regressions**, each with the existing AnyIO deprecation warning. Discovery, both comparative modes, full and limited corpus-wide research, the Amazon–Alphabet subset, planning, recursive, and Standard RAG demos passed offline. Live retrieval effects, generalized query selection, and independent semantic verification remain open.
 
 ## Ongoing engineering record
 

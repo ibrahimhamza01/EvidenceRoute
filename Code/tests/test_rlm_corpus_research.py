@@ -11,6 +11,7 @@ from evidenceroute.research.rlm import CorpusEnvironment
 from evidenceroute.research.rlm.budget import FinalizationPolicy, SharedLimits
 from evidenceroute.research.rlm.controller import ModelAttempt, RootLimits, ScriptedModelClient
 from evidenceroute.research.rlm.corpus_research import CorpusLimits, execute_corpus_research
+from evidenceroute.research.rlm.discovery import DiscoverySpec
 from evidenceroute.research.rlm.planning import interpret_intent, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.spans import passage_spans
@@ -144,12 +145,13 @@ def test_overall_allowances_settle_and_admit_against_remaining(corpus, cap, ceil
 def test_zero_candidates_and_unresolved_subset_keep_original_denominator(corpus):
     plan = resolve(corpus, ["NVDA", "NOTREAL", "AMD"])
     result = execute_corpus_research(plan, runner_for(corpus, plan), limits=overall(max_scan_chunks=3),
-                                     scan_terms=("unlikelyliteralfixture",))
+                                     discovery=DiscoverySpec.from_intent(plan.intent, ("unlikelyliteralfixture",)))
     assert result.plan is plan and result.coverage.required_target_count == 6
     assert result.coverage.missing_requirements == plan.missing_requirements and len(plan.resolved_targets) == 4
     assert [batch.companies for batch in result.batches] == [("AMD",), ("NVDA",)]
     assert result.groups[-1].pending_reason == "unresolved_requirements"
     assert result.scan.stop_reason == "chunk_limit" and result.usage.lexical_chunks_scanned == 3
+    assert result.usage.lexical_metadata_reads == result.scan.metadata_reads
     assert all(not row.candidates for row in result.scan.sections)
     assert result.usage.corpus_attempts == 4
     assert {ref.ticker for ref in result.citations} == {"AMD", "NVDA"}
