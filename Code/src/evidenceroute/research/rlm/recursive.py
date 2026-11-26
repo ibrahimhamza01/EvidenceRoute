@@ -11,7 +11,7 @@ from uuid import uuid4
 from pydantic import Field, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
-from evidenceroute.research.rlm.comparison import Comparison, CorpusScan, resolve_comparison
+from evidenceroute.research.rlm.comparison import CandidatePageRequest, Comparison, CorpusScan, render_comparisons, resolve_comparison
 from evidenceroute.research.rlm.controller import (
     ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction,
 )
@@ -56,6 +56,7 @@ class DelegationTrace:
     invocation: Invocation | None = None
     child: ExecutionTrace | None = None
     delivered_finding_ids: tuple[str, ...] = ()
+    initial_assignment: bool = False
 
 
 class RecursiveResearch:
@@ -67,6 +68,7 @@ class RecursiveResearch:
         finalization: FinalizationPolicy | None = None,
         child_guidance: str | None = None,
         comparison_scan: CorpusScan | None = None,
+        max_root_reinvestigation_calls: int | None = None,
         clock: Callable[[], float] = monotonic,
     ):
         self.corpus = corpus
@@ -77,11 +79,17 @@ class RecursiveResearch:
         self.finalization = finalization
         self.child_guidance = child_guidance
         self.comparison_scan = comparison_scan
+        if max_root_reinvestigation_calls is not None and (
+            type(max_root_reinvestigation_calls) is not int or max_root_reinvestigation_calls < 0
+        ):
+            raise ValueError("Root reinvestigation call limit must be a nonnegative integer.")
+        self.max_root_reinvestigation_calls = max_root_reinvestigation_calls
 
     def run(
         self, question: str, *, partitions: tuple[SectionTarget, ...] | None = None,
         run_id: str | None = None,
         root_delegation_groups: tuple[tuple[SectionTarget, ...], ...] | None = None,
+        delegation_first: bool = False,
     ) -> ExecutionTrace:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Research question must be a non-blank string.")
@@ -96,6 +104,15 @@ class RecursiveResearch:
             groups = frozenset(frozenset(group) for group in root_delegation_groups)
             if not groups or any(not group or not group.issubset(partitions or ()) for group in groups):
                 raise ValueError("Root delegation groups must be nonempty subsets of authorized pairs.")
+        if delegation_first:
+            if (not groups or len(groups) != len(root_delegation_groups)
+                    or any(len(group) != len(set(group)) for group in root_delegation_groups)
+                    or sum(map(len, groups)) != len(partitions or ()) or set().union(*groups) != set(partitions or ())):
+                raise ValueError("Delegation-first research requires disjoint whole groups covering the root scope.")
+            if len(groups) > self.shared_limits.max_delegations or self.shared_limits.max_depth < 1:
+                raise ValueError("Initial groups must fit the shared delegation and depth limits.")
+            budget.initial_delegations_left = len(groups)
+            budget.initial_partitions_left = len(partitions)
         invocation = Invocation(run_id or uuid4().hex, "root", None, 0, question, None, partitions)
         return self._invoke(invocation, budget, [], budget.deadline, groups)
 
@@ -142,19 +159,28 @@ class RecursiveResearch:
             prompt += f"\nInvestigation guidance: {self.child_guidance}"
         if partitions is not None:
             prompt += "\nAuthorized partitions: " + observation_json([vars(pair) for pair in partitions])
-        if self.comparison_scan is not None:
+        if self.comparison_scan is not None and not session.delegation_first:
             shortlist = self.comparison_scan.shortlist(partitions or ())
             prompt += (
-                "\nLexical candidates (chunk IDs only, at most three per section): " + observation_json(shortlist)
-                + "\nRead candidates and surrounding context as needed. Choose chunk_id and span_id from acknowledged "
+                "\nLexical candidates (IDs and span hints, at most three per section): " + observation_json(shortlist)
+                + "\nUse get_spans for matching passages and list_candidates with next_offset for more scoped IDs. "
+                "Read promising evidence in each fiscal "
+                "year and check the same risk in both filings. Choose chunk_id and span_id from acknowledged "
                 "evidence to create findings. To compare the same risk, reference your own findings by one-based index "
                 "in comparisons. Evaluate relevance to the topic separately from what the passage supports or contradicts. "
-                "Inspect possible counterevidence in the earlier year. If unclear, use remaining scoped tool calls to "
-                "investigate that specific uncertainty, then report any unresolved conflict or gap. No lexical miss proves absence."
+                "Accelerator demand alone does not establish an infrastructure risk. Explain the connection in the "
+                "assessment and state separately whether the exact source links it to AI infrastructure. "
+                "Mark relevance other or uncertain where appropriate and abstain if support is insufficient. "
+                "Investigate counterevidence and report gaps. No lexical miss proves absence."
             )
-        if invocation.depth < budget.limits.max_depth:
+        if session.delegation_first:
+            prompt += ("\nStart with one delegate_research call per company, keeping all its fiscal years together. "
+                       "Once every admitted group has an attempt, synthesize delivered results or investigate specific gaps.")
+        elif invocation.depth < budget.limits.max_depth:
             prompt += "\nUse delegate_research only for a narrower subproblem."
         evidence_instruction = ("source span IDs" if self.comparison_scan is not None else "exact quotes")
+        if self.comparison_scan is not None:
+            prompt += "\nUse structured comparisons for conclusions and keep the answer field brief."
         prompt += (
             f"\nSubmit findings via finish_research with {evidence_instruction} and original chunk IDs. "
             "Report uncertainty, conflicts and incomplete analysis. "
@@ -178,6 +204,8 @@ class RecursiveSession:
         self.clients = clients
         self.parent_deadline = parent_deadline
         self.root_groups = root_groups
+        self.delegation_first = invocation.depth == 0 and budget.initial_delegations_left > 0
+        self.unassigned_groups = set(root_groups or ()) if self.delegation_first else set()
         self.direct_ids: set[str] = set()
         self.direct_spans: dict[str, set[str]] = {}
         self.delivered_findings: dict[str, Finding] = {}
@@ -186,14 +214,52 @@ class RecursiveSession:
         self.used_finding_ids: tuple[str, ...] = ()
         self.analysis_status: AnalysisStatus = "incomplete"
 
-    def can_delegate(self) -> bool:
+    def can_delegate(self, *, initial_assignment: bool = False) -> bool:
         if self.invocation.depth and len(self.invocation.partitions or ()) <= 1:
             return False
+        groups = self.root_groups if self.delegation_first else None
+        if initial_assignment:
+            groups = self.unassigned_groups
+        if initial_assignment and not groups:
+            return False
         try:
-            self.budget.check_child(self.invocation.depth + 1, 1)
+            self.budget.check_child(self.invocation.depth + 1, min(map(len, groups)) if groups else 1,
+                                    initial_assignment=initial_assignment)
         except BudgetExceeded:
             return False
         return True
+
+    def candidate_schema(self) -> dict | None:
+        if self.runner.comparison_scan is None or self.invocation.partitions is None:
+            return None
+        return {
+            "name": "list_candidates",
+            "description": "Page through precomputed lexical candidate IDs and span hints for one authorized section. "
+                           "Use get_spans to read and cite exact evidence.",
+            "input_schema": CandidatePageRequest.model_json_schema(),
+        }
+
+    def list_candidates(self, arguments: dict) -> DispatchResult:
+        scan = self.runner.comparison_scan
+        cap = self.runner.local_limits.max_response_bytes
+        if scan is None or self.invocation.partitions is None:
+            return DispatchResult(None, error_observation("unknown_tool", "Candidate pages require a scoped scan.", cap))
+        try:
+            request = CandidatePageRequest.model_validate(arguments)
+        except ValidationError as exc:
+            return DispatchResult(None, error_observation("invalid_arguments", validation_message(exc), cap))
+        validated = request.model_dump(mode="json")
+        pair = SectionTarget(request.document_id, request.section_id)
+        try:
+            if pair not in self.invocation.partitions:
+                raise KeyError(pair)
+            page = scan.candidate_page(pair, request.offset, request.limit)
+        except KeyError:
+            return DispatchResult(validated, error_observation("unknown_id", "No candidate inventory for this section.", cap))
+        content = observation_json({"ok": True, "result": page})
+        if len(content.encode("utf-8")) > cap:
+            content = error_observation("response_too_large", "Try a smaller candidate page at the same offset.", cap)
+        return DispatchResult(validated, content)
 
     def tool_schema(self) -> dict:
         return {
@@ -202,18 +268,20 @@ class RecursiveSession:
                 "Investigate a narrower question in a fresh conversation with exact document and section pairs. "
                 f"Current depth {self.invocation.depth}, maximum {self.budget.limits.max_depth}. "
                 "All delegates share the run budget. Returned findings include original excerpts and coverage."
-            ),
+            ) + (" Use one whole admitted company group." if self.root_groups is not None else ""),
             "input_schema": _Delegate.model_json_schema(),
         }
 
-    def delegate(self, arguments: dict, deadline: float) -> tuple[DispatchResult, DelegationTrace]:
+    def delegate(
+        self, arguments: dict, deadline: float, *, initial_assignment: bool = False,
+    ) -> tuple[DispatchResult, DelegationTrace]:
         cap = self.runner.local_limits.max_response_bytes
         validated = None
         invocation = None
 
         def reject(code: str, message: str, *, status: Literal["rejected", "failed"] = "rejected"):
             return (DispatchResult(validated, error_observation(code, message, cap)),
-                    DelegationTrace(status, code, invocation=invocation))
+                    DelegationTrace(status, code, invocation=invocation, initial_assignment=initial_assignment))
 
         try:
             request = _Delegate.model_validate(arguments)
@@ -221,25 +289,31 @@ class RecursiveSession:
             return reject("invalid_arguments", validation_message(exc))
         validated = request.model_dump(mode="json")
         pairs = tuple(SectionTarget(p.document_id, p.section_id) for p in request.partitions)
+        group = frozenset(pairs)
         parent_pairs = self.invocation.partitions
         depth = self.invocation.depth + 1
         try:
-            self.budget.check_child(depth, len(pairs))
-            if parent_pairs is not None and not set(pairs).issubset(parent_pairs):
+            if not initial_assignment:
+                self.budget.check_child(depth, len(pairs))
+            if parent_pairs is not None and not group.issubset(parent_pairs):
                 return reject("scope_violation", "Delegate only authorized document and section pairs.")
-            if self.root_groups is not None and frozenset(pairs) not in self.root_groups:
+            if self.root_groups is not None and group not in self.root_groups:
                 return reject("group_violation", "Delegate one whole admitted company group at a time.")
-            if self.invocation.depth > 0 and set(pairs) == set(parent_pairs or ()):
+            if initial_assignment and group not in self.unassigned_groups:
+                return reject("duplicate_initial_assignment", "Choose a whole company group without an initial attempt.")
+            if self.invocation.depth > 0 and group == frozenset(parent_pairs or ()):
                 return reject("scope_violation", "A descendant must delegate a strict subset.")
             self.runner._validate_partitions(pairs)
             if self.runner.clock() >= deadline:
                 raise BudgetExceeded("deadline")
-            number = self.budget.reserve_child(depth, len(pairs))
+            number = self.budget.reserve_child(depth, len(pairs), initial_assignment=initial_assignment)
         except BudgetExceeded as exc:
             return reject(str(exc), "Shared budget does not permit this delegation.")
         except (KeyError, ValueError):
             return reject("invalid_partitions", "Use unique canonical document and section pairs.")
 
+        if initial_assignment:
+            self.unassigned_groups.remove(group)
         invocation = Invocation(self.invocation.run_id, f"child-{number}", self.invocation.invocation_id,
                                 depth, request.question, request.goal, pairs)
         try:
@@ -267,7 +341,7 @@ class RecursiveSession:
         if not successful:
             body["error"] = {"code": "child_not_finished", "message": "Inspect the child stop reason and coverage."}
         content = observation_json(body)
-        delegation = DelegationTrace(status, invocation=invocation, child=child)
+        delegation = DelegationTrace(status, invocation=invocation, child=child, initial_assignment=initial_assignment)
         if len(content.encode("utf-8")) > cap:
             delegation.status = "oversized"
             delegation.error = "response_too_large"
@@ -281,7 +355,8 @@ class RecursiveSession:
 
     def record_delivery(self, step: ToolTrace) -> None:
         if step.delegation is None:
-            self.direct_ids.update(ref.chunk_id for ref in step.evidence)
+            if step.tool_name != "get_spans":
+                self.direct_ids.update(ref.chunk_id for ref in step.evidence)
             for chunk_id, spans in (step.observation or {}).get("span_ids", {}).items():
                 self.direct_spans.setdefault(chunk_id, set()).update(spans)
         elif step.delegation.child is not None and step.delegation.status in {"finished", "incomplete"}:
@@ -299,7 +374,7 @@ class RecursiveSession:
         used_evidence = [item for finding_id in used for item in self.delivered_findings[finding_id].evidence]
         selected_ids = {item.source.chunk_id for item in used_evidence}
         cited = set(action.cited_chunk_ids)
-        if not cited.issubset(self.direct_ids | selected_ids):
+        if not cited.issubset(self.direct_ids | self.direct_spans.keys() | selected_ids):
             return "Declare the delivered finding IDs used by delegated citations."
 
         findings = []
@@ -354,8 +429,13 @@ class RecursiveSession:
                 return str(exc)
         self.findings = tuple(findings)
         self.used_finding_ids = used
-        self.analysis_status = (action.analysis_status or "incomplete") if referenced else "incomplete"
+        self.analysis_status = (action.analysis_status or "incomplete") if referenced and not self.unassigned_groups else "incomplete"
         return None
+
+    def render_answer(self, draft: str) -> str:
+        if self.runner.comparison_scan is not None:
+            return render_comparisons(self.comparisons)
+        return draft
 
     def trace_fields(self, coverage: CoverageReport) -> dict:
         partitions = tuple(PartitionCoverage(pair, partition_status(coverage, pair))

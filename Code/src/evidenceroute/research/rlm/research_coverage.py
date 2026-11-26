@@ -56,6 +56,7 @@ class TargetCoverage:
     section_character_count: int
     section_text_complete: bool
     delegated_excerpt_chunk_ids: tuple[str, ...]
+    direct_span_chunk_ids: tuple[str, ...]
     generated_finding_ids: tuple[str, ...]
     acknowledged_finding_ids: tuple[str, ...]
     used_finding_ids: tuple[str, ...]
@@ -79,6 +80,7 @@ class _Access:
     discovered: set[str] = field(default_factory=set)
     ranges: list[tuple[int, int]] = field(default_factory=list)
     excerpts: set[str] = field(default_factory=set)
+    direct_spans: set[str] = field(default_factory=set)
     assigned: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     generated: set[str] = field(default_factory=set)
@@ -158,6 +160,11 @@ def aggregate_research_coverage(
                         end = start + len(result["text"])
                         target.ranges.append((start, end))
                         windows.append(SectionAccess(pair, start, end))
+                elif operation.tool_name == "get_spans":
+                    for ref in operation.evidence:
+                        target = access.get(SectionTarget(ref.document_id, ref.section_id))
+                        if target is not None:
+                            target.direct_spans.add(ref.chunk_id)
 
         outcomes.append(InvocationOutcome(
             invocation, run.stop_reason if run else None, run.budget_stop if run else None,
@@ -184,11 +191,12 @@ def aggregate_research_coverage(
         ranges = _merge_ranges(seen.ranges)
         chunks_complete = len(seen.chunks) == meta.chunk_count
         text_complete = ranges == ((0, meta.char_count),)
-        status = "complete" if chunks_complete or text_complete else "partial" if seen.chunks or ranges else "none"
+        status = "complete" if chunks_complete or text_complete else "partial" if seen.chunks or ranges or seen.direct_spans else "none"
         targets.append(TargetCoverage(
             pair, meta.ticker, meta.fiscal_year, pair in admitted, tuple(seen.assigned), tuple(seen.failed),
             status, tuple(sorted(seen.discovered)), tuple(sorted(seen.chunks)), meta.chunk_count, chunks_complete,
-            ranges, meta.char_count, text_complete, tuple(sorted(seen.excerpts)), tuple(sorted(seen.generated)),
+            ranges, meta.char_count, text_complete, tuple(sorted(seen.excerpts)), tuple(sorted(seen.direct_spans)),
+            tuple(sorted(seen.generated)),
             tuple(sorted(seen.acknowledged)), tuple(sorted(seen.used)),
         ))
     return ResearchCoverage(tuple(targets), plan.missing_requirements, tuple(outcomes), tuple(rejected))

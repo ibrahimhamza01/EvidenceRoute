@@ -159,15 +159,17 @@ def _acknowledged_findings(step):
 def _evidence_delivery(trace):
     direct = sorted({
         ref.chunk_id for step in _operations(trace)
-        if step.observation_sent and not step.delivery_error and step.delegation is None
+        if step.observation_sent and not step.delivery_error and step.delegation is None and step.tool_name != "get_spans"
         for ref in step.evidence
     })
+    spans = sorted({ref.chunk_id for step in _operations(trace) if step.tool_name == "get_spans"
+                    and step.observation_sent and not step.delivery_error for ref in step.evidence})
     excerpts = [
         {"finding_id": finding.finding_id, "declared_used": finding.finding_id in trace.used_finding_ids,
          **asdict(item)}
         for step in _operations(trace) for finding in _acknowledged_findings(step) for item in finding.evidence
     ]
-    return {"direct_chunk_text_ids": direct, "delegated_excerpts": excerpts}
+    return {"direct_chunk_text_ids": direct, "direct_span_chunk_ids": spans, "delegated_excerpts": excerpts}
 
 
 def _invocation_report(trace, detailed):
@@ -177,6 +179,7 @@ def _invocation_report(trace, detailed):
         "budget_stop": trace.budget_stop,
         "model_reported_analysis_status": trace.analysis_status,
         "coverage_status": trace.coverage_status,
+        "initial_assignment_stop": trace.initial_assignment_stop,
         "partition_coverage": [asdict(item) for item in trace.partition_coverage],
         "inclusive_wall_seconds": trace.elapsed_seconds,
         "model_decisions": len(trace.steps),
@@ -201,6 +204,7 @@ def _invocation_report(trace, detailed):
         report["delegations"].append({
             "request": step.validated_arguments,
             "status": delegation.status,
+            "initial_assignment": delegation.initial_assignment,
             "error": delegation.error,
             "invocation": asdict(delegation.invocation) if delegation.invocation else None,
             "observation_acknowledged": step.observation_sent,
@@ -224,13 +228,17 @@ def _invocation_report(trace, detailed):
         "error": operation.error,
         "delivery_error": operation.delivery_error,
         "observation_acknowledged": operation.observation_sent,
+        "generated_observation_bytes": operation.observation_bytes,
         "search_discovered_chunk_ids": [ref.chunk_id for ref in operation.search_discovered],
         "generated_observation_chunk_ids": [ref.chunk_id for ref in operation.evidence],
+        **({"candidate_chunk_ids": (operation.observation or {}).get("result", {}).get("chunks", [])}
+           if operation.tool_name == "list_candidates" else {}),
     } for step in trace.steps for operation in step.operations]
     if detailed:
         report["steps"] = [{
             "iteration": step.iteration,
             "phase": step.phase,
+            "assignment_stage": step.assignment_stage,
             "finalization_reason": step.finalization_reason,
             "requested_action": step.requested_action,
             "validated_arguments": step.validated_arguments,

@@ -6,7 +6,9 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 from evidenceroute.research.rlm.budget import SharedBudget
+from evidenceroute.research.rlm.comparison import Comparison, render_comparisons
 from evidenceroute.research.rlm.controller import ExecutionTrace
+from evidenceroute.research.rlm.findings import Finding
 from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.research_coverage import AccessStatus, ResearchCoverage, aggregate_research_coverage
@@ -21,6 +23,24 @@ class GroupOutcome:
     failed_invocation_ids: tuple[str, ...]
     access_status: AccessStatus
     findings_acknowledged_by_root: tuple[str, ...]
+    admitted: bool
+    assignment_status: Literal["unresolved", "not_admitted", "unassigned", "completed", "failed"]
+    initial_invocation_id: str | None
+    initial_result_acknowledged: bool
+    result_acknowledged: bool
+    assignment_pending_reason: str | None
+
+
+@dataclass(frozen=True)
+class PartialComparativeResult:
+    answer: str
+    child_findings: tuple[Finding, ...]
+    child_comparisons: tuple[Comparison, ...]
+    failed_groups: tuple[str, ...]
+    targets_by_access: dict[AccessStatus, int]
+    unresolved_targets: int
+    status: Literal["acknowledged_child_evidence"] = "acknowledged_child_evidence"
+    root_synthesis: Literal[False] = False
 
 
 @dataclass(frozen=True)
@@ -32,15 +52,48 @@ class PlannedResearchResult:
     citations: tuple[EvidenceRef, ...]
     answer_status: Literal["incomplete", "unverified"]
 
+    @property
+    def acknowledged_comparisons(self) -> tuple[Comparison, ...]:
+        comparisons = []
+        for step in self.trace.steps if self.trace else ():
+            for operation in step.operations:
+                edge = operation.delegation
+                if not edge or not edge.child or not operation.observation_sent or operation.delivery_error:
+                    continue
+                delivered = set(edge.delivered_finding_ids)
+                comparisons.extend(item for item in edge.child.comparisons if delivered.issuperset(item.finding_ids))
+        return tuple(comparisons)
+
+    @property
+    def partial_comparative_result(self) -> PartialComparativeResult | None:
+        if not self.trace or self.trace.stop_reason == "finished":
+            return None
+        findings = tuple(finding for child in self.coverage.invocations if child.invocation.parent_id == "root"
+                         for finding in child.findings if finding.finding_id in child.findings_acknowledged_by_parent)
+        if not findings:
+            return None
+        comparisons = self.acknowledged_comparisons
+        return PartialComparativeResult(
+            "Partial result from acknowledged child evidence. Root synthesis did not finish.\n" + render_comparisons(comparisons),
+            findings, comparisons,
+            tuple(group.ticker for group in self.groups if group.assignment_status == "failed" and not group.result_acknowledged),
+            {status: sum(target.status == status for target in self.coverage.targets)
+             for status in ("none", "partial", "complete")},
+            len(self.coverage.missing_requirements),
+        )
+
 
 def execute_research_plan(
     plan: ResearchPlan, runner: RecursiveResearch, *, max_groups: int = 2, root_guidance: str | None = None,
+    delegation_first: bool | None = None,
 ) -> PlannedResearchResult:
     if type(max_groups) is not int or max_groups < 0:
         raise ValueError("max_groups must be a nonnegative integer.")
 
     limits = runner.shared_limits
     local = runner.local_limits
+    if delegation_first is None:
+        delegation_first = plan.intent.comprehensive
     # Preflight with the same allocation rules as the runner, including slots
     # held for prospective children even when fewer groups are selected.
     preflight = SharedBudget(limits, finalization=runner.finalization)
@@ -48,7 +101,9 @@ def execute_research_plan(
         allocation = preflight.active_allocation
         investigation_turns = allocation.investigation_left if allocation else limits.max_provider_attempts - 1
     finish_decisions = allocation.finalization_left if allocation else 1
-    root_slots = min(local.max_tool_calls, MAX_TOOL_BATCH * min(local.max_iterations - finish_decisions, investigation_turns))
+    assignments_per_turn = 1 if delegation_first else MAX_TOOL_BATCH
+    root_slots = min(local.max_tool_calls,
+                     assignments_per_turn * min(local.max_iterations - finish_decisions, investigation_turns))
 
     unresolved = {entry.company for entry in plan.missing_requirements}
     pending: dict[str, str] = {}
@@ -89,7 +144,8 @@ def execute_research_plan(
         if root_guidance:
             question += f"\nSynthesis guidance: {root_guidance}"
         trace = runner.run(question, partitions=tuple(pair for group in admitted for pair in group.targets),
-                           root_delegation_groups=tuple(group.targets for group in admitted))
+                           root_delegation_groups=tuple(group.targets for group in admitted),
+                           delegation_first=delegation_first)
 
     coverage = aggregate_research_coverage(runner.corpus, plan, trace)
     by_pair = {target.pair: target for target in coverage.targets}
@@ -98,19 +154,38 @@ def execute_research_plan(
         if outcome.invocation.parent_id == "root":
             root_delegations.setdefault(frozenset(outcome.invocation.partitions or ()), []).append(outcome)
 
+    admitted_tickers = {group.ticker for group in admitted}
+    resolved = {group.ticker: group for group in plan.groups}
     groups = []
-    for group in plan.groups:
-        delegates = root_delegations.get(frozenset(group.targets), ())
-        targets = [by_pair[pair] for pair in group.targets]
+    for ticker in plan.requested_companies:
+        pairs = resolved[ticker].targets if ticker in resolved else ()
+        delegates = root_delegations.get(frozenset(pairs), ())
+        first = delegates[0] if delegates else None
+        acknowledged = {child.invocation.invocation_id for child in delegates
+                        if child.parent_acknowledged and child.delegation_status in {"finished", "incomplete"}}
+        is_admitted = ticker in admitted_tickers
+        if ticker in unresolved:
+            assignment_status = "unresolved"
+        elif not is_admitted:
+            assignment_status = "not_admitted"
+        elif first is None:
+            assignment_status = "unassigned"
+        else:
+            assignment_status = "completed" if first.stop_reason == "finished" else "failed"
+        targets = [by_pair[pair] for pair in pairs]
         status = "none"
-        if targets and all(target.status == "complete" for target in targets) and group.ticker not in unresolved:
+        if targets and all(target.status == "complete" for target in targets) and ticker not in unresolved:
             status = "complete"
         elif any(target.status != "none" for target in targets):
             status = "partial"
         groups.append(GroupOutcome(
-            group.ticker, pending.get(group.ticker), tuple(child.invocation.invocation_id for child in delegates),
+            ticker, "unresolved_requirements" if ticker in unresolved else pending.get(ticker),
+            tuple(child.invocation.invocation_id for child in delegates),
             tuple(sorted({invocation_id for target in targets for invocation_id in target.failed_invocation_ids})),
             status, tuple(finding_id for child in delegates for finding_id in child.findings_acknowledged_by_parent),
+            is_admitted, assignment_status, first.invocation.invocation_id if first else None,
+            bool(first and first.invocation.invocation_id in acknowledged), bool(acknowledged),
+            (trace.initial_assignment_stop or "no_initial_attempt") if trace and assignment_status == "unassigned" else None,
         ))
 
     citations = tuple(ref for ref in trace.coverage.visible_chunks if ref.chunk_id in trace.cited_chunk_ids) if trace else ()

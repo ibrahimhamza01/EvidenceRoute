@@ -13,7 +13,14 @@ from evidenceroute.research.rlm.environment import MAX_CHUNK_ROWS, CorpusEnviron
 from evidenceroute.research.rlm.findings import Finding
 from evidenceroute.research.rlm.planning import ResearchPlan
 from evidenceroute.research.rlm.spans import passage_spans
-from evidenceroute.research.rlm.tools import StrictInput
+from evidenceroute.research.rlm.tools import Identifier, StrictInput
+
+
+class CandidatePageRequest(StrictInput):
+    document_id: Identifier
+    section_id: Identifier
+    offset: int = Field(default=0, ge=0, description="Use next_offset from the shortlist or a candidate page.")
+    limit: int = Field(default=5, ge=1, le=10)
 
 
 @dataclass(frozen=True)
@@ -47,8 +54,27 @@ class CorpusScan:
         authorized = set(pairs)
         return [{"ticker": row.ticker, "fiscal_year": row.fiscal_year, "section_id": row.pair.section_id,
                  "document_id": row.pair.document_id, "candidate_count": len(row.candidates),
-                 "chunks": [item.chunk_id for item in row.candidates[:per_section]]}
+                 "chunks": [item.chunk_id for item in row.candidates[:per_section]],
+                 "matching_span_ids": self._span_hints(row.candidates[:per_section]),
+                 "next_offset": per_section if len(row.candidates) > per_section else None}
                 for row in self.sections if row.pair in authorized]
+
+    def candidate_page(self, pair: SectionTarget, offset: int, limit: int) -> dict:
+        row = next((row for row in self.sections if row.pair == pair), None)
+        if row is None:
+            raise KeyError(pair)
+        end = offset + limit
+        hits = row.candidates[offset:end]
+        return {
+            "ticker": row.ticker, "fiscal_year": row.fiscal_year, "document_id": pair.document_id,
+            "section_id": pair.section_id, "candidate_count": len(row.candidates), "offset": offset,
+            "chunks": [item.chunk_id for item in hits], "matching_span_ids": self._span_hints(hits),
+            "next_offset": end if end < len(row.candidates) else None,
+        }
+
+    @staticmethod
+    def _span_hints(candidates: tuple[Candidate, ...]) -> dict:
+        return {hit.chunk_id: hit.matching_span_ids[:4] for hit in candidates if hit.matching_span_ids}
 
 
 def scan_research_plan(corpus: CorpusEnvironment, plan: ResearchPlan, terms: tuple[str, ...], *,
@@ -98,10 +124,18 @@ class EvidenceAssessment(StrictInput):
     relevance: Literal["infrastructure", "other", "uncertain"]
     entailment: Literal["supports", "contradicts", "uncertain"]
     rationale: str = Field(min_length=1, max_length=250)
+    infrastructure_connection: str | None = Field(default=None, min_length=1, max_length=250, description=(
+        "For infrastructure relevance, explain how the cited span links to the specific risk mechanism. "
+        "Accelerator demand alone is insufficient. Relevance without this connection is treated as uncertain."
+    ))
+    ai_specific_connection: str | None = Field(default=None, min_length=1, max_length=250, description=(
+        "If supported by this exact source span, describe how the risk mechanism specifically affects AI infrastructure. "
+        "Leave empty for general infrastructure exposure or unrelated AI demand."
+    ))
 
 
 class ComparisonDraft(StrictInput):
-    risk: str = Field(min_length=1, max_length=250)
+    risk: str = Field(min_length=1, max_length=250, description="Neutral mechanism label. Leave novelty to the structured assessment.")
     same_risk: Literal["yes", "no", "uncertain"]
     assessments: list[EvidenceAssessment] = Field(min_length=1, max_length=8)
 
@@ -116,6 +150,9 @@ class Comparison:
     assessments: tuple[EvidenceAssessment, ...]
     finding_ids: tuple[str, ...]
     assessed_chunk_ids: tuple[str, ...]
+    evidence_years: tuple[int, ...]
+    both_years_contributed: bool
+    ai_specific_years: tuple[int, ...]
 
 
 def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: tuple[int, int]) -> Comparison:
@@ -128,10 +165,13 @@ def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: t
         raise ValueError("A comparison must use evidence from one company and the requested years.")
     if any(not item.span_id for finding in selected for item in finding.evidence):
         raise ValueError("Comparison assessments require source-backed spans.")
-    supported = {finding.evidence[0].source.fiscal_year for assessment, finding in zip(draft.assessments, selected)
+    assessments = tuple(item.model_copy(update={"relevance": "uncertain"})
+                        if item.relevance == "infrastructure" and not item.infrastructure_connection else item
+                        for item in draft.assessments)
+    supported = {finding.evidence[0].source.fiscal_year for assessment, finding in zip(assessments, selected)
                  if assessment.relevance == "infrastructure" and assessment.entailment == "supports"}
     contradicts = any(item.relevance == "infrastructure" and item.entailment == "contradicts"
-                      for item in draft.assessments)
+                      for item in assessments)
     if (supported and contradicts) or any(f.analysis_status == "conflicting" for f in selected):
         outcome = "conflicting"
     elif supported == set(years) and draft.same_risk == "yes":
@@ -140,5 +180,28 @@ def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: t
         outcome = "possible_new_needs_review"
     else:
         outcome = "insufficient"
-    return Comparison(draft.risk, sources[0].ticker, years, outcome, draft.same_risk, tuple(draft.assessments),
-                      tuple(f.finding_id for f in selected), tuple(sorted({s.chunk_id for s in sources})))
+    evidence_years = tuple(sorted({source.fiscal_year for source in sources}))
+    ai_years = {finding.evidence[0].source.fiscal_year for assessment, finding in zip(assessments, selected)
+                if assessment.relevance == "infrastructure" and assessment.entailment == "supports"
+                and assessment.ai_specific_connection}
+    return Comparison(draft.risk, sources[0].ticker, years, outcome, draft.same_risk, assessments,
+                      tuple(f.finding_id for f in selected), tuple(sorted({s.chunk_id for s in sources})),
+                      evidence_years, evidence_years == years, tuple(sorted(ai_years)))
+
+
+def render_comparisons(comparisons: tuple[Comparison, ...] | list[Comparison]) -> str:
+    """Render conclusions from validated outcomes without adopting model-drafted prose."""
+    lines = []
+    for item in comparisons:
+        earlier, later = (f"FY{year}" for year in item.years)
+        conclusion = {
+            "comparable_both_years": f"The assessed spans support the same underlying infrastructure risk in {earlier} and {later}.",
+            "possible_new_needs_review": f"The assessed spans support a risk in {later}. Whether it is new remains unresolved.",
+            "conflicting": "The assessed evidence is conflicting. Novelty remains unresolved.",
+            "insufficient": "The assessed evidence is insufficient to establish novelty.",
+        }[item.outcome]
+        ai_years = ", ".join(f"FY{year}" for year in item.ai_specific_years)
+        ai = (f"Model assessments identify an AI-specific connection in {ai_years}." if ai_years
+              else "The assessments leave an AI-specific connection unestablished.")
+        lines.append(f"{item.ticker} ({earlier} and {later}). {conclusion} {ai}")
+    return "\n".join(lines) if lines else "No validated structured comparison was produced."

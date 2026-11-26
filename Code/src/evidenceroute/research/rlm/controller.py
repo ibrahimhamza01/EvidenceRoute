@@ -153,6 +153,9 @@ class ModelAttempt:
     provider_latency_seconds: float | None = None
     response_received: bool = False
     provider_stop_reason: str | None = None
+    request_bytes: int | None = None
+    estimated_tokens: int | None = None
+    timeout_seconds: float | None = None
 
 
 @dataclass(kw_only=True)
@@ -170,10 +173,12 @@ class ToolTrace:
     error: dict | None = None
     delegation: DelegationTrace | None = None
     delivery_error: str | None = None
+    observation_bytes: int | None = None
 
     def record(self, result: DispatchResult) -> None:
         self.validated_arguments = trace_data(result.arguments)
         self.observation = json.loads(result.content)
+        self.observation_bytes = len(result.content.encode("utf-8"))
         self.error = self.observation.get("error")
         self.evidence = result.evidence
         self.search_discovered = result.search_discovered
@@ -189,6 +194,7 @@ class StepTrace(ToolTrace):
     batch_operations: tuple[ToolTrace, ...] = ()
     phase: Literal["investigation", "finalization"] = "investigation"
     finalization_reason: str | None = None
+    assignment_stage: Literal["assignment", "synthesis", "incomplete_finalization"] | None = None
 
     @property
     def operations(self) -> tuple[ToolTrace, ...]:
@@ -215,6 +221,7 @@ class ExecutionTrace:
     partition_coverage: tuple[PartitionCoverage, ...] = ()
     coverage_status: Literal["unknown", "complete", "partial", "missing"] | None = None
     comparisons: tuple[Comparison, ...] = ()
+    initial_assignment_stop: str | None = None
 
     @property
     def model_attempts(self) -> tuple[ModelAttempt, ...]:
@@ -232,6 +239,7 @@ class RootController:
         self._model = model
         self._limits = limits if limits is not None else RootLimits()
         self._clock = clock
+        self._comparative = include_spans
         self._dispatcher = CorpusToolDispatcher(corpus, max_response_bytes=self._limits.max_response_bytes,
                                                 include_spans=include_spans)
 
@@ -254,10 +262,18 @@ class RootController:
         citations: tuple[str, ...] = ()
         stop: StopReason = "iteration_limit"
         budget_stop = None
-        tools = tool_schemas(max_response_bytes=self._limits.max_response_bytes)
-        if _recursive is not None and _recursive.invocation.depth < _recursive.budget.limits.max_depth:
-            tools.append(_recursive.tool_schema())
+        tools = tool_schemas(max_response_bytes=self._limits.max_response_bytes, comparative=self._comparative)
+        if self._comparative and scope.required_sections:
+            tools = [tool for tool in tools if tool["name"] not in {"list_companies", "list_filings", "get_filing", "list_sections"}]
+        if _recursive is not None:
+            if _recursive.invocation.depth < _recursive.budget.limits.max_depth:
+                tools.append(_recursive.tool_schema())
+            candidate_tool = _recursive.candidate_schema()
+            if candidate_tool is not None:
+                tools.append(candidate_tool)
         finalization_reason = None
+        tool_limit = self._limits.max_tool_calls
+        reinvestigation_limit = _recursive.runner.max_root_reinvestigation_calls if _recursive else None
 
         for iteration in range(1, self._limits.max_iterations + 1):
             model_start = self._clock()
@@ -265,46 +281,79 @@ class RootController:
                 stop = "deadline"
                 break
             offered_tools = tools
-            if _recursive is not None and _recursive.budget.active_allocation is not None:
+            assignment_stage = None
+            if _recursive is not None:
                 budget = _recursive.budget
                 allocation = budget.active_allocation
-                tool_slots = self._limits.max_tool_calls - calls
+                unassigned = bool(_recursive.unassigned_groups)
+                if _recursive.delegation_first and not unassigned and reinvestigation_limit is not None:
+                    tool_limit = min(tool_limit, calls + reinvestigation_limit)
+                    reinvestigation_limit = None
+                tool_slots = tool_limit - calls
+                reinvestigation_exhausted = not tool_slots and tool_limit < self._limits.max_tool_calls
                 corpus_slots = budget.limits.max_corpus_attempts - budget.corpus_attempts
-                can_delegate = _recursive.can_delegate()
-                if finalization_reason is None:
-                    if not allocation.investigation_left:
+                can_delegate = (allocation is not None or unassigned) and _recursive.can_delegate(initial_assignment=unassigned)
+                if finalization_reason is None and (allocation is not None or unassigned or reinvestigation_exhausted):
+                    if allocation is not None and not allocation.investigation_left:
                         finalization_reason = "investigation_attempt_limit"
+                    elif unassigned and allocation is None and 0 < budget.provider_attempts == budget.limits.max_provider_attempts - 1:
+                        finalization_reason = "reserved_last_provider_attempt"
                     elif not tool_slots:
-                        finalization_reason = "tool_call_limit"
+                        finalization_reason = "root_reinvestigation_limit" if reinvestigation_exhausted else "tool_call_limit"
+                    elif unassigned and not can_delegate:
+                        finalization_reason = "initial_assignment_unavailable"
                     elif not corpus_slots and not can_delegate:
                         finalization_reason = "corpus_attempt_limit"
-                    elif self._limits.max_iterations - iteration + 1 <= allocation.finalization_left:
+                    elif self._limits.max_iterations - iteration + 1 <= (allocation.finalization_left if allocation else 1):
                         finalization_reason = "reserved_local_decisions"
-                allocation.finalizing = finalization_reason is not None
-                if allocation.finalizing and not allocation.finalization_left:
-                    stop, budget_stop = "budget_exhausted", "finalization_attempt_limit"
-                    break
-                offered_tools = [] if allocation.finalizing else [
-                    tool for tool in tools if (can_delegate if tool["name"] == "delegate_research" else corpus_slots)
-                ]
-                if allocation.finalizing:
+                if allocation is not None:
+                    allocation.finalizing = finalization_reason is not None
+                    if allocation.finalizing and not allocation.finalization_left:
+                        stop, budget_stop = "budget_exhausted", "finalization_attempt_limit"
+                        break
+                if finalization_reason:
+                    offered_tools = []
                     notice = (
                         f"Finalization only ({finalization_reason}). Call finish_research now using delivered "
                         "evidence. Keep the answer and findings concise; put quotes in findings without repeating "
                         "them in the answer. If evidence is insufficient, report an incomplete result or abstain."
                     )
-                else:
+                elif unassigned:
+                    offered_tools = [tool for tool in tools if tool["name"] == "delegate_research"]
                     notice = (
+                        f"Initial assignment has {len(_recursive.unassigned_groups)} unassigned company group(s). "
+                        "Use delegate_research for one unassigned whole group per turn. Keep its fiscal years together."
+                    )
+                else:
+                    notice = ""
+                if allocation is not None and not finalization_reason:
+                    if not unassigned:
+                        offered_tools = [tool for tool in tools if (
+                            can_delegate if tool["name"] == "delegate_research" else corpus_slots
+                        )]
+                    notice += (" " if notice else "") + (
                         f"Investigation: {allocation.investigation_left} provider attempt(s) for this invocation, "
                         f"{tool_slots} local tool slot(s), {corpus_slots} shared corpus attempt(s), "
                         f"{budget.limits.max_provider_attempts - budget.provider_attempts} shared provider attempt(s) "
                         f"including reserves, {budget.limits.max_reported_tokens - budget.reported_tokens} "
                         f"reported-token headroom, {deadline - model_start:.0f}s remaining. "
-                        f"{allocation.finalization_left} attempt(s) reserved for this invocation's finish. "
-                        "Finish once the evidence is sufficient."
+                        f"{allocation.finalization_left} attempt(s) reserved for this invocation's finish."
                     )
+                    if not unassigned:
+                        notice += " Finish once the evidence is sufficient."
+                if _recursive.delegation_first:
+                    if not unassigned:
+                        assignment_stage = "synthesis"
+                    elif finalization_reason:
+                        assignment_stage = "incomplete_finalization"
+                        notice += f" Report that {len(_recursive.unassigned_groups)} admitted group(s) had no attempt."
+                    else:
+                        assignment_stage = "assignment"
+                    set_finish = getattr(self._model, "set_finish_allowed", None)
+                    if callable(set_finish):
+                        set_finish(assignment_stage != "assignment")
                 notify = getattr(self._model, "set_research_budget_notice", None)
-                if callable(notify):
+                if callable(notify) and (allocation is not None or _recursive.delegation_first):
                     notify(notice)
             if _recursive is not None:
                 try:
@@ -315,7 +364,7 @@ class RootController:
                     break
             step = StepTrace(
                 iteration, phase="finalization" if finalization_reason else "investigation",
-                finalization_reason=finalization_reason,
+                finalization_reason=finalization_reason, assignment_stage=assignment_stage,
             )
             steps.append(step)
             prior = steps[-2] if pending is not None else replayed_observation
@@ -325,10 +374,15 @@ class RootController:
                     question, offered_tools, pending, remaining_seconds=deadline - model_start,
                 )
             except BudgetExceeded as exc:
-                budget_stop = str(exc)
-                stop = "deadline" if budget_stop == "deadline" else "budget_exhausted"
-                step.error = {"code": budget_stop}
-                break
+                code = str(exc)
+                step.error = {"code": code}
+                prepare_replay = getattr(self._model, "prepare_request_replay", None)
+                recovering = code == "investigation_token_headroom" and callable(prepare_replay) and prepare_replay()
+                if not recovering:
+                    budget_stop = code
+                    stop = "deadline" if code == "deadline" else "budget_exhausted"
+                    break
+                finalization_reason = code
             except Exception as exc:
                 timed_out = self._clock() >= deadline
                 allocation = _recursive.budget.active_allocation if _recursive is not None else None
@@ -362,7 +416,8 @@ class RootController:
                 # tool results already attached to it. Credit those results once.
                 replayed_observation = prior
                 pending = None
-                finalization_reason = "truncated_response"
+                if finalization_reason is None and step.assignment_stage != "assignment":
+                    finalization_reason = "truncated_response"
                 continue
             replayed_observation = None
 
@@ -385,6 +440,9 @@ class RootController:
                 break
 
             if isinstance(action, _FinishAction):
+                if step.assignment_stage == "assignment":
+                    pending = self._feedback(step, "initial_assignment_required", "Attempt each whole group first.")
+                    continue
                 visible = {ref.chunk_id for ref in coverage.report().visible_chunks}
                 if not visible.issuperset(action.cited_chunk_ids):
                     pending = self._feedback(step, "unseen_citation", "Cite only chunks supplied to the model.")
@@ -397,7 +455,7 @@ class RootController:
                 elif action.findings or action.used_finding_ids or action.analysis_status is not None or action.comparisons:
                     pending = self._feedback(step, "invalid_action", "Recursive fields require a research session.")
                     continue
-                answer = action.answer
+                answer = _recursive.render_answer(action.answer) if _recursive is not None else action.answer
                 citations = tuple(action.cited_chunk_ids)
                 stop = "finished"
                 break
@@ -407,7 +465,7 @@ class RootController:
                     step.error = {"code": "invalid_tool_use"}
                     stop = "model_error"
                     break
-                pending, calls = self._execute_batch(action, step, calls, deadline, coverage, _recursive)
+                pending, calls = self._execute_batch(action, step, calls, tool_limit, deadline, coverage, _recursive)
                 if pending is None:
                     stop = "batch_observation_limit"
                     break
@@ -423,29 +481,35 @@ class RootController:
                 step.outcome = "rejected"
                 pending = self._feedback(step, "finalization_only", "Call finish_research using delivered evidence.")
                 continue
-            if calls >= self._limits.max_tool_calls:
+            if calls >= tool_limit:
                 step.outcome = "skipped"
                 self._feedback(step, "tool_call_limit", "Tool call budget exhausted.")
                 stop = "tool_call_limit"
                 break
             calls += 1
-            pending = self._execute_tool(step, action, deadline, coverage, _recursive)
+            pending = self._execute_tool(step, action, deadline, coverage, _recursive,
+                                         initial_assignment=step.assignment_stage == "assignment")
             if self._clock() >= deadline:
                 stop = "deadline"
                 break
 
         report = coverage.report()
         metadata = _recursive.trace_fields(report) if _recursive is not None else {}
+        if _recursive is not None and _recursive.unassigned_groups:
+            metadata["initial_assignment_stop"] = finalization_reason or budget_stop or stop
         return ExecutionTrace(question, tuple(steps), calls, self._clock() - start,
                               stop, report, answer, citations, budget_stop=budget_stop, **metadata)
 
     def _execute_tool(
         self, operation: ToolTrace, action: _ToolAction, deadline: float,
-        coverage: CoverageTracker, recursive: RecursiveSession | None,
+        coverage: CoverageTracker, recursive: RecursiveSession | None, *, initial_assignment: bool = False,
     ) -> str:
         started = self._clock()
+        if initial_assignment and action.name != "delegate_research":
+            operation.outcome = "rejected"
+            return self._feedback(operation, "initial_assignment_required", "Delegate whole company groups first.")
         if recursive is not None and action.name == "delegate_research":
-            result, operation.delegation = recursive.delegate(action.arguments, deadline)
+            result, operation.delegation = recursive.delegate(action.arguments, deadline, initial_assignment=initial_assignment)
         else:
             try:
                 if recursive is not None:
@@ -453,7 +517,11 @@ class RootController:
             except BudgetExceeded as exc:
                 operation.outcome = "skipped"
                 return self._feedback(operation, str(exc), "Shared corpus work budget exhausted.")
-            result = self._dispatcher.dispatch(action.name, action.arguments)
+            if recursive is not None and action.name == "list_candidates":
+                result = recursive.list_candidates(action.arguments)
+            else:
+                result = self._dispatcher.dispatch(action.name, action.arguments,
+                                                   delivered_chunks=recursive.direct_ids if recursive else None)
         operation.tool_seconds = self._clock() - started
         delegation = operation.delegation
         operation.outcome = ("rejected" if result.arguments is None or
@@ -463,7 +531,7 @@ class RootController:
         return result.content
 
     def _execute_batch(
-        self, batch: _ToolBatch, step: StepTrace, calls: int, deadline: float,
+        self, batch: _ToolBatch, step: StepTrace, calls: int, tool_limit: int, deadline: float,
         coverage: CoverageTracker, recursive: RecursiveSession | None,
     ) -> tuple[str | None, int]:
         step.batch_operations = tuple(ToolTrace(
@@ -497,8 +565,9 @@ class RootController:
                 operation.outcome = "rejected"
                 self._feedback(operation, "mixed_finish_batch", "Call finish_research on its own.")
             else:
-                calls = self._execute_batch_call(call, operation, calls, deadline, coverage, recursive,
-                                                 provider_turn=bool(step.model_attempts))
+                calls = self._execute_batch_call(call, operation, calls, tool_limit, deadline, coverage, recursive,
+                                                 provider_turn=bool(step.model_attempts),
+                                                 initial_assignment=step.assignment_stage == "assignment")
             results[index]["observation"] = operation.observation
             if len(encode().encode("utf-8")) > cap:
                 if operation.error:
@@ -538,8 +607,8 @@ class RootController:
         return content
 
     def _execute_batch_call(
-        self, call: _BatchCall, operation: ToolTrace, calls: int, deadline: float,
-        coverage: CoverageTracker, recursive: RecursiveSession | None, *, provider_turn: bool,
+        self, call: _BatchCall, operation: ToolTrace, calls: int, tool_limit: int, deadline: float,
+        coverage: CoverageTracker, recursive: RecursiveSession | None, *, provider_turn: bool, initial_assignment: bool,
     ) -> int:
         try:
             if self._clock() >= deadline:
@@ -549,7 +618,7 @@ class RootController:
                     recursive.budget.check_provider_attempt()
                 else:
                     recursive.budget.check_work()
-            if calls >= self._limits.max_tool_calls:
+            if calls >= tool_limit:
                 raise BudgetExceeded("tool_call_limit")
         except BudgetExceeded as exc:
             operation.outcome = "skipped"
@@ -562,7 +631,7 @@ class RootController:
             self._feedback(operation, "invalid_arguments", validation_message(exc))
         else:
             operation.tool_name = trace_data(action.name)
-            self._execute_tool(operation, action, deadline, coverage, recursive)
+            self._execute_tool(operation, action, deadline, coverage, recursive, initial_assignment=initial_assignment)
         return calls + 1
 
     def _feedback(self, step: ToolTrace, code: str, message: str) -> str:

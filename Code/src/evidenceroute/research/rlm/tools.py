@@ -105,6 +105,10 @@ class _Chunk(StrictInput):
     chunk_id: Identifier
 
 
+class _Spans(_Chunk):
+    span_ids: list[Annotated[str, Field(pattern=r"^\d{1,8}:\d{1,8}$")]] = Field(min_length=1, max_length=4)
+
+
 class _Filters(StrictInput):
     tickers: list[Identifier] | None = Field(default=None, min_length=1, max_length=25)
     fiscal_years: list[FiscalYear] | None = Field(default=None, min_length=1, max_length=25)
@@ -130,12 +134,21 @@ _TOOLS: dict[str, tuple[str, type[StrictInput]]] = {
 }
 
 
-def tool_schemas(*, max_response_bytes: int | None = None) -> list[dict]:
+def tool_schemas(*, max_response_bytes: int | None = None, comparative: bool = False) -> list[dict]:
     """Return fresh JSON-compatible tool definitions with JSON Schema inputs."""
     tools = [
         {"name": name, "description": description, "input_schema": args.model_json_schema()}
         for name, (description, args) in _TOOLS.items()
     ]
+    if comparative:
+        tools.append({"name": "get_spans", "description": "Read up to four exact passages in one scoped chunk. "
+                      "Use span IDs from the lexical shortlist, candidate page, or search results.",
+                      "input_schema": _Spans.model_json_schema()})
+        for tool in tools:
+            if tool["name"] == "search_chunks":
+                tool["description"] = "Rank scoped keyword candidates. Returns IDs and matching span IDs. Use get_spans for text."
+            elif tool["name"] == "get_chunk":
+                tool["description"] += " Use get_spans for targeted excerpts. Already delivered chunks are referenced by ID."
     if max_response_bytes is not None:
         for tool in tools:
             if tool["name"] in {"get_section", "read_chunks", "search_chunks"}:
@@ -202,11 +215,14 @@ class CorpusToolDispatcher:
         self._max_bytes = max_response_bytes
         self._include_spans = include_spans
 
-    def dispatch(self, name: str, arguments: dict) -> DispatchResult:
-        if not isinstance(name, str) or name not in _TOOLS:
+    def dispatch(self, name: str, arguments: dict, *, delivered_chunks: set[str] | None = None) -> DispatchResult:
+        if not isinstance(name, str):
+            return self._error("unknown_tool", "Tool is outside the SEC corpus allowlist.")
+        args_schema = _Spans if self._include_spans and name == "get_spans" else _TOOLS.get(name, (None, None))[1]
+        if args_schema is None:
             return self._error("unknown_tool", "Tool is outside the SEC corpus allowlist.")
         try:
-            validated = _TOOLS[name][1].model_validate(arguments).model_dump(mode="json")
+            validated = args_schema.model_validate(arguments).model_dump(mode="json")
         except ValidationError as exc:
             return self._error("invalid_arguments", validation_message(exc))
 
@@ -217,13 +233,32 @@ class CorpusToolDispatcher:
             call_args["filters"] = filters
         try:
             # Only names in the fixed registry reach attribute lookup.
+            if name == "get_spans":
+                return self._get_spans(validated)
+            if name == "get_chunk" and self._include_spans and validated["chunk_id"] in (delivered_chunks or ()):
+                return DispatchResult(validated, observation_json({"ok": True, "result": {
+                    "chunk_id": validated["chunk_id"], "already_delivered": True,
+                }}))
             result = getattr(self._corpus, name)(**call_args)
             chunks = self._result_chunks(name, result)
             evidence = tuple(EvidenceRef.from_chunk(chunk) for chunk in chunks)
             discovered = evidence if name == "search_chunks" else ()
             body = {"ok": True, "result": result}
             if self._include_spans and chunks:
-                body["span_ids"] = {chunk.chunk_id: list(passage_spans(chunk.text)) for chunk in chunks}
+                if name == "search_chunks":
+                    words = set(re.findall(r"\w+", validated["query"].casefold()))
+                    body["result"] = {"items": [self._candidate(chunk, ref, words) for chunk, ref in zip(chunks, evidence)],
+                                      "total": result.total, "next_offset": result.next_offset}
+                    evidence = ()
+                else:
+                    if name == "read_chunks" and delivered_chunks:
+                        body["result"] = {"items": [
+                            {"chunk_id": chunk.chunk_id, "already_delivered": True} if chunk.chunk_id in delivered_chunks else chunk
+                            for chunk in chunks
+                        ], "total": result.total, "next_offset": result.next_offset}
+                        chunks = tuple(chunk for chunk in chunks if chunk.chunk_id not in delivered_chunks)
+                        evidence = tuple(ref for ref in evidence if ref.chunk_id not in delivered_chunks)
+                    body["span_ids"] = {chunk.chunk_id: list(passage_spans(chunk.text)) for chunk in chunks}
             content = observation_json(body)
             response_bytes = len(content.encode("utf-8"))
             if response_bytes > self._max_bytes:
@@ -233,6 +268,28 @@ class CorpusToolDispatcher:
             return self._error("unknown_id", "No corpus record matches the supplied IDs.", validated)
         except Exception as exc:
             return self._error("tool_error", type(exc).__name__, validated)
+
+    @staticmethod
+    def _candidate(chunk: Chunk, ref: EvidenceRef, words: set[str]) -> dict:
+        spans = passage_spans(chunk.text)
+        ranked = sorted(spans, key=lambda key: -len(words.intersection(
+            re.findall(r"\w+", chunk.text[slice(*spans[key])].casefold())
+        )))
+        return {"source": ref, "span_ids": ranked[:4]}
+
+    def _get_spans(self, arguments: dict) -> DispatchResult:
+        chunk = self._corpus.get_chunk(arguments["chunk_id"])
+        spans = passage_spans(chunk.text)
+        selected = arguments["span_ids"]
+        if any(key not in spans for key in selected):
+            return self._error("unknown_span", "Use canonical span IDs for this chunk.", arguments)
+        ref = EvidenceRef.from_chunk(chunk)
+        content = observation_json({"ok": True, "result": {
+            "source": ref, "spans": {key: chunk.text[slice(*spans[key])] for key in selected},
+        }, "span_ids": {chunk.chunk_id: list(dict.fromkeys(selected))}})
+        if len(content.encode("utf-8")) > self._max_bytes:
+            return self._error("response_too_large", "Try fewer spans in one request.", arguments)
+        return DispatchResult(arguments, content, (ref,))
 
     def _oversized(
         self, name: str, arguments: dict, result, response_bytes: int, discovered: tuple[EvidenceRef, ...],

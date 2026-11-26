@@ -19,7 +19,7 @@ Python pages through the filing and section metadata without search. Company sel
 
 Each company group keeps its resolved fiscal years and the original question together. The [live semantic review](#reading-the-report) shows why that matters. Independently choosing excerpts for each year can make different topics look like a change in disclosure. A shared group lets the analyst check the same risk in each filing. Even matched excerpts need adequate coverage before making an absence claim.
 
-The plan stays host-side. `execute_research_plan` checks the existing reservation policy, then admits whole groups in ticker order up to the requested group cap and the shared and root structural limits. Unresolved groups and groups that do not fit retain an explicit pending reason. The existing runner receives only admitted pairs and the root must delegate one whole group at a time. The full plan remains the reporting denominator. Provider, token, and time limits can still stop execution after admission.
+The plan stays host-side. `execute_research_plan` validates provider reservations and admits whole groups in ticker order within the group, shared, and root limits. Unresolved groups and groups outside those limits retain a pending reason. Comprehensive plans default to delegation-first execution. Admission reserves enough root decisions for one assignment per group and enough shared delegation and partition slots for every admitted group. The full plan remains the reporting denominator. Provider, token, and time limits can still stop execution after admission.
 
 ### Bounded recursive execution
 
@@ -325,7 +325,7 @@ Durable finding storage, independent semantic verification, automated reinvestig
 
 ### Systematic comparative research
 
-The separate comparative demo scans the full resolved inventory in canonical company, year, section, and chunk order. It counts case-insensitive literal matches for configurable terms. The scan has its own local chunk and time limits and uses zero provider attempts. Each invocation sees at most three candidate chunk IDs per authorized section. It can read the full chunks for neighboring context and use its remaining scoped tool calls to investigate specific uncertainties or counterevidence.
+The comparative demo scans the full resolved inventory in canonical company, year, section, and chunk order. It counts case-insensitive literal matches for configurable terms under separate local chunk and time limits. Children receive up to three candidate IDs per authorized section with span hints and a cursor. `list_candidates` returns up to ten IDs for a scoped section. Comparative `search_chunks` returns ranked candidate IDs and span hints. Each call uses one local tool slot and one shared corpus attempt. Candidate IDs grant no evidence or access credit. `get_spans` supplies up to four exact passages from one scoped chunk. `get_chunk` supplies the full text when context is needed.
 
 Comparative chunk observations include compact span IDs alongside the original text. An ID is a pair of character offsets within one canonical chunk. The model selects the pair and Python copies the exact source characters. Selection is limited to acknowledged span IDs or the identical span from a declared, acknowledged child finding. This preserves Unicode and prevents a parent from expanding a delegated excerpt. The existing observation byte cap applies and the legacy exact-quote interface remains available.
 
@@ -337,7 +337,7 @@ PYTHONPATH=Code/src python Code/examples/demo_rlm_comparative.py
 
 With the default terms, the offline demo scanned **3,038 chunks in 50 Item 1A sections across 25 companies** using 328 local pages and 4,603,503 chunk characters, including overlap. It identified **87 candidate chunks and 118 matching spans**. FY2023/FY2024 candidate chunk counts were **1/1 for AAPL** and **4/6 for AMD**. The AMD script read the FY2024 water-and-power passage and then the canonical FY2023 counterpart. Two chunks were delivered and assessed, both original citations reached the root, and the scripted root classified the constraint as comparable across both years. The FY2024 excerpt explicitly adds a potential revenue impact. The selected passages concern data centers generally and leave the AI-specific link unestablished. This demonstration used 3 sessions, 7 decisions, 2 corpus attempts, and zero provider attempts. Corpus-wide research remained incomplete.
 
-The live path is opt-in and keeps intent scripted. It admits two company groups, limits the run to 18 provider attempts and 12 corpus attempts, and uses the existing protected finish policy with zero provider retries.
+The baseline live runs below used scripted intent, a two-group cap, 18 provider attempts, 12 corpus attempts, protected finalization, and zero provider retries.
 
 The first live run, `fdd6cd9d72d14c708bfdc36e2b3b05a1`, scanned all **3,038 chunks across 50 sections and 25 companies** in **0.0568015 seconds**, finding **87 candidate chunks and 118 matching spans**. The root used one model session, one decision, and one Bedrock request with one response. The request took **3.1933 seconds** and reported **5,190 input and 374 output tokens**. The run stopped with `model_error` before any delegation or corpus operation, with zero delivered chunks, findings, or citations and no budget exhaustion. The saved report contains neither the decoder error nor the provider tool requests, so the exact live failure remains unknown.
 
@@ -351,14 +351,91 @@ The third live run, `5ae02fdd1d154776801963e39e521f57`, finished in **19.6014 se
 
 Both company comparisons returned `insufficient` rather than asserting novelty. Apple cited both years, while AMD cited only FY2023. One AMD assessment labeled AI accelerator demand `infrastructure` and `supports` even though its rationale described a market opportunity rather than an infrastructure risk. The run finished with research status `incomplete`. Scanning all 3,038 chunks for lexical candidates did not establish comprehensive semantic coverage.
 
+Offline verification recorded **198 focused tests passed, 1 warning in 10.91s** and **40 related retrieval, provenance, and canonical integrity tests passed, 1 warning in 17.71s**. The warning was the existing AnyIO pytest deprecation. Bedrock stubs covered complete rejection and correction at five and sixteen calls, repeated rejections through protected finalization, duplicate and malformed requests, and the protocol and byte ceilings. The scripted comparative demo still scanned 3,038 chunks, finished with two citations and `incomplete` research status, and made zero provider attempts.
+
+#### Delegation-first execution and budget profiles
+
+The baseline at `3605854` produced four citations with zero delegations and no AMD FY2024 citation. The root now starts comprehensive plans with `delegate_research` as its only advertised tool. Python rejects direct reads, premature finishes, split groups, and duplicate initial assignments. The assignment restriction applies to the entire provider reply, including a batch that attempts the last unassigned group. An initial attempt counts when the host creates the child invocation. A failed child stays visible and does not block subsequent assignments. After all groups have an attempt, the root can synthesize or use remaining capacity for scoped reads and whole-group reinvestigation. When assignment capacity runs out, the root can finalize an incomplete answer if finish capacity remains. Set `delegation_first=False` to use the previous model-directed behavior.
+
+| Setting | `diagnostic` (default) | `expanded` |
+| --- | ---: | ---: |
+| Company groups / depth / delegations / pair assignments | 2 / 1 / 2 / 4 | 2 / 1 / 2 / 4 |
+| Shared provider attempts / attempts per child | 18 / 6 | 36 / 12 |
+| Shared corpus attempts / reported-token threshold | 12 / 100,000 | 30 / 200,000 |
+| Shared and local deadline | 180 s | 300 s |
+| Local decisions / tool calls / response byte cap | 6 / 6 / 6,000 | 12 / 12 / 16,000 |
+| Protected finish attempts / output tokens / tool choice | 2 / 2,048 / required | 2 / 2,048 / required |
+| Root / child finalization token headroom | 12,000 / 12,000 | 24,000 / 24,000 |
+| Protected request timeout / timeout retries | `CLAUDE_TIMEOUT_SECONDS` / 0 | 60 s / 1 |
+| Post-assignment root tool calls | 2 | 2 |
+
+The diagnostic profile retains the baseline shared ceilings. The expanded profile starts the root and each child with ten investigation attempts and two reserved finish attempts. Its 30 shared corpus calls can accommodate both children's maximum of 12 local tools each and the root's two follow-up calls. The existing allocation can return unused child attempts to the root within the configured ceiling. Execution batches remain capped at four and protocol recovery at sixteen.
+
+Use `--profile-file` to load JSON with `max_groups`, `shared_limits`, `local_limits`, and `finalization`. The optional `max_root_reinvestigation_calls` defaults to two. `finalization` accepts `root_token_headroom`, `child_token_headroom`, `finalization_timeout_seconds`, and `finalization_timeout_retries`. Validation checks provider and token reservations, root decisions and tool slots, depth, pair capacity, and the minimum corpus allowance of one retrieval per year per group before the runner creates a provider client. The three-group offline run used the expanded profile with `max_groups=3`, `max_delegations=3`, `max_partitions=6`, and `max_provider_attempts=42`.
+
+`execution_status` records whether the root accepted a finish. `recursive_comparative_status` also requires an acknowledged child result for each admitted group and declared use of delegated evidence when any child delivers findings. An investigator may abstain. The ledger retains failed initial attempts and any successful reinvestigation. `evidence_years` and `both_years_contributed` describe the assessed spans in each comparison. `root_cited_years_by_company` shows which fiscal years reached the answer's citations. The report also shows delivery failures, provider errors, unassigned groups, and pending scope.
+
+The comparison resolver treats an infrastructure label without a stated risk connection as uncertain. An accelerator-demand passage needs a source-backed link to the risk mechanism. A final response accepts up to three structured comparisons and eight findings. Broader reporting needs consolidation across bounded runs.
+
+Run the expanded profile manually from the repository root with authorized Bedrock credentials.
+
 ```bash
 BEDROCK_REGION=us-east-1 \
   BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
   CLAUDE_MAX_OUTPUT_TOKENS=1024 PYTHONPATH=Code/src \
-  python Code/examples/demo_rlm_comparative.py --live --trace
+  python Code/examples/demo_rlm_comparative.py --profile expanded --live --trace
 ```
 
-Offline verification recorded **198 focused tests passed, 1 warning in 10.91s** and **40 related retrieval, provenance, and canonical integrity tests passed, 1 warning in 17.71s**. The warning was the existing AnyIO pytest deprecation. Bedrock stubs covered complete rejection and correction at five and sixteen calls, repeated rejections through protected finalization, duplicate and malformed requests, and the protocol and byte ceilings. The scripted comparative demo still scanned 3,038 chunks, finished with two citations and `incomplete` research status, and made zero provider attempts.
+**Offline verification.** The focused RLM suite passed **218 tests** and the related regressions passed **53 tests**. Each reported the existing AnyIO pytest deprecation warning. In the expanded Bedrock stub, the root recovered from a truncated assignment reply, delegated both companies, and synthesized four original citations covering both years for each company. The stub recorded eight provider attempts and four corpus attempts. The scripted recursive, planning, planned research, comparative, and Standard RAG demos exited successfully with zero provider calls. Both comparative profiles scanned 3,038 chunks, attempted two groups, and returned two citations. The custom profile attempted three groups. Corpus-wide comparative research remained incomplete.
+
+```bash
+export PYTHONPATH=Code/src AWS_EC2_METADATA_DISABLED=true HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+python -m pytest -q Code/tests/test_rlm_*.py
+python -m pytest -q Code/tests/test_retrieval_bm25.py Code/tests/test_retrieval_corpus.py \
+  Code/tests/test_rag_corpus.py Code/tests/test_rag_citations.py Code/tests/test_rag_prompts.py \
+  Code/tests/test_standard_rag.py Code/tests/test_corpus_regression.py::test_exported_canonical_corpus_integrity
+python Code/examples/demo_rlm_recursive.py
+python Code/examples/demo_rlm_plan.py
+python Code/examples/demo_rlm_planned_research.py
+python Code/examples/demo_rlm_comparative.py --profile diagnostic
+python Code/examples/demo_rlm_comparative.py --profile expanded
+python Code/examples/demo_standard_rag.py
+```
+
+#### Grounded partial results under shared limits
+
+Expanded live run `2f2882839aca4a7b9c61e7a26463237c`, saved as `rlm-comparative-expanded-v3.json`, delegated both companies in the initial batch. It used **21 provider attempts, 20 responses, 29 corpus attempts, and 202,093 reported tokens in 147.95 seconds**. Apple acknowledged 26 whole-chunk deliveries covering 16 unique chunks. Its protected finish timed out after 20.04 seconds and returned no findings or usage. AMD acknowledged 11 whole-chunk deliveries covering nine unique chunks and returned two source-backed findings that the root acknowledged. Its structure classified the underlying water and power risk as `comparable_both_years`. Its prose opened with a claim of novelty, then stated that the underlying risk appeared in both years. The root requested six follow-up searches for Apple. Five reached the corpus, and the root received 14 whole-chunk deliveries covering 11 unique chunks. A response crossed the 200,000-token threshold by 2,093 and the root stopped without finalizing or citing evidence.
+
+- **Token admission.** Estimate each complete request from its serialized UTF-8 bytes divided by three, rounded up, plus the requested output cap. Investigation must leave the configured reserves for the root and active or initially unassigned children. A blocked investigation can replay its assembled history in finish-only mode. A child finish can use its own reserve while protecting the root and later children. A root finish may use the remaining shared headroom. Estimates count message history and tool schemas. Provider tokenization, request framing, and cache accounting can differ, and missing usage or a single response can still push actual consumption past the threshold. Measured usage stays separate and the configured ceiling is fixed.
+- **Timeout and replay.** `CLAUDE_TIMEOUT_SECONDS` defaults to 20 seconds. The expanded override applies 60 seconds to protected finish requests. Bedrock sets both socket timeouts to the smaller of the applicable setting and remaining invocation time. One protected timeout retry can reuse the same request within the attempt, token, and deadline limits. The SDK performs one request per application attempt. The trace records each attempt, including missing usage, and acknowledges tool results only once. A timed-out server request may still have done work. The deadline remains cooperative.
+- **Context and follow-up.** The adapters keep native assistant messages and tool-result IDs in order. Comparative searches send IDs and span hints. Acknowledged whole chunks returned again in the same invocation are referenced by ID. Two post-assignment root tool slots bound follow-up even across a batch. The trace records estimated request bytes, effective timeout, and generated observation bytes. The historical report lacks request-size telemetry. Measured locally, the two cited AMD whole-chunk observations were 1,479 and 1,660 bytes. Their exact-span observations were 566 and 636 bytes, and each duplicate whole-chunk reference was 85 bytes.
+- **Conclusions and fallback.** The comparative answer renders validated outcomes instead of publishing the model's draft prose. General infrastructure support and the reported AI-specific connection are separate fields. The same-risk finding for the cited AMD spans supports a comparison across fiscal years and leaves the AI-specific link unestablished. If the root cannot finish, `partial_result` exposes only acknowledged child findings and comparisons with original spans, failed groups, and access counts. Root citations and synthesis status remain separate. Formatting and exact-span checks establish provenance and consistency. Independent semantic verification and corpus-wide conclusions remain open.
+
+Offline verification at this stage passed **229 focused RLM tests** and **53 related regressions**, each with the existing AnyIO deprecation warning. Bedrock stubs exercised timeout replay, projected token starvation, measured overshoot, and acknowledged-child fallback.
+
+#### Expanded V4 live checkpoint
+
+V4 (`7489d1f7a57949f5b99880eba68bd149`, `rlm-comparative-expanded-v4.json`) lexically scanned **3,038 chunks across 50 sections and 25 companies**, finding **87 candidate chunks and 118 matching spans**. Both children and the root finished. AMD's first protected finish combined evidence from multiple documents in individual findings, violating the one-document-and-section rule. Its second protected attempt succeeded. The root acknowledged and used four AMD findings, returned four original chunk citations, and classified the assessed data-center power and water constraint as `comparable_both_years`. The exact spans leave the AI-specific connection unestablished. Apple finished with an incomplete assessment and no validated findings. The model did not investigate the other 23 companies.
+
+| Measure | Expanded V3 | Expanded V4 | Observed change |
+| --- | ---: | ---: | --- |
+| Reported input tokens | 196,764 | 133,818 | 62,946 fewer |
+| Reported output tokens | 5,329 | 7,703 | 2,374 more |
+| Total reported tokens | 202,093 | 141,521 | 60,572 fewer (30.0%) |
+| Recursive wall time | 147.9479 s | 86.4068 s | 61.5411 s less (41.6%) |
+| Provider attempts / responses | 21 / 20 | 19 / 19 | 2 fewer attempts |
+| Corpus operations | 29 | 26 | 3 fewer |
+| Timeouts / attempts missing token usage | 1 / 1 | 0 / 0 | Both zero in V4 |
+
+Both runs used the shared and local ceilings in the expanded column above, including 36 provider attempts, 30 corpus operations, a 200,000 reported-token threshold, and 300-second deadlines. Both reserved two finish attempts with a 2,048-token output cap and required finish-tool choice. V3 used whole-chunk search delivery and shared/local limits for root follow-up, with no dedicated token headroom or finish-timeout override. V4 used compact evidence delivery, two root follow-up calls, 24,000 tokens of headroom each for root and child finalization, and the 60-second protected timeout with one allowed retry. V4 used no retries.
+
+Compact results reduce the filing text repeated in provider history. V4 delivered exact spans from 13 chunks and whole text from two. The root follow-up cap limits repeated investigation after delegation. Token headroom and the longer protected timeout leave room for synthesis and validation correction, as exercised by AMD's second finish. The lower reported input and wall time are consistent with these changes. One run per configuration cannot isolate causes or establish statistical significance. V3's missing usage prevents a complete token accounting, and the reported token difference cannot establish a monetary cost reduction.
+
+The live command above applies to V4. To reproduce the V3 configuration, run the same `--profile expanded --live --trace` command with the earlier implementation and the V3 settings recorded here. Use the same local corpus for both configurations. Results and usage can vary across runs.
+
+`execution_status` and `recursive_comparative_status` both succeeded in V4. `research_status` remained incomplete and independent semantic verification remained false. The public answer now identifies evidence-supported comparisons, states when the validated outcomes leave novelty unestablished, and lists admitted companies with unresolved assessments and companies outside the admitted scope. Possible novelty still requires review. The same scope disclosure accompanies acknowledged-child fallback, and the validated comparisons and original citations remain the source of the answer's claims.
+
+Checkpoint verification passed **230 focused RLM tests** and **53 related regressions**, each with the existing AnyIO deprecation warning. Both offline comparative profiles finished with two original citations, zero provider attempts, and incomplete research status. The regression cases cover an unresolved admitted company, non-admitted scope, tentative novelty, and acknowledged-child fallback.
 
 ## Bounded live recursive experiment · Four observed runs
 

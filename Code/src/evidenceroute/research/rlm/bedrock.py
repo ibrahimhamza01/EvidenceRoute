@@ -13,6 +13,7 @@ from botocore import exceptions as aws_errors
 from pydantic import Field
 
 from evidenceroute.research.rlm.claude import (
+    _DELEGATE,
     _FINISH,
     _retry_after,
     ClaudeConfig,
@@ -79,9 +80,12 @@ class BedrockConverseTransport:
                 return client.converse(**payload)
         except aws_errors.ClientError as exc:
             error = _client_error(exc)
-            if (exc.response.get("Error", {}).get("Code") == "ValidationException"
-                    and "tool" in payload.get("toolConfig", {}).get("toolChoice", {})):
-                error = ProviderTransportError("aws_required_finish_validation")
+            choice = payload.get("toolConfig", {}).get("toolChoice", {}).get("tool", {}).get("name")
+            if exc.response.get("Error", {}).get("Code") == "ValidationException":
+                if choice == _FINISH:
+                    error = ProviderTransportError("aws_required_finish_validation")
+                elif choice == _DELEGATE:
+                    error = ProviderTransportError("aws_required_delegation_validation")
             usage = exc.response.get("usage")
             if isinstance(usage, dict):
                 error.usage = usage
@@ -137,6 +141,8 @@ class BedrockRootClient(ClaudeRootClient):
         policy = self._finalization_policy()
         inference = {"maxTokens": policy.finalization_max_output_tokens if policy else self.config.max_output_tokens}
         choice = {"tool": {"name": _FINISH}} if policy and policy.finalization_tool_choice == "required" else {"auto": {}}
+        if not self._finish_allowed:
+            choice = {"tool": {"name": _DELEGATE}}
         if self.config.temperature is not None:
             inference["temperature"] = self.config.temperature
         if self.config.top_p is not None:
