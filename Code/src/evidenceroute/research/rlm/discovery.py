@@ -19,6 +19,7 @@ from evidenceroute.retrieval.tokenization import tokenize
 
 
 _Phrase = Annotated[str, Field(min_length=1, max_length=200)]
+DiscoveryPhrases = Annotated[tuple[_Phrase, ...], Field(min_length=1, max_length=32)]
 
 
 class DiscoverySpec(StrictInput):
@@ -27,7 +28,7 @@ class DiscoverySpec(StrictInput):
     model_config = ConfigDict(frozen=True)
 
     topic: str = Field(min_length=1, max_length=2_000)
-    phrases: tuple[_Phrase, ...] = Field(min_length=1, max_length=32)
+    phrases: DiscoveryPhrases
     max_candidates_per_section: int = Field(default=16, ge=1, le=50)
 
     @model_validator(mode="after")

@@ -13,7 +13,7 @@ The caller can supply required filing and section IDs through `ResearchScope`. A
 
 ### Research scope planning
 
-The interpreter identifies companies, fiscal years, section IDs, the topic and objective, and whether the question requires comprehensive review. It marks inferred requirements and explains its assumptions or uncertainty. Invalid or incomplete structured output raises an interpretation error. The offline interpreter is injected, and the host preserves the original question. A future provider-backed interpreter must charge attempts and reported tokens to the same budget and deadline as execution.
+The interpreter identifies companies, fiscal years, section IDs, the topic and objective, and whether the question requires comprehensive review. It marks inferred requirements and explains its assumptions. The host preserves the original question. Scripted callers can still pass an `IntentInterpreter` to `interpret_intent`. The natural-language entry point requests requirements and discovery phrases from Bedrock and charges interpretation to the overall research allowance. [Natural-language question interpretation](#natural-language-question-interpretation)
 
 Python pages through the filing and section metadata without search. Company selectors match a ticker first, then an exact name recorded in the manifest, ignoring case and extra whitespace. Matched aliases collapse to their canonical ticker. Targets are unique and sorted by ticker, fiscal year, and section ID. Unknown companies, ambiguous matches, and unavailable filings or sections remain visible as unresolved company/year/section slots in the required count.
 
@@ -321,7 +321,7 @@ The root acknowledged three validated Apple child findings. AMD failed quotation
 
 The two-company demo optimization cycle ends here. The next milestone is systematic comparison of the same risk across years, including an explicit search for prior-year counterevidence before making a novelty claim.
 
-Durable finding storage, independent semantic verification, automated reinvestigation scheduling, live intent interpretation, and comprehensive corpus execution remain pending. This demo executes one bounded slice and does not launch follow-up runs.
+At this checkpoint, durable finding storage, independent semantic verification, automated reinvestigation scheduling, live intent interpretation, and comprehensive corpus execution were still pending. This demo executes one bounded slice.
 
 ### Systematic comparative research
 
@@ -733,7 +733,61 @@ PYTHONPATH=Code/src python Code/examples/demo_rlm_comparative.py
 PYTHONPATH=Code/src python Code/examples/demo_rlm_comparative.py --fixed-terms
 ```
 
-The research demos use normalized discovery by default. Repeat `--term` to supply phrases, or use `--fixed-terms` for the literal baseline. Verification passed **266 focused RLM tests** and **53 related regressions**, each with the existing AnyIO deprecation warning. Discovery, both comparative modes, full and limited corpus-wide research, the Amazon–Alphabet subset, planning, recursive, and Standard RAG demos passed offline. Live retrieval effects, generalized query selection, and independent semantic verification remain open.
+The research demos use normalized discovery by default. Repeat `--term` to supply phrases, or use `--fixed-terms` for the literal baseline. Verification passed **266 focused RLM tests** and **53 related regressions**, each with the existing AnyIO deprecation warning. Discovery, both comparative modes, full and limited corpus-wide research, the Amazon–Alphabet subset, planning, recursive, and Standard RAG demos passed offline.
+
+#### Live discovery validation
+
+Run `7ae604dd29d14d53bd01326cba9f0394` (`rlm-discovery-live-validation.json`, code at `c784491`) repeated the Amazon–Alphabet reference-synthesis scope of `d34a62a374c647e18f50f3c257f36cf5`. Both runs required and resolved four FY2023–FY2024 Item 1A targets and scanned 208 chunks under the expanded per-tree ceilings.
+
+| Measure | Reference synthesis, literal terms | Normalized discovery |
+| --- | ---: | ---: |
+| Initial candidate chunks | 15 | 19 |
+| Assessed chunks among initial candidates | 2 of 7 | 5 of 5 |
+| Provider attempts | 20 | 17 |
+| Reported tokens | 156,778 | 127,726 |
+| Corpus tool attempts | 24 | 24 |
+| Elapsed seconds | 83.04 | 79.40 |
+
+The normalized metrics were checked against the saved report. The reference column uses the recorded checkpoint and the historical corpus-attempt count supplied for this comparison. The scanner recovered all seven known regression targets in those two companies using 23 chunk-page reads and four metadata reads in 0.0192 seconds. The offline count of 40 normalized candidates also included Microsoft and measures a larger scope. Known targets informed the example phrases, and the two observed runs had different investigation sequences. General recall and causal effects on latency, token usage, and retrieval quality remain unmeasured.
+
+All three invocations finished. The root acknowledged and selected five child findings, added zero findings, and cited five original chunks supporting seven evidence spans. It finished during investigation with 924 output tokens under the 1,024-token cap. The Alphabet child logged one local tool-limit rejection. The report recorded zero provider truncations and terminal failures. Execution finished and research remained incomplete.
+
+The Alphabet assessments treated missing prior-year accelerator or energy specificity as contradiction. The prior-year excerpt describes a more general dependency and does not oppose either current-year proposition. The FY2024 accelerator excerpt supports intense competition for supply capacity. It does not fully support the assessment that competitors could claim capacity first. Independent semantic verification remains open.
+
+To reproduce this checkpoint with authorized Bedrock credentials, use the reference-synthesis command above with `--fixed-terms` omitted, `--limits-file rlm-discovery-limits.json`, and output redirected to `rlm-discovery-live-validation-rerun.json`. The saved limits file uses the same overall ceilings as the reference-synthesis run.
+
+### Natural-language question interpretation
+
+`natural_language.research_question(question, runner, limits=...)` accepts the original question and an existing recursive runner. `BedrockIntentInterpreter` requests one forced Converse tool use for both requirements and discovery phrases. It sends recorded company names and tickers, available fiscal years per company, and the set of filing section IDs and titles. The request contains no filing excerpts. The host validates the native tool response, constructs a `ResearchIntent`, checks 1–32 lexical phrases through `DiscoverySpec`, and uses the existing deterministic planner and canonical corpus IDs. The result includes the original question, scope assumptions, unresolved requirements, and execution telemetry.
+
+| Question or requirement | Interpretation policy |
+| --- | --- |
+| Explicit company, year, or filing section | Preserve named requirements, including unavailable ones. Claude maps unambiguous aliases using the inventory, and Python resolves the resulting ticker or exact recorded name. Unknown names and unavailable filing or section slots stay in the plan. A group with an unresolved requirement remains pending under the existing whole-group admission policy. |
+| Corpus-wide scope | Apply all corpus companies to explicit corpus-wide requests and unqualified “which companies” questions. Mark the latter company universe as inferred. Mark comprehensiveness for questions that require evaluating every requested target. |
+| Unspecified or relative fiscal years | A descriptive review with no year uses the latest fiscal year in the snapshot, FY2024 here, as an inferred requirement even when it is unavailable for a named company. Relative periods and missing comparison years call for clarification. |
+| Unspecified or ambiguous section or company | Use Item 1A for risk-factor questions as an inferred section. Ask for clarification when company scope or identity is ambiguous or when the appropriate section is unclear. Requests for full filings or all sections are unsupported because the corpus contains selected sections. |
+| Objective | Descriptive SEC disclosure reviews use the generic evidence pipeline with scoped candidate pages and exact quotes. The comparative engine supports AI infrastructure risk comparisons across exactly two distinct fiscal years. Other comparison topics, predictions, recommendations, and objectives requiring external data return an unsupported outcome. |
+
+Defaults must appear in `inferred_fields` with a concise `scope_notes` explanation. The host checks that inferred years and sections follow policy and that the execution mode matches the objective. Ambiguous, unsupported, unavailable, invalid, truncated, and exhausted interpretations return explicit outcomes without starting research. Schema and corpus checks establish shape and resolvability. Fidelity to the wording of the question, including alias judgments and scope extraction, still depends on the model.
+
+Interpretation defaults to at most two attempts, 1,024 output tokens per attempt within the configured Claude cap, a 16,000-token charge threshold, and a 30-second cooperative deadline. The phase uses the lower of its limits and the overall allowances. The existing Converse transport applies the configured retry policy, credential chain, timeout caps, and sanitized error codes. Each attempt records transport latency, available provider latency and reported token counters, estimated tokens, output cap, stop reason, and errors. A missing input or output counter charges the larger of the request estimate or the available reported usage. Admission checks the estimate before each request, and an observed overage blocks research. Estimates use the existing request-byte heuristic. A blocking SDK operation can overrun the deadline.
+
+Research receives the remaining provider-attempt and token allowances and the original absolute deadline. The scheduler applies the configured tree reservations, protected finalization, and corpus and scan ceilings. Overall usage includes the interpretation attempts and actual reported and estimated counters. The interpretation report also shows the token charge used for admission. The timer starts after the caller has loaded the corpus. Discovery searches only resolved filing sections. Citation authority requires acknowledged evidence reads. A miss cannot establish absence or novelty, and research can remain incomplete after every invocation finishes.
+
+Run the scripted verification from the repository root. Each question produces a different mocked structured reply through the same Bedrock adapter and runs scoped research over one canonical FY2024 Item 1A section. The Amazon review scanned 44 chunks and the Apple foreign exchange review scanned 53. Each finished execution with one original citation and incomplete research. The CLI records one mocked interpretation attempt and zero live provider attempts per question.
+
+```bash
+PYTHONPATH=Code/src python Code/examples/demo_rlm_question.py \
+  "What AI infrastructure supply risks does Amazon disclose in FY2024 Item 1A?"
+PYTHONPATH=Code/src python Code/examples/demo_rlm_question.py \
+  "What foreign exchange risks does Apple disclose in FY2024?"
+```
+
+For a future authorized Bedrock run, add `--live --limits-file rlm-discovery-limits.json` to either command with the Bedrock environment from the course setup section. The default diagnostic profile leaves room within those overall ceilings for interpretation. An expanded tree requires an overall file that also covers interpretation. `--interpretation-limits-file` can set a smaller phase allowance. The prior scripted demos remain reproducible.
+
+Verification passed **294 focused RLM tests** (28 for the question path) and **53 related retrieval, provenance, and corpus integrity regressions**, each with the existing AnyIO deprecation warning. Use the focused and related commands in the earlier verification section. The planning, planned research, recursive, discovery, both comparative modes, full and limited corpus research, Amazon–Alphabet subset, and Standard RAG demos also ran offline. The limited corpus demo returned its expected partial result and exit code 1.
+
+Mocked responses verify request construction, validation, budget settlement, scoped candidate access, and original evidence provenance. Live interpretation accuracy, latency, token usage, and retrieval quality remain unmeasured. Independent semantic verification and durable findings remain future work.
 
 ## Ongoing engineering record
 

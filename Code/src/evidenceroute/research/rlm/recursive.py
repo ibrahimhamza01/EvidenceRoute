@@ -73,6 +73,7 @@ class RecursiveResearch:
         finalization: FinalizationPolicy | None = None,
         child_guidance: str | None = None,
         comparison_scan: CorpusScan | None = None,
+        discovery_scan: CorpusScan | None = None,
         max_root_reinvestigation_calls: int | None = None,
         clock: Callable[[], float] = monotonic,
     ):
@@ -84,6 +85,7 @@ class RecursiveResearch:
         self.finalization = finalization
         self.child_guidance = child_guidance
         self.comparison_scan = comparison_scan
+        self.discovery_scan = discovery_scan
         if max_root_reinvestigation_calls is not None and (
             type(max_root_reinvestigation_calls) is not int or max_root_reinvestigation_calls < 0
         ):
@@ -170,6 +172,13 @@ class RecursiveResearch:
             prompt += f"\nInvestigation guidance: {self.child_guidance}"
         if partitions is not None:
             prompt += "\nAuthorized partitions: " + observation_json([vars(pair) for pair in partitions])
+        if self.discovery_scan is not None and not session.delegation_first:
+            shortlist = self.discovery_scan.shortlist(partitions or ())
+            prompt += (
+                "\nLexical candidates (IDs, at most three per section): " + observation_json(shortlist)
+                + "\nUse list_candidates for more scoped IDs and get_chunk to read promising evidence. "
+                "Use scoped search_chunks for gaps or different wording. No lexical miss proves absence."
+            )
         if self.comparison_scan is not None and not session.delegation_first:
             shortlist = self.comparison_scan.shortlist(partitions or ())
             prompt += (
@@ -251,17 +260,19 @@ class RecursiveSession:
         return True
 
     def candidate_schema(self) -> dict | None:
-        if self.runner.comparison_scan is None or self.invocation.partitions is None:
+        if (self.runner.comparison_scan is None and self.runner.discovery_scan is None
+                or self.invocation.partitions is None):
             return None
+        read_tool = "get_spans" if self.runner.comparison_scan is not None else "get_chunk"
         return {
             "name": "list_candidates",
             "description": "Page through precomputed lexical candidate IDs and span hints for one authorized section. "
-                           "Use get_spans to read and cite exact evidence.",
+                           f"Use {read_tool} to read and cite exact evidence.",
             "input_schema": CandidatePageRequest.model_json_schema(),
         }
 
     def list_candidates(self, arguments: dict) -> DispatchResult:
-        scan = self.runner.comparison_scan
+        scan = self.runner.comparison_scan or self.runner.discovery_scan
         cap = self.runner.local_limits.max_response_bytes
         if scan is None or self.invocation.partitions is None:
             return DispatchResult(None, error_observation("unknown_tool", "Candidate pages require a scoped scan.", cap))

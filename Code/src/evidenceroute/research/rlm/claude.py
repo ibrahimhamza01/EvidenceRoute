@@ -304,9 +304,7 @@ class ClaudeRootClient:
                                                     reference_based=self._reference_finish),
             }]
         response = self._request(self._payload(tools), deadline)
-        reason = self._stop_reason(response) if isinstance(response, dict) else None
-        logged_reason = (reason if reason in self._known_stop_reasons else "unknown") if isinstance(reason, str) else None
-        self.last_attempts = (*self.last_attempts[:-1], replace(self.last_attempts[-1], provider_stop_reason=logged_reason))
+        reason = self._record_stop_reason(response)
         assistant = self._assistant_message(response)
         content = assistant.get("content") if assistant is not None else None
         has_observation = observation is not None or (resuming and len(self._messages) > 1)
@@ -319,8 +317,17 @@ class ClaudeRootClient:
                 raise ClaudeModelError("deadline")
             return self._decode(response, assistant)
         except ClaudeModelError as exc:
-            self.last_attempts = (*self.last_attempts[:-1], replace(self.last_attempts[-1], error=str(exc)))
+            self._record_response_error(str(exc))
             raise
+
+    def _record_stop_reason(self, response: dict) -> str | None:
+        reason = self._stop_reason(response) if isinstance(response, dict) else None
+        logged = (reason if reason in self._known_stop_reasons else "unknown") if isinstance(reason, str) else None
+        self.last_attempts = (*self.last_attempts[:-1], replace(self.last_attempts[-1], provider_stop_reason=logged))
+        return reason
+
+    def _record_response_error(self, code: str) -> None:
+        self.last_attempts = (*self.last_attempts[:-1], replace(self.last_attempts[-1], error=code))
 
     def _payload(self, tools: list[dict]) -> dict:
         policy = self._finalization_policy()
@@ -385,13 +392,14 @@ class ClaudeRootClient:
             "content": observation, "is_error": not body["ok"],
         }
 
-    def _request(self, payload: dict, deadline: float) -> dict:
+    def _request(self, payload: dict, deadline: float, *, output_cap: int | None = None) -> dict:
         policy = self._finalization_policy()
         timeout = self.config.timeout_seconds
         if policy and policy.finalization_timeout_seconds is not None:
             timeout = policy.finalization_timeout_seconds
         timeout_retries = policy.finalization_timeout_retries if policy else 0
-        output_cap = policy.finalization_max_output_tokens if policy else self.config.max_output_tokens
+        if output_cap is None:
+            output_cap = policy.finalization_max_output_tokens if policy else self.config.max_output_tokens
         request_bytes = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                                        default=_encode_request_blob).encode("utf-8"))
         # Admission estimate only. The provider's serialization and tokenizer can differ.

@@ -145,11 +145,13 @@ def execute_research_plan(
             {"ticker": group.ticker, "partitions": [asdict(pair) for pair in group.targets]} for group in admitted
         ])
         company_count = _requested_scope[0] if _requested_scope else len(plan.requested_companies)
+        approach = ("Compare the same topic across the assigned filings." if plan.intent.objective == "year_over_year"
+                    else "Review the same topic in the assigned filings. Submit supported claims as findings.")
         question = (
             f"{plan.intent.question}\nObjective: {plan.intent.objective}. Topic: {plan.intent.topic}\n"
             f"This run admits {len(admitted)} of {company_count} requested companies. "
             f"Use one whole group per delegation: {manifest}\n"
-            "Compare the same topic across the assigned filings. Synthesize only supported findings and cite "
+            f"{approach} Synthesize only supported findings and cite "
             "original chunks. Disclose unexamined targets and unresolved or conflicting evidence. "
             "A search miss cannot establish that a risk was absent or newly introduced."
         )

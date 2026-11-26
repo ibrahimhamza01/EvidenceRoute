@@ -121,7 +121,7 @@ class BedrockRootClient(ClaudeRootClient):
         super().__init__(transport, config=config, clock=clock, wait=wait)
 
     @classmethod
-    def from_env(cls, *, disable_retries: bool = False) -> BedrockRootClient:
+    def from_env(cls, *, disable_retries: bool = False, clock: Callable[[], float] = monotonic) -> BedrockRootClient:
         if not os.getenv("BEDROCK_MODEL_ID"):
             raise ValueError("Set BEDROCK_MODEL_ID to an inference profile or model authorized for your account.")
         config = BedrockConfig.from_env(model_variable="BEDROCK_MODEL_ID")
@@ -135,22 +135,30 @@ class BedrockRootClient(ClaudeRootClient):
         updates = {"region": region}
         if disable_retries:
             updates["max_retries"] = 0
-        return cls(BedrockConverseTransport(session, region=region), config=config.model_copy(update=updates))
+        return cls(BedrockConverseTransport(session, region=region), config=config.model_copy(update=updates), clock=clock)
 
     def _payload(self, tools: list[dict]) -> dict:
         policy = self._finalization_policy()
-        inference = {"maxTokens": policy.finalization_max_output_tokens if policy else self.config.max_output_tokens}
         choice = {"tool": {"name": _FINISH}} if policy and policy.finalization_tool_choice == "required" else {"auto": {}}
         if not self._finish_allowed:
             choice = {"tool": {"name": _DELEGATE}}
+        return self._converse_payload(
+            tools, choice, self._system_prompt(), self._messages,
+            policy.finalization_max_output_tokens if policy else self.config.max_output_tokens,
+        )
+
+    def _converse_payload(
+        self, tools: list[dict], choice: dict, system: str, messages: list[dict], output_cap: int,
+    ) -> dict:
+        inference = {"maxTokens": output_cap}
         if self.config.temperature is not None:
             inference["temperature"] = self.config.temperature
         if self.config.top_p is not None:
             inference["topP"] = self.config.top_p
         return {
             "modelId": self.config.model,
-            "system": [{"text": self._system_prompt()}],
-            "messages": self._messages,
+            "system": [{"text": system}],
+            "messages": messages,
             "inferenceConfig": inference,
             "toolConfig": {"toolChoice": choice, "tools": [
                 {"toolSpec": {

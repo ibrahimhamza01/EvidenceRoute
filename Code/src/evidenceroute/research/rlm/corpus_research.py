@@ -187,25 +187,28 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
 def execute_corpus_research(
     plan: ResearchPlan, runner: RecursiveResearch, *, limits: CorpusLimits, max_groups: int = 2,
     scan_terms: tuple[str, ...] | None = None, root_guidance: str | None = None,
-    detailed_trace: bool = False, discovery: DiscoverySpec | None = None,
+    detailed_trace: bool = False, discovery: DiscoverySpec | None = None, _deadline: float | None = None,
 ) -> CorpusResearchResult:
     """Run a resolved plan in ticker order, settling one tree before admitting the next."""
-    if runner.comparison_scan is not None:
+    if runner.comparison_scan is not None or runner.discovery_scan is not None:
         raise ValueError("Pass discovery or scan_terms so the lexical scan is charged to this corpus execution.")
     if discovery is not None and scan_terms is not None:
         raise ValueError("Choose either normalized discovery or the literal-term baseline.")
-    comparative = discovery is not None or scan_terms is not None
+    review_discovery = discovery is not None and plan.intent.objective == "review"
+    comparative = scan_terms is not None or (discovery is not None and not review_discovery)
     if comparative and (plan.intent.objective != "year_over_year" or len(set(plan.intent.fiscal_years)) != 2):
         raise ValueError("Comparative execution requires a two-year comparison.")
     clock = runner.clock
     started = clock()
     deadline = started + limits.deadline_seconds
+    if _deadline is not None:
+        deadline = min(deadline, _deadline)
     run_id = uuid4().hex
     schedule, pending = _schedule(plan, runner, max_groups)
     scheduled = {group.ticker: number for number, groups in enumerate(schedule, 1) for group in groups}
     scan = None
     remaining_seconds = deadline - clock()
-    if comparative and remaining_seconds > 0:
+    if (comparative or review_discovery) and remaining_seconds > 0:
         options = dict(max_chunks=limits.max_scan_chunks, max_pages=limits.max_scan_pages,
                        deadline_seconds=min(limits.scan_deadline_seconds, remaining_seconds), clock=clock)
         if discovery is not None:
@@ -213,7 +216,10 @@ def execute_corpus_research(
         else:
             scan = scan_research_plan(runner.corpus, plan, scan_terms, **options)
         runner = copy(runner)
-        runner.comparison_scan = scan
+        if comparative:
+            runner.comparison_scan = scan
+        else:
+            runner.discovery_scan = scan
 
     batches = []
     traces = []
@@ -278,6 +284,9 @@ def execute_corpus_research(
     child_findings = tuple(finding for child in coverage.invocations if child.invocation.parent_id in roots
                            and child.stop_reason == "finished" for finding in child.findings
                            if finding.finding_id in child.findings_acknowledged_by_parent)
+    if review_discovery:
+        used_ids = {finding_id for trace in traces if trace.stop_reason == "finished" for finding_id in trace.used_finding_ids}
+        selected = tuple(finding for finding in child_findings if finding.finding_id in used_ids)
     retained = tuple(finding for child in coverage.invocations if child.invocation.parent_id is not None
                      and child.stop_reason == "finished" for finding in child.findings
                      if finding.finding_id not in child.findings_acknowledged_by_parent)
@@ -337,6 +346,13 @@ def execute_corpus_research(
         answer += ("\n\nResearch is incomplete. Evidence applies to the passages reviewed. "
                    "This result cannot establish absence or answer for the full requested scope."
                    if incomplete else "\n\nResearch conclusions await independent semantic verification.")
+        if review_discovery and (root_findings or selected):
+            answer += "\n\nFindings selected or submitted by finished roots.\n" + "\n".join(
+                f"{finding.evidence[0].source.ticker} FY{finding.evidence[0].source.fiscal_year}"
+                f" [{finding.analysis_status}] {finding.claim} Evidence chunks "
+                + ", ".join(dict.fromkeys(item.source.chunk_id for item in finding.evidence))
+                for finding in (*root_findings, *selected)
+            )
     return CorpusResearchResult(plan, limits, run_id, groups, tuple(batches), coverage, scan, usage,
                                 root_findings, selected, child_findings, retained, root_comparisons, child_comparisons, evidence,
                                 tuple(citations[key] for key in sorted(citations)), tuple(sorted(assessed)), tuple(errors),
