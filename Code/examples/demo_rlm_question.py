@@ -18,7 +18,8 @@ from evidenceroute.research.rlm.tools import observation_json, trace_data
 
 OFFLINE_CASES = {
     "What AI infrastructure supply risks does Amazon disclose in FY2024 Item 1A?": {
-        "company": "AMZN", "section_inferred": False, "topic": "AI infrastructure supply risks",
+        "company": "AMZN", "section_selection": "explicit", "section_ids": ["item_1a"],
+        "topic": "AI infrastructure supply risks",
         "phrases": ["AI infrastructure", "semiconductor products", "graphics processing units", "supply constraints"],
         "chunk_id": "4d1474550060251037c5f981",
         "quote": "For example, we rely on a limited group of suppliers for semiconductor products, "
@@ -26,7 +27,8 @@ OFFLINE_CASES = {
         "claim": "Amazon discloses reliance on a limited group of semiconductor suppliers for products including GPUs.",
     },
     "What foreign exchange risks does Apple disclose in FY2024?": {
-        "company": "AAPL", "section_inferred": True, "topic": "Foreign exchange exposure",
+        "company": "AAPL", "section_selection": "risk_factors_default", "section_ids": [],
+        "topic": "Foreign exchange exposure",
         "phrases": ["foreign currency", "exchange rate fluctuations", "foreign exchange"],
         "chunk_id": "cd7988623c9a3bf545f06045",
         "quote": "The weakening of foreign currencies relative to the U.S. dollar adversely affects the U.S. dollar value "
@@ -41,9 +43,6 @@ class ScriptedInterpretationTransport:
     def send(self, payload, *, timeout_seconds):
         question = json.loads(payload["messages"][0]["content"][0]["text"])["question"]
         case = OFFLINE_CASES[question]
-        inferred = ["objective", "comprehensive"]
-        if case["section_inferred"]:
-            inferred.append("section_ids")
         return {
             "stopReason": "tool_use",
             "output": {"message": {"role": "assistant", "content": [{"toolUse": {
@@ -52,10 +51,10 @@ class ScriptedInterpretationTransport:
                 "input": {
                     "mode": "review", "explanation": None, "discovery_phrases": case["phrases"],
                     "requirements": {"company_selection": "explicit", "companies": [case["company"]],
-                                     "fiscal_years": [2024], "section_ids": ["item_1a"], "objective": "review",
-                                     "topic": case["topic"], "comprehensive": False, "inferred_fields": inferred,
-                                     "scope_notes": "Bounded disclosure review."
-                                                    + (" Use Item 1A for this risk question." if case["section_inferred"] else "")},
+                                     "fiscal_years": [2024], "section_selection": case["section_selection"],
+                                     "section_ids": case["section_ids"], "objective": "review", "topic": case["topic"],
+                                     "comprehensive": False, "inferred_fields": ["objective", "comprehensive"],
+                                     "scope_notes": "Bounded disclosure review."},
                 },
             }}]}},
         }

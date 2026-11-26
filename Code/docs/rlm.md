@@ -765,10 +765,10 @@ To reproduce this checkpoint with authorized Bedrock credentials, use the refere
 | Explicit company, year, or filing section | Preserve named requirements, including unavailable ones. Claude maps unambiguous aliases using the inventory, and Python resolves the resulting ticker or exact recorded name. Unknown names and unavailable filing or section slots stay in the plan. A group with an unresolved requirement remains pending under the existing whole-group admission policy. |
 | Corpus-wide scope | Apply all corpus companies to explicit corpus-wide requests and unqualified “which companies” questions. Mark the latter company universe as inferred. Mark comprehensiveness for questions that require evaluating every requested target. |
 | Unspecified or relative fiscal years | A descriptive review with no year uses the latest fiscal year in the snapshot, FY2024 here, as an inferred requirement even when it is unavailable for a named company. Relative periods and missing comparison years call for clarification. |
-| Unspecified or ambiguous section or company | Use Item 1A for risk-factor questions as an inferred section. Ask for clarification when company scope or identity is ambiguous or when the appropriate section is unclear. Requests for full filings or all sections are unsupported because the corpus contains selected sections. |
+| Unspecified or ambiguous section or company | For risk-factor questions with no named section, Python defaults to Item 1A and records the inferred scope. Ask for clarification when company scope or identity is ambiguous or when the appropriate section is unclear. Requests for full filings or all sections are unsupported because the corpus contains selected sections. |
 | Objective | Descriptive SEC disclosure reviews use the generic evidence pipeline with scoped candidate pages and exact quotes. Supported AI infrastructure risk comparisons require exactly two distinct fiscal years and comprehensive review within the requested scope, including yes/no novelty questions. Other comparison topics, predictions, recommendations, and objectives requiring external data return an unsupported outcome. |
 
-Defaults must appear in `inferred_fields` with a concise `scope_notes` explanation. The host checks that inferred years and sections follow policy and that the execution mode matches the objective. Only a valid executable interpretation reaches plan resolution. Schema and corpus checks establish shape and resolvability. Fidelity to the wording of the question, including alias judgments and scope extraction, still depends on the model.
+The resolved intent records defaults in `inferred_fields` with a concise `scope_notes` explanation. The host materializes the default section, validates inferred years, and checks that the execution mode matches the objective. Only a valid executable interpretation reaches plan resolution. Schema and corpus checks establish shape and resolvability. Fidelity to the wording of the question, including alias judgments and scope extraction, still depends on the model.
 
 Interpretation defaults to at most two attempts, 1,024 output tokens per attempt within the configured Claude cap, a 16,000-token charge threshold, and a 30-second cooperative deadline. The phase uses the lower of its limits and the overall allowances. The existing Converse transport applies the configured retry policy, credential chain, timeout caps, and sanitized error codes. Each attempt records transport latency, available provider latency and reported token counters, estimated tokens, output cap, stop reason, and errors. A missing input or output counter charges the larger of the request estimate or the available reported usage. Admission checks the estimate before each request, and an observed overage blocks research. Estimates use the existing request-byte heuristic. A blocking SDK operation can overrun the deadline.
 
@@ -825,7 +825,25 @@ PYTHONPATH=Code/src python -m pytest -q Code/tests/test_rlm_natural_language.py 
 
 The mocked Apple review exercises a missing-field repair and passes the corrected plan into scoped research, ending with one original citation. Verification passed 313 focused RLM tests and 53 related regressions, each with the existing AnyIO warning. Both question demos and the earlier planning, recursive, discovery, comparative, corpus, and Standard RAG demos ran offline. The limited corpus demo returned its expected partial result and exit code 1.
 
-The exact live Apple rejection and live correction success rate remain unknown. Amazon's protected finalization failures and the root–child disagreement on the Alphabet comparison remain open.
+The exact rejected payload from the first live Apple run remains unknown. Amazon's protected finalization failures and the root–child disagreement on the Alphabet comparison remain open.
+
+#### Apple correction validation
+
+At `58078c4`, the rerun in `rlm-question-foreign-exchange-correction-validation.json` returned `tool_use` without truncation on both attempts. Correction ran on attempt 2. Both attempts reported `invalid_inferred_sections` in the `inconsistent_requirements` category at `requirements.section_ids`. The saved report omits the rejected section IDs. The run consumed 6,715 reported and charged tokens in 7.56 seconds. Plan resolution, discovery, and recursive research never started.
+
+The previous contract asked Claude to generate inferred section IDs, then validated them against a fixed Item 1A default. The provider now selects `explicit` with all requested `section_ids`, or `risk_factors_default` with an empty list. Python supplies `item_1a` for the default, adds `section_ids` to `inferred_fields`, and records that the plan covers only Item 1A. Explicit IDs reach the existing planner, where an unavailable section such as Item 7A stays unresolved.
+
+Correction feedback spells out both forms of the contract. A malformed default can be corrected by clearing its IDs. Correction preserves an explicit section selection even if the default would resolve to the same Item 1A target. Requests with unclear scope can still return a clarification. The existing retry and resource ceilings apply.
+
+The offline Amazon demo supplies explicit Item 1A. The Apple demo selects the Python default. The mocked correction regression submits a representative malformed default, repairs it, and exercises the resulting scope through research. Verification passed 323 focused RLM tests and 53 related regressions with the existing AnyIO warning. Both question demos and the legacy demos ran offline.
+
+#### Live Apple validation with deterministic section selection
+
+Run `ee6e51027fb348ed9cf351fbf070ef30` interpreted the Apple foreign-exchange question on the first attempt as an AAPL FY2024 review with inferred Item 1A. The interpreter generated 13 discovery phrases and used 3,367 reported and charged tokens in approximately 3.09 seconds, with no validation failures or correction. The scan examined 53 chunks and found five candidates. The child received all five candidate chunks in full.
+
+Research used 12 provider attempts, 74,172 reported tokens, and nine corpus operations in approximately 72.99 seconds. The overall run used 13 attempts and 77,539 reported tokens in 76.08 seconds. The child had a truncated investigation response followed by two `invalid_findings` protected finishes. The root made two recovery searches, then received `invalid_action` and `invalid_findings` on its protected finishes. Both exhausted their finalization allocations.
+
+Interpretation succeeded. Research execution and research completeness remained incomplete, with no accepted findings or citations and no independent semantic verification.
 
 ## Ongoing engineering record
 

@@ -28,8 +28,9 @@ def _structured(*, mode="review", phrases=None, **overrides):
         "discovery_phrases": ["foreign currency", "foreign exchange"] if phrases is None else phrases,
         "requirements": {
             "company_selection": "explicit", "companies": ["Apple Inc."], "fiscal_years": [2024],
-            "section_ids": ["item_1a"], "objective": "review", "topic": "Foreign exchange exposure",
-            "comprehensive": False, "inferred_fields": ["section_ids"], "scope_notes": "Use the risk factors section.",
+            "section_selection": "risk_factors_default", "section_ids": [],
+            "objective": "review", "topic": "Foreign exchange exposure",
+            "comprehensive": False, "inferred_fields": [], "scope_notes": None,
             **overrides,
         },
     }
@@ -125,13 +126,19 @@ def test_inventory_and_original_question_reach_one_forced_structured_request(cor
     assert outcome.status == "ready"
     assert result.plan.requested_companies == ("GOOGL",)
     assert result.plan.required_target_count == 1
+    assert outcome.intent.section_ids == ("item_1a",)
     assert outcome.intent.inferred_fields == ("section_ids",)
-    assert outcome.intent.scope_notes == "Use the risk factors section."
+    assert outcome.intent.scope_notes == "No filing section was specified. This plan is limited to Item 1A (Risk Factors)."
     assert outcome.discovery.phrases == ("data center", "technical infrastructure")
     assert len(transport.requests) == 1
     payload, _ = transport.requests[0]
     assert payload["toolConfig"]["toolChoice"] == {"tool": {"name": "interpret_research_question"}}
     assert len(payload["toolConfig"]["tools"]) == 1
+    schema = payload["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]
+    requirements = schema["$defs"]["_Requirements"]
+    assert "section_selection" in requirements["required"]
+    assert requirements["properties"]["section_selection"]["enum"] == ["explicit", "risk_factors_default"]
+    assert "section_ids" not in requirements["properties"]["inferred_fields"]["items"]["enum"]
     submitted = json.loads(payload["messages"][0]["content"][0]["text"])
     assert submitted["question"] == result.question == result.plan.intent.question
     inventory = submitted["corpus_inventory"]
@@ -144,11 +151,11 @@ def test_inventory_and_original_question_reach_one_forced_structured_request(cor
 
 @pytest.mark.parametrize("explicit", [False, True])
 def test_corpus_wide_scope_uses_latest_snapshot_year(corpus, explicit):
-    inferred = ["fiscal_years", "section_ids"]
+    inferred = ["fiscal_years"]
     if not explicit:
         inferred.extend(["company_selection", "comprehensive"])
     data = _structured(company_selection="all", companies=[], comprehensive=True,
-                       inferred_fields=inferred, scope_notes="Use the latest snapshot year and Item 1A.")
+                       inferred_fields=inferred, scope_notes="Use the latest snapshot year.")
     question = "List every company in this corpus with foreign exchange risk." if explicit else (
         "Which companies discuss foreign exchange risk?"
     )
@@ -157,6 +164,8 @@ def test_corpus_wide_scope_uses_latest_snapshot_year(corpus, explicit):
     assert result.plan.intent.company_selection == "all"
     assert result.plan.intent.comprehensive
     assert result.plan.intent.fiscal_years == (2024,)
+    assert result.plan.intent.inferred_fields == (*inferred, "section_ids")
+    assert result.plan.intent.scope_notes.startswith("Use the latest snapshot year.")
     assert ("company_selection" in result.plan.intent.inferred_fields) is not explicit
     assert len(result.plan.requested_companies) == result.plan.required_target_count == 25
     assert result.research.research_status == "incomplete"
@@ -164,7 +173,7 @@ def test_corpus_wide_scope_uses_latest_snapshot_year(corpus, explicit):
 
 def test_explicit_unavailable_scope_remains_in_plan(corpus):
     data = _structured(companies=["Apple Inc.", "Unlisted Corp."], fiscal_years=[2024, 2025],
-                       section_ids=["item_1a", "item_9a"], inferred_fields=[], scope_notes=None)
+                       section_selection="explicit", section_ids=["item_1a", "item_9a"])
     result = _run(corpus, MockTransport([_interpretation(data)]), question=(
         "Review foreign exchange disclosures by Apple and Unlisted Corp. in FY2024 and FY2025 Items 1A and 9A."
     ))
@@ -177,11 +186,38 @@ def test_explicit_unavailable_scope_remains_in_plan(corpus):
     assert result.research.research_status == "incomplete"
 
 
+def test_explicit_multiple_sections_are_preserved(corpus):
+    data = _structured(section_selection="explicit", section_ids=["item_7", "item_8"])
+    result = _run(corpus, MockTransport([_interpretation(data)]), max_batches=0,
+                  question="What foreign exchange risks did Apple disclose in FY2024 Items 7 and 8?")
+    assert result.plan.intent.section_ids == ("item_7", "item_8")
+    assert result.plan.intent.inferred_fields == () and result.plan.intent.scope_notes is None
+    assert {target.section_id for target in result.plan.resolved_targets} == {"item_7", "item_8"}
+    assert result.plan.missing_requirements == ()
+
+
+def test_explicit_item_7a_remains_unavailable(corpus):
+    data = _structured(section_selection="explicit", section_ids=["item_7a"])
+    result = _run(corpus, MockTransport([_interpretation(data)]),
+                  question="What foreign exchange risks did Apple disclose in FY2024 Item 7A?")
+    assert result.plan.intent.section_ids == ("item_7a",)
+    assert result.plan.intent.inferred_fields == ()
+    assert result.plan.resolved_targets == ()
+    missing, = result.plan.missing_requirements
+    assert (missing.company, missing.fiscal_year, missing.section_id, missing.reason) == (
+        "AAPL", 2024, "item_7a", "missing_section",
+    )
+    assert result.research.groups[0].pending_reason == "unresolved_requirements"
+    assert result.research.batches == ()
+
+
 @pytest.mark.parametrize(("data", "question", "status", "reason"), [
     (_blocked("unsupported", "The comparison concerns foreign exchange risk."),
      "Compare Apple's FY2023 and FY2024 foreign exchange risk.", "unsupported", "unsupported"),
     (_blocked("ambiguous", "Which company and fiscal years should be compared?"),
      "How did the company's risk change recently?", "ambiguous", "ambiguous"),
+    (_blocked("ambiguous", "Which filing section should be reviewed?"),
+     "What did Apple disclose in FY2024?", "ambiguous", "ambiguous"),
     (_structured(mode="ai_infrastructure_comparison", objective="year_over_year", fiscal_years=[2022, 2023, 2024]),
      "Compare AI infrastructure risks in 2022, 2023 and 2024.", "unsupported", "unsupported_comparison_years"),
 ])
@@ -198,10 +234,14 @@ def test_blocked_questions_have_explicit_outcomes(corpus, data, question, status
     (_structured(fiscal_years=["2024"]), ValidationIssue("requirements.fiscal_years[0]", "schema", "int_type")),
     (_structured(comprehensive=1), ValidationIssue("requirements.comprehensive", "schema", "bool_type")),
     (_structured(extra_field="private provider content"), ValidationIssue("requirements", "schema", "extra_forbidden")),
-    (_structured(fiscal_years=[2023], inferred_fields=["fiscal_years"]),
+    (_structured(fiscal_years=[2023], inferred_fields=["fiscal_years"], scope_notes="Use the latest snapshot year."),
      ValidationIssue("requirements.fiscal_years", "inconsistent_requirements", "invalid_inferred_years")),
-    (_structured(inferred_fields=["section_ids"], scope_notes=None),
+    (_structured(inferred_fields=["topic"], scope_notes=None),
      ValidationIssue("requirements.scope_notes", "inconsistent_requirements", "scope_notes_required")),
+    (_structured(inferred_fields=["section_ids"], scope_notes="Inferred section."),
+     ValidationIssue("requirements.inferred_fields[0]", "schema", "literal_error")),
+    (_structured(section_selection="explicit"),
+     ValidationIssue("requirements.section_ids", "inconsistent_requirements", "explicit_sections_required")),
     (_structured(companies=[]),
      ValidationIssue("requirements.companies", "inconsistent_requirements", "company_selection_mismatch")),
     (_structured(mode="ai_infrastructure_comparison", objective="year_over_year", fiscal_years=[2024]),
@@ -263,6 +303,28 @@ def test_correction_uses_fresh_native_request_and_bounded_sanitized_feedback(cor
     assert result.usage.provider_attempts == 2 and result.usage.reported_tokens == 250
     assert result.research.limits.max_provider_attempts == 7
     assert result.research.limits.max_reported_tokens == 29_750
+
+
+def test_correction_clears_generated_ids_from_risk_default(corpus):
+    # Representative malformed default. The live report did not record which IDs were submitted.
+    first = _structured(section_ids=["item_7a"])
+    transport = MockTransport([_interpretation(first), _interpretation(_structured())])
+    result = _run(corpus, transport, max_batches=0,
+                  question="What foreign exchange risks did Apple disclose in its FY2024 annual report?")
+    report = result.interpretation
+    assert report.correction_attempt == 2
+    failure, = report.validation_failures
+    assert failure.issues == (
+        ValidationIssue("requirements.section_ids", "inconsistent_requirements", "default_section_ids_must_be_empty"),
+    )
+    system = transport.requests[1][0]["system"][0]["text"]
+    assert 'use "risk_factors_default" with section_ids []' in system
+    assert 'For expressly named sections, use "explicit" with every requested ID' in system
+    assert "Leave section_ids out of inferred_fields" in system
+    assert result.plan.intent.section_ids == ("item_1a",)
+    assert result.plan.intent.inferred_fields == ("section_ids",)
+    assert result.plan.missing_requirements == ()
+    assert result.usage.provider_attempts == 2 and result.usage.reported_tokens == 250
 
 
 def test_invalid_correction_stops_after_one_correction_even_with_a_spare_attempt(corpus):
@@ -340,7 +402,8 @@ def test_correction_shares_deadline_and_rejects_late_response(corpus):
 ])
 def test_correction_cannot_narrow_or_substitute_previously_valid_explicit_scope(corpus, field, change):
     question = "Did Amazon and Unlisted Corp. disclose a new AI infrastructure risk in FY2024 versus FY2023 Item 1A?"
-    scope = {"companies": ["AMZN", "Unlisted Corp."], "fiscal_years": [2023, 2024], "section_ids": ["item_1a"],
+    scope = {"companies": ["AMZN", "Unlisted Corp."], "fiscal_years": [2023, 2024],
+             "section_selection": "explicit", "section_ids": ["item_1a"],
              "objective": "year_over_year", "inferred_fields": [], "scope_notes": None}
     first = _structured(mode="ai_infrastructure_comparison", **scope)
     mode = "review" if field == "objective" else "ai_infrastructure_comparison"
@@ -355,10 +418,26 @@ def test_correction_cannot_narrow_or_substitute_previously_valid_explicit_scope(
     assert result.plan is result.research is None
 
 
+@pytest.mark.parametrize("first_selection", ["explicit", None])
+@pytest.mark.parametrize("section_ids", [["item_1a"], ["item_7a"]])
+def test_correction_cannot_replace_explicit_section_with_default(corpus, first_selection, section_ids):
+    first = _structured(section_selection="explicit", section_ids=section_ids, phrases=[])
+    if first_selection is None:
+        first["requirements"].pop("section_selection")
+    transport = MockTransport([_interpretation(first), _interpretation(_structured())])
+    result = _run(corpus, transport, question=f"What foreign exchange risks did Apple disclose in FY2024 {section_ids[0]}?")
+    report = result.interpretation
+    assert report.correction_attempt == 2
+    assert report.validation_failures[1].issues == (
+        ValidationIssue("requirements.section_selection", "inconsistent_requirements", "correction_changed_scope"),
+    )
+    assert result.plan is result.research is None
+
+
 def test_inconsistent_inferred_default_can_be_repaired(corpus):
-    first = _structured(fiscal_years=[2023], inferred_fields=["fiscal_years", "section_ids"])
-    corrected = _structured(fiscal_years=[2024], inferred_fields=["fiscal_years", "section_ids"],
-                            scope_notes="Use the latest snapshot year and Item 1A.")
+    first = _structured(fiscal_years=[2023], inferred_fields=["fiscal_years"], scope_notes="Use the latest snapshot year.")
+    corrected = _structured(fiscal_years=[2024], inferred_fields=["fiscal_years"],
+                            scope_notes="Use the latest snapshot year.")
     result = _run(corpus, MockTransport([_interpretation(first), _interpretation(corrected)]), max_batches=0,
                   question="What foreign exchange risks does Apple disclose?")
     assert result.plan.intent.fiscal_years == (2024,)
@@ -494,9 +573,7 @@ def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus
 
     replies = [_interpretation(_structured())]
     if needs_correction:
-        incomplete = _structured()
-        incomplete["requirements"].pop("scope_notes")
-        replies.insert(0, _interpretation(incomplete))
+        replies.insert(0, _interpretation(_structured(section_ids=["item_7a"])))
     result = _run(corpus, MockTransport(replies), research_factory=factory, clock=clock, max_provider_attempts=10)
     child_first = transports[1].requests[0][0]
     child_prompt = child_first["messages"][0]["content"][0]["text"]
@@ -528,8 +605,8 @@ def test_two_year_ai_comparison_uses_existing_comparative_execution(corpus):
                        companies=["AMZN"], topic="AI infrastructure supply risk", phrases=["semiconductor products"])
     corrected = {
         **data, "requirements": {**data["requirements"], "comprehensive": True,
-                                 "inferred_fields": ["section_ids", "comprehensive"],
-                                 "scope_notes": "Use Item 1A and review both years to evaluate novelty."},
+                                 "inferred_fields": ["comprehensive"],
+                                 "scope_notes": "Review both years to evaluate novelty."},
     }
 
     def factory(invocation):
