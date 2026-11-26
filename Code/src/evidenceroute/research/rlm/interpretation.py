@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 import json
-import re
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from evidenceroute.research.rlm.bedrock import BedrockRootClient
-from evidenceroute.research.rlm.budget import BudgetExceeded, SharedBudget, SharedLimits
+from evidenceroute.research.rlm.budget import BudgetExceeded, EstimatedTokenBudget
 from evidenceroute.research.rlm.claude import ClaudeModelError
-from evidenceroute.research.rlm.controller import ModelAttempt
 from evidenceroute.research.rlm.discovery import DiscoveryPhrases, DiscoverySpec
 from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.planning import IntentRequirements, ResearchIntent, _items, _name_key
@@ -182,27 +179,8 @@ class InterpretationOutcome:
     discovery: DiscoverySpec | None = None
 
 
-class InterpretationBudget(SharedBudget):
-    """Use reported usage, reserving the request estimate when usage is missing."""
-
-    def __init__(self, *, max_attempts: int, token_limit: int, deadline: float, clock: Callable[[], float]):
-        super().__init__(SharedLimits(max_provider_attempts=max_attempts, max_reported_tokens=max(1, token_limit),
-                                     deadline_seconds=max(1.0, deadline - clock())), clock, deadline=deadline)
-        self.token_limit = token_limit
-        self.charged_tokens = 0
-
-    def check_provider_attempt(self, *, estimated_tokens: int | None = None) -> None:
-        super().check_provider_attempt(estimated_tokens=estimated_tokens)
-        if self.charged_tokens >= self.token_limit or self.charged_tokens + (estimated_tokens or 0) > self.token_limit:
-            raise BudgetExceeded("interpretation_token_limit")
-
-    def record_provider_usage(self, attempt: ModelAttempt) -> None:
-        before = self.reported_tokens
-        super().record_provider_usage(attempt)
-        reported = self.reported_tokens - before
-        if attempt.input_tokens is None or attempt.output_tokens is None:
-            reported = max(reported, attempt.estimated_tokens or 0)
-        self.charged_tokens += reported
+class InterpretationBudget(EstimatedTokenBudget):
+    token_stop = "interpretation_token_limit"
 
 
 def _inventory(corpus: CorpusEnvironment, budget: InterpretationBudget) -> dict:
@@ -356,19 +334,9 @@ class BedrockIntentInterpreter(BedrockRootClient):
         raise AssertionError("The correction loop must return or raise.")
 
     def _tool_arguments(self, response: dict, reason: str | None) -> dict:
-        if reason == "max_tokens":
-            raise ClaudeModelError("truncated_response")
-        assistant = self._assistant_message(response)
-        if reason != "tool_use" or assistant is None:
-            raise ClaudeModelError("missing_structured_interpretation")
-        uses = self._tool_uses(assistant["content"])
-        if len(uses) != 1:
-            raise ClaudeModelError("invalid_interpretation_tool_use")
-        use = uses[0]
-        if (use["name"] != _TOOL or not isinstance(use["input"], dict)
-                or not isinstance(use["id"], str) or not re.fullmatch(self._tool_use_id_pattern, use["id"])):
-            raise ClaudeModelError("invalid_interpretation_tool_use")
-        return use["input"]
+        return self._structured_tool_arguments(
+            response, reason, _TOOL, missing="missing_structured_interpretation", invalid="invalid_interpretation_tool_use",
+        )
 
     @staticmethod
     def _validate_interpretation(

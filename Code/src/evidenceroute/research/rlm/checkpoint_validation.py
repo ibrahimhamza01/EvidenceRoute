@@ -18,12 +18,13 @@ from evidenceroute.research.rlm.planning import ResearchPlan, resolve_research_p
 from evidenceroute.research.rlm.research_coverage import InvocationOutcome, _Access, _target_coverage
 from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import EvidenceRef
+from evidenceroute.research.rlm.verification_records import comparison_id, validate_review_evidence
 from evidenceroute.schemas import Chunk
 
 if TYPE_CHECKING:
     from evidenceroute.research.rlm.checkpoint import CheckpointRun, ResearchCheckpoint
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSIONS = (1, 2)
 
 
 class CheckpointError(ValueError):
@@ -367,8 +368,10 @@ def _validate_assignments(run: CheckpointRun, plan: ResearchPlan,
 
 
 def validate_checkpoint(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironment) -> None:
-    _require(type(checkpoint.version) is int and checkpoint.version == CHECKPOINT_VERSION,
+    _require(type(checkpoint.version) is int and checkpoint.version in CHECKPOINT_VERSIONS,
              "Unsupported checkpoint schema version.")
+    _require((checkpoint.version == 2) == bool(checkpoint.verification_runs),
+             "Checkpoint version does not match its verification history.")
     _require(checkpoint.corpus_identity == corpus.snapshot_identity, "Checkpoint corpus identity does not match the loaded snapshot.")
     plan = checkpoint.plan
     _require(plan == resolve_research_plan(plan.intent, corpus), "Checkpoint plan differs from its canonical original scope.")
@@ -404,3 +407,29 @@ def validate_checkpoint(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironmen
         nodes, new = _validate_coverage(run, plan, canonical, findings)
         findings.update(new)
         _validate_results(run, plan, canonical, nodes, findings)
+    _validate_verification_history(checkpoint)
+
+
+def _validate_verification_history(checkpoint: ResearchCheckpoint) -> None:
+    research_ids = tuple(run.run_id for run in checkpoint.runs)
+    seen = set()
+    for verification in checkpoint.verification_runs:
+        count = len(verification.research_run_ids)
+        _require(verification.run_id not in seen and verification.corpus_identity == checkpoint.corpus_identity
+                 and verification.research_run_ids == research_ids[:count],
+                 "Verification history does not match its source research runs.")
+        seen.add(verification.run_id)
+        source_runs = checkpoint.runs[:count]
+        findings = {finding.finding_id: finding for run in source_runs
+                    for node in run.coverage.invocations for finding in node.findings}
+        comparisons = {comparison_id(item): item for run in source_runs
+                       for item in (*run.root_comparisons, *run.acknowledged_child_comparisons)}
+        for item in verification.items:
+            comparison = comparisons.get(item.target_id) if item.kind == "comparison" else None
+            _require(set(item.finding_ids).issubset(findings)
+                     and (item.kind == "finding" or comparison is not None and item.finding_ids == comparison.finding_ids),
+                     "Verification references a finding or comparison outside its source runs.")
+            try:
+                validate_review_evidence(item, findings, comparison)
+            except ValueError as exc:
+                raise CheckpointError(str(exc)) from None

@@ -7,14 +7,14 @@ import os
 import stat
 from collections.abc import Iterable
 from copy import copy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from evidenceroute.research.rlm.checkpoint_validation import CHECKPOINT_VERSION, CheckpointError, validate_checkpoint
+from evidenceroute.research.rlm.checkpoint_validation import CHECKPOINT_VERSIONS, CheckpointError, validate_checkpoint
 from evidenceroute.research.rlm.comparison import Comparison
 from evidenceroute.research.rlm.corpus_research import (
     BatchOutcome, CorpusGroupOutcome, CorpusLimits, CorpusResearchResult, CorpusUsage, execute_corpus_research,
@@ -28,9 +28,11 @@ from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.research_coverage import ResearchCoverage, merge_research_coverage
 from evidenceroute.research.rlm.tools import EvidenceRef, observation_json
+from evidenceroute.research.rlm.verification_records import VerificationRun, VerificationUsage
 
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
 MAX_CHECKPOINT_RUNS = 64
+MAX_VERIFICATION_RUNS = 32
 
 
 class _CheckpointModel(BaseModel):
@@ -77,13 +79,14 @@ def _sum_usage(entries: Iterable[CorpusUsage]) -> CorpusUsage:
 
 
 class ResearchCheckpoint(_CheckpointModel):
-    version: Literal[1]
+    version: Literal[1, 2]
     corpus_identity: Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
     plan: ResearchPlan
     runs: tuple[CheckpointRun, ...] = Field(min_length=1, max_length=MAX_CHECKPOINT_RUNS)
     interpretation: CheckpointInterpretation | None = None
     discovery: DiscoverySpec | None = None
     scan_terms: tuple[Annotated[str, Field(min_length=1, max_length=200)], ...] = Field(default=(), max_length=32)
+    verification_runs: tuple[VerificationRun, ...] = Field(default=(), max_length=MAX_VERIFICATION_RUNS)
 
     @property
     def findings(self) -> tuple[Finding, ...]:
@@ -143,6 +146,20 @@ class ResearchCheckpoint(_CheckpointModel):
     def cumulative_usage(self) -> CorpusUsage:
         return _sum_usage((self.historical_usage, self.current_usage))
 
+    @property
+    def verification_usage(self) -> VerificationUsage:
+        return VerificationUsage(**{
+            field: sum(getattr(run.usage, field) for run in self.verification_runs)
+            for field in VerificationUsage.model_fields
+        })
+
+    @property
+    def combined_usage(self) -> CorpusUsage:
+        research, verification = self.cumulative_usage, self.verification_usage
+        fields = ("provider_attempts", "reported_tokens", "estimated_tokens", "attempts_with_missing_usage",
+                  "attempts_with_missing_estimate", "elapsed_seconds")
+        return replace(research, **{field: getattr(research, field) + getattr(verification, field) for field in fields})
+
     def merged_coverage(self, corpus: CorpusEnvironment) -> ResearchCoverage:
         if corpus.snapshot_identity != self.corpus_identity:
             raise CheckpointError("Checkpoint corpus identity does not match the loaded snapshot.")
@@ -176,7 +193,7 @@ def create_checkpoint(
         if discovery is None:
             scan_terms = scan_terms or result.scan.terms
     checkpoint = ResearchCheckpoint(
-        version=CHECKPOINT_VERSION, corpus_identity=corpus.snapshot_identity, plan=result.plan,
+        version=1, corpus_identity=corpus.snapshot_identity, plan=result.plan,
         runs=(CheckpointRun.from_result(result, result.plan.requested_companies),), interpretation=interpretation,
         discovery=discovery, scan_terms=scan_terms,
     )
@@ -247,7 +264,7 @@ def _decode_checkpoint(payload: bytes) -> ResearchCheckpoint:
         raise CheckpointError("Malformed checkpoint JSON.") from None
     if not isinstance(data, dict) or type(data.get("version")) is not int:
         raise CheckpointError("Checkpoint schema version is missing or invalid.")
-    if data["version"] != CHECKPOINT_VERSION:
+    if data["version"] not in CHECKPOINT_VERSIONS:
         raise CheckpointError("Unsupported checkpoint schema version.")
     del data
     try:
@@ -273,7 +290,8 @@ def load_checkpoint(path: Path | str, corpus: CorpusEnvironment) -> ResearchChec
 def save_checkpoint(path: Path | str, checkpoint: ResearchCheckpoint) -> None:
     """Write one checkpoint atomically using a same-directory, private temporary file."""
     target = Path(path)
-    payload = checkpoint.model_dump_json().encode("utf-8")
+    exclude = {"verification_runs"} if checkpoint.version == 1 and not checkpoint.verification_runs else None
+    payload = checkpoint.model_dump_json(exclude=exclude).encode("utf-8")
     _decode_checkpoint(payload)
     temporary = None
     try:

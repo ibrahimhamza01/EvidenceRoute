@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from contextlib import closing
 from time import monotonic, sleep
@@ -206,6 +207,24 @@ class BedrockRootClient(ClaudeRootClient):
             ):
                 raise ClaudeModelError("invalid_content")
         return uses
+
+    def _structured_tool_arguments(
+        self, response: dict, reason: str | None, name: str, *, missing: str, invalid: str,
+    ) -> dict:
+        """Decode one forced tool reply for a stateless Converse request."""
+        if reason == "max_tokens":
+            raise ClaudeModelError("truncated_response")
+        assistant = self._assistant_message(response)
+        if reason != "tool_use" or assistant is None:
+            raise ClaudeModelError(missing)
+        uses = self._tool_uses(assistant["content"])
+        if len(uses) != 1:
+            raise ClaudeModelError(invalid)
+        use, = uses
+        if (use["name"] != name or not isinstance(use["input"], dict) or not isinstance(use["id"], str)
+                or not re.fullmatch(self._tool_use_id_pattern, use["id"])):
+            raise ClaudeModelError(invalid)
+        return use["input"]
 
     def _usage_attempt(self, latency: float, response: dict) -> ModelAttempt:
         usage = response.get("usage") if isinstance(response, dict) else None

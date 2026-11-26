@@ -899,6 +899,40 @@ The offline demo saved and reloaded a two-company FY2024 Item 1A review after Ap
 
 Version 1 checkpoints settled runs through explicit saves. Conversation history, automatic crash recovery, cross-snapshot migration, concurrent writer coordination and semantic verification are outside this format. The merged research status remains incomplete after a focused continuation.
 
+#### Live checkpoint validation
+
+`rlm-checkpoint-live.py` ran each phase in a separate Python process with the expanded per-tree profile and a separately authorized one-batch corpus allowance. The FY2024 Item 1A review required Amazon and Alphabet. Loading both checkpoints against the canonical corpus confirmed that the complete first run record and all three original finding IDs survived in the continued checkpoint.
+
+| Stage | Execution and evidence | Attempts / reported tokens | Corpus operations / seconds | Lexical chunks scanned |
+| --- | --- | ---: | ---: | ---: |
+| Initial | AMZN finished with three retained findings and two citation chunks. GOOGL was pending at `batch_limit`. | 11 / 78,882 | 14 / 44.30 | 107 |
+| Continuation | The planner selected GOOGL alone. It finished with four additional findings and four citation chunks. | 10 / 71,734 | 14 / 37.50 | 63 |
+| Merged | Both assignments completed against the original two-target denominator. Seven findings and six unique citation chunks survived. | 21 / 150,616 | 28 / 81.81 | 170 |
+
+The initial scan examined 44 Amazon and 63 Alphabet chunks before the batch cap stopped investigation. The continuation scanned the same 63 Alphabet chunks again. The cumulative count measures scan work across 19 pages and three metadata reads. The records also show 176,056 estimated tokens, two delegations, two partition assignments and two finding-submission attempts. Execution finished and research remained incomplete, with partial access for each filing section. Both continuation invocations recorded zero acknowledged prior finding IDs. Same-company historical delivery was established offline.
+
+### Independent semantic verification
+
+`verify_checkpoint` reviews retained findings and comparisons in separately authorized batches. Each batch is a fresh Bedrock Converse invocation with one native `submit_verification` tool. The verifier receives the claim or comparative conclusion and numbered exact selected excerpts with fiscal years. Investigator assessments, rationales and conversation history stay outside the request. An invocation using the same underlying model can share its systematic errors. The results record a second model judgment, with statistical independence and semantic correctness still unestablished.
+
+The verifier must list each material component, including qualifiers, causal links and consequences. Each component receives a support, contradiction or insufficient-evidence assessment. Support and contradiction require selected evidence references. Insufficiency requires a concise gap. Python derives the finding result from the components. An explicit contradiction yields `contradicted`. A mix of supported and insufficient components yields `partially_supported`. Uniform support yields `supported`, and uniform insufficiency yields `insufficient_evidence`. Failed, skipped and missing assessments remain `unverified`. The host checks references and result consistency. Completeness of the component list still depends on the verifier.
+
+Comparative reviews assess the original conclusion and separately classify the risk relationship as shared, more specifically worded, different or unclear. A resolved relationship requires selected excerpts from both years. Earlier-year nonmention and an earlier statement that explicitly opposes the risk have separate fields. The host rejects contradiction attributed solely to a year marked nonmention or insufficient. A different risk in the selected excerpts leaves filing-wide novelty unresolved.
+
+The current span splitter divides at periods followed by whitespace, including after `U.S.`. Apple's strengthening-currency span `848:1098` therefore begins mid-sentence and omits both the opening condition and the adjacent component-cost sentence. The hedge-effectiveness span `1442:1667` omits the preceding forwards-and-options sentence. The verifier sees selected evidence only. Historical span IDs and the segmentation algorithm retain their existing meanings.
+
+`VerificationLimits` bounds attempts, estimated admission and charged usage, generated output, cases per run and batch, selected-evidence payload bytes, and elapsed time. A batch uses at most one provider attempt. Missing usage charges at least the request estimate, and measured overage or late replies retain their charges and leave the batch unverified. Reports show current and cumulative verification usage alongside research and combined usage. Version 2 checkpoints attach review results to stable finding and comparison identities, exact subject digests and the source run prefix. Version 1 files still load. Coverage and original findings remain available, and gap recommendations identify authorized filing sections for optional continuation.
+
+```bash
+export PYTHONPATH=Code/src AWS_EC2_METADATA_DISABLED=true HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+python Code/examples/demo_rlm_verification.py > rlm-verification-offline-report.json
+python -m pytest -q Code/tests/test_rlm_verification.py
+```
+
+The offline fixture uses Apple's two recorded compound claims and reconstructs the Alphabet comparison from canonical FY2023–FY2024 excerpts. In two mocked attempts, the Apple fixture produced two partial results for component costs and hedge contract types, one supported assessment of limited hedge effectiveness, and one contradicted hedge guarantee. In three mocked attempts, the Alphabet fixture produced five supported assessments and one insufficient assessment of the historical conflict claim. Its comparative results distinguished more-specific accelerator wording from a different product-recall risk while leaving filing-wide novelty unresolved. Both fixtures kept research incomplete.
+
+Verification passed 399 RLM tests, including 31 semantic verification tests, and 53 related regressions. The suites reported the existing AnyIO deprecation warning. The live-capable CLI requires `--live --checkpoint FILE --limits-file FILE`, with optional `--kind comparisons` and `--save-checkpoint FILE`. This milestone made zero paid calls. Live verifier accuracy and reliability remain unmeasured.
+
 ## Ongoing engineering record
 
 For each future milestone, add a short entry to this guide with the **problem and baseline**, **hypothesis**, **solution and alternatives**, **verification method**, **before-and-after results**, and **trade-offs and limitations**. Include a reproduction command and, where applicable, the model and provider, corpus scope, execution limits, commit reference, and whether verification was scripted, offline, or live. Identify which variables changed, how many trials ran, and which metrics were unavailable. Link to the relevant design decision when it already explains the architecture.

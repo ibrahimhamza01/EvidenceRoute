@@ -221,3 +221,28 @@ class SharedBudget:
             self.investigation_provider_attempts, self.finalization_provider_attempts,
             self.released_child_provider_slots, self.finding_submission_attempts,
         )
+
+
+class EstimatedTokenBudget(SharedBudget):
+    """Admit requests by estimate and charge available reported usage."""
+
+    token_stop = "estimated_token_limit"
+
+    def __init__(self, *, max_attempts: int, token_limit: int, deadline: float, clock: Callable[[], float]):
+        super().__init__(SharedLimits(max_provider_attempts=max_attempts, max_reported_tokens=max(1, token_limit),
+                                     deadline_seconds=max(1.0, deadline - clock())), clock, deadline=deadline)
+        self.token_limit = token_limit
+        self.charged_tokens = 0
+
+    def check_provider_attempt(self, *, estimated_tokens: int | None = None) -> None:
+        super().check_provider_attempt(estimated_tokens=estimated_tokens)
+        if self.charged_tokens >= self.token_limit or self.charged_tokens + (estimated_tokens or 0) > self.token_limit:
+            raise BudgetExceeded(self.token_stop)
+
+    def record_provider_usage(self, attempt: ModelAttempt) -> None:
+        before = self.reported_tokens
+        super().record_provider_usage(attempt)
+        reported = self.reported_tokens - before
+        if attempt.input_tokens is None or attempt.output_tokens is None:
+            reported = max(reported, attempt.estimated_tokens or 0)
+        self.charged_tokens += reported
