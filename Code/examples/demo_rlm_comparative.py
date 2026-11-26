@@ -9,7 +9,7 @@ from demo_rlm_plan import QUESTION, scripted_interpretation
 from demo_rlm_recursive import _invocation_report, _usage, _walk
 from evidenceroute.research.rlm import CorpusEnvironment
 from evidenceroute.research.rlm.bedrock import BedrockRootClient
-from evidenceroute.research.rlm.comparison import scan_research_plan
+from evidenceroute.research.rlm.comparison import render_comparative_scope, scan_research_plan
 from evidenceroute.research.rlm.controller import ScriptedModelClient
 from evidenceroute.research.rlm.planned_research import execute_research_plan
 from evidenceroute.research.rlm.planning import interpret_intent, resolve_research_plan
@@ -26,6 +26,13 @@ GUIDANCE = (
     "power, or supply constraint. General AI regulation and accelerator demand alone do not establish a risk. "
     "Use one concise finding and one exact span per passage. Leave room to read evidence in both years. "
     "Abstain if the available passages do not support a conclusion."
+)
+ROOT_GUIDANCE = (
+    "Ask each company investigator to compare the same risk across both years and look for "
+    "prior-year counterevidence. Reassess the strongest delivered spans and report each group's result, "
+    "including missing years and abstentions. Use separate relevance and entailment judgments. "
+    "Declare the delivered finding IDs you use and cite the original chunks. Finish with a partial synthesis "
+    "when a company investigation fails. Use the few follow-up calls only for a specific evidence gap."
 )
 
 
@@ -56,9 +63,10 @@ def _offline_factory(corpus, plan):
             amd_index = next((index for index, group in enumerate(groups, 1) if group.ticker == "AMD"), None)
             if amd_index is None:
                 return ScriptedModelClient([*actions, {"type": "finish", "answer": "No scripted evidence in scope."}])
+            namespace, separator, _ = invocation.invocation_id.rpartition(".")
             return ScriptedModelClient([*actions, {"type": "finish", "answer": "Sampled comparative research.",
                 "analysis_status": "incomplete", "cited_chunk_ids": [chunk.chunk_id for chunk in chunks],
-                "used_finding_ids": [f"child-{amd_index}:finding-{number}" for number in (1, 2)],
+                "used_finding_ids": [f"{namespace}{separator}child-{amd_index}:finding-{number}" for number in (1, 2)],
                 "findings": findings, "comparisons": [comparison],
             }])
         selected = {pair.document_id for pair in invocation.partitions}
@@ -95,23 +103,11 @@ def _diagnostics(invocations):
 
 
 def _scope_answer(result, comparisons, answer):
-    comparable = {item.ticker for item in comparisons if item.outcome == "comparable_both_years"}
-    inconclusive = {item.ticker for item in comparisons if item.outcome != "comparable_both_years"}
-    unresolved = [group.ticker for group in result.groups if group.admitted
-                  and (group.ticker not in comparable or group.ticker in inconclusive)]
-    not_admitted = [group.ticker for group in result.groups if not group.admitted]
-
-    lines = [
-        "Research is incomplete. Conclusions apply to the assessed passages only. "
-        "This result cannot establish absence of a risk or answer for the full requested scope."
-        if result.answer_status == "incomplete" else "Research conclusions await independent semantic verification.",
-        "Supported novelty. The validated comparisons establish no novelty conclusion.",
-        "Comparable existing risks. " + (", ".join(sorted(comparable)) or "None established in the assessed comparisons."),
-        "Structured assessments.\n" + answer,
-        "Admitted companies with unresolved assessments. " + (", ".join(unresolved) or "None identified."),
-        f"Companies outside the admitted scope ({len(not_admitted)}). " + (", ".join(not_admitted) or "None."),
-    ]
-    return "\n\n".join(lines)
+    return render_comparative_scope(
+        tuple(comparisons), answer, requested=tuple(group.ticker for group in result.groups),
+        admitted={group.ticker for group in result.groups if group.admitted},
+        incomplete=result.answer_status == "incomplete",
+    )
 
 
 def _report(result, scan, live, detailed=False):
@@ -199,13 +195,7 @@ def main(argv=None) -> int:
             max_root_reinvestigation_calls=profile.max_root_reinvestigation_calls,
             shared_limits=profile.shared_limits, local_limits=profile.local_limits, finalization=profile.finalization,
         )
-        result = execute_research_plan(plan, runner, max_groups=profile.max_groups, root_guidance=(
-            "Ask each company investigator to compare the same risk across both years and look for "
-            "prior-year counterevidence. Reassess the strongest delivered spans and report each group's result, "
-            "including missing years and abstentions. Use separate relevance and entailment judgments. "
-            "Declare the delivered finding IDs you use and cite the original chunks. Finish with a partial synthesis "
-            "when a company investigation fails. Use the few follow-up calls only for a specific evidence gap."
-        ))
+        result = execute_research_plan(plan, runner, max_groups=profile.max_groups, root_guidance=ROOT_GUIDANCE)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     report = _report(result, scan, args.live, args.trace)

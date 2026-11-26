@@ -156,6 +156,7 @@ class ModelAttempt:
     request_bytes: int | None = None
     estimated_tokens: int | None = None
     timeout_seconds: float | None = None
+    output_cap: int | None = None
 
 
 @dataclass(kw_only=True)
@@ -174,6 +175,7 @@ class ToolTrace:
     delegation: DelegationTrace | None = None
     delivery_error: str | None = None
     observation_bytes: int | None = None
+    observation_attempted: bool = False
 
     def record(self, result: DispatchResult) -> None:
         self.validated_arguments = trace_data(result.arguments)
@@ -195,6 +197,9 @@ class StepTrace(ToolTrace):
     phase: Literal["investigation", "finalization"] = "investigation"
     finalization_reason: str | None = None
     assignment_stage: Literal["assignment", "synthesis", "incomplete_finalization"] | None = None
+    recovery: str | None = None
+    envelope_bytes: int | None = None
+    offered_tool_names: tuple[str, ...] = ()
 
     @property
     def operations(self) -> tuple[ToolTrace, ...]:
@@ -272,6 +277,7 @@ class RootController:
             if candidate_tool is not None:
                 tools.append(candidate_tool)
         finalization_reason = None
+        replay_reason = None
         tool_limit = self._limits.max_tool_calls
         reinvestigation_limit = _recursive.runner.max_root_reinvestigation_calls if _recursive else None
 
@@ -318,6 +324,9 @@ class RootController:
                         "evidence. Keep the answer and findings concise; put quotes in findings without repeating "
                         "them in the answer. If evidence is insufficient, report an incomplete result or abstain."
                     )
+                    if replay_reason == "truncated_response" and self._comparative:
+                        notice += (" The previous output was truncated. Give a brief answer and prioritize one comparison "
+                                   "per company using one exact span per finding. Keep each finding in one document and section.")
                 elif unassigned:
                     offered_tools = [tool for tool in tools if tool["name"] == "delegate_research"]
                     notice = (
@@ -364,7 +373,8 @@ class RootController:
                     break
             step = StepTrace(
                 iteration, phase="finalization" if finalization_reason else "investigation",
-                finalization_reason=finalization_reason, assignment_stage=assignment_stage,
+                finalization_reason=finalization_reason, assignment_stage=assignment_stage, recovery=replay_reason,
+                offered_tool_names=tuple(tool["name"] for tool in offered_tools),
             )
             steps.append(step)
             prior = steps[-2] if pending is not None else replayed_observation
@@ -389,7 +399,7 @@ class RootController:
                 prepare_recovery = getattr(self._model, "prepare_truncation_recovery", None)
                 recovering = (
                     not timed_out and iteration < self._limits.max_iterations
-                    and allocation is not None and not allocation.finalizing and allocation.finalization_left > 0
+                    and allocation is not None and allocation.finalization_left > 0
                     and callable(prepare_recovery) and prepare_recovery()
                 )
                 if not recovering:
@@ -404,6 +414,9 @@ class RootController:
                 step.model_attempts = getattr(self._model, "last_attempts", ())
                 step.provider_tool_requests = getattr(self._model, "last_tool_requests", ())
                 step.provider_tool_request_count = getattr(self._model, "last_tool_request_count", 0)
+                if prior is not None and step.model_attempts:
+                    for observation in prior.batch_operations or (prior,):
+                        observation.observation_attempted = True
                 if prior is not None and getattr(self._model, "last_observation_delivered", True):
                     for observation in prior.batch_operations or (prior,):
                         self._deliver(observation, coverage)
@@ -416,10 +429,12 @@ class RootController:
                 # tool results already attached to it. Credit those results once.
                 replayed_observation = prior
                 pending = None
+                replay_reason = step.error["code"]
                 if finalization_reason is None and step.assignment_stage != "assignment":
                     finalization_reason = "truncated_response"
                 continue
             replayed_observation = None
+            replay_reason = None
 
             try:
                 candidate = json.loads(json.dumps(raw, allow_nan=False))
@@ -503,13 +518,15 @@ class RootController:
     def _execute_tool(
         self, operation: ToolTrace, action: _ToolAction, deadline: float,
         coverage: CoverageTracker, recursive: RecursiveSession | None, *, initial_assignment: bool = False,
+        batch_share: int | None = None,
     ) -> str:
         started = self._clock()
         if initial_assignment and action.name != "delegate_research":
             operation.outcome = "rejected"
             return self._feedback(operation, "initial_assignment_required", "Delegate whole company groups first.")
         if recursive is not None and action.name == "delegate_research":
-            result, operation.delegation = recursive.delegate(action.arguments, deadline, initial_assignment=initial_assignment)
+            result, operation.delegation = recursive.delegate(action.arguments, deadline, initial_assignment=initial_assignment,
+                                                              batch_share=batch_share)
         else:
             try:
                 if recursive is not None:
@@ -549,7 +566,8 @@ class RootController:
             return observation_json({"tool_results": results})
 
         # Reserve a bounded error slot for every ID before performing any work.
-        if len(encode().encode("utf-8")) > cap:
+        step.envelope_bytes = len(encode().encode("utf-8"))
+        if step.envelope_bytes > cap:
             step.error = {"code": "batch_observation_limit"}
             for operation in step.batch_operations:
                 operation.outcome = "skipped"
@@ -565,9 +583,10 @@ class RootController:
                 operation.outcome = "rejected"
                 self._feedback(operation, "mixed_finish_batch", "Call finish_research on its own.")
             else:
+                share = (cap - len(encode().encode("utf-8"))) // (len(batch.calls) - index)
                 calls = self._execute_batch_call(call, operation, calls, tool_limit, deadline, coverage, recursive,
                                                  provider_turn=bool(step.model_attempts),
-                                                 initial_assignment=step.assignment_stage == "assignment")
+                                                 initial_assignment=step.assignment_stage == "assignment", batch_share=share)
             results[index]["observation"] = operation.observation
             if len(encode().encode("utf-8")) > cap:
                 if operation.error:
@@ -575,7 +594,9 @@ class RootController:
                 if not operation.error or len(encode().encode("utf-8")) > cap:
                     results[index]["observation"] = overflow
                     operation.delivery_error = "batch_observation_limit"
-        return encode(), calls
+        content = encode()
+        step.envelope_bytes = len(content.encode("utf-8"))
+        return content, calls
 
     def _reject_oversized_batch(self, batch: _ToolBatch, step: StepTrace) -> str | None:
         error = {"code": "tool_batch_limit", "max_operations": MAX_TOOL_BATCH}
@@ -598,6 +619,8 @@ class RootController:
 
         if content is None:
             step.error = {"code": "batch_observation_limit", "requested_operations": len(batch.calls)}
+        else:
+            step.envelope_bytes = len(content.encode("utf-8"))
         result = DispatchResult(None, observation_json(observation))
         for operation in step.batch_operations:
             operation.outcome = "rejected"
@@ -609,6 +632,7 @@ class RootController:
     def _execute_batch_call(
         self, call: _BatchCall, operation: ToolTrace, calls: int, tool_limit: int, deadline: float,
         coverage: CoverageTracker, recursive: RecursiveSession | None, *, provider_turn: bool, initial_assignment: bool,
+        batch_share: int,
     ) -> int:
         try:
             if self._clock() >= deadline:
@@ -631,7 +655,8 @@ class RootController:
             self._feedback(operation, "invalid_arguments", validation_message(exc))
         else:
             operation.tool_name = trace_data(action.name)
-            self._execute_tool(operation, action, deadline, coverage, recursive, initial_assignment=initial_assignment)
+            self._execute_tool(operation, action, deadline, coverage, recursive, initial_assignment=initial_assignment,
+                               batch_share=batch_share)
         return calls + 1
 
     def _feedback(self, step: ToolTrace, code: str, message: str) -> str:

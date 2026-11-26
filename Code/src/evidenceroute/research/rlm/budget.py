@@ -76,10 +76,12 @@ class BudgetUsage:
 
 class SharedBudget:
     def __init__(self, limits: SharedLimits, clock: Callable[[], float] = monotonic, *,
-                 finalization: FinalizationPolicy | None = None):
+                 finalization: FinalizationPolicy | None = None, deadline: float | None = None):
         self.limits = limits
         self.clock = clock
         self.deadline = clock() + limits.deadline_seconds
+        if deadline is not None:
+            self.deadline = min(self.deadline, deadline)
         self.model_sessions = self.model_decisions = self.delegated_invocations = 0
         self.provider_attempts = self.corpus_attempts = self.partition_assignments = 0
         self.reported_tokens = self.attempts_with_missing_usage = 0

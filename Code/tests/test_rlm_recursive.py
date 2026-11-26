@@ -1136,6 +1136,59 @@ def planned_corpus():
         pytest.skip("Canonical local corpus unavailable")
 
 
+def test_corpus_demo_propagates_protected_comparative_policy_across_bedrock_batches(planned_corpus, monkeypatch, capsys):
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    monkeypatch.syspath_prepend(str(examples))
+    monkeypatch.setattr("evidenceroute.research.rlm.CorpusEnvironment", lambda: planned_corpus)
+    limits = {"max_batches": 2, "max_provider_attempts": 72, "max_reported_tokens": 400_000,
+              "max_corpus_attempts": 60, "max_delegations": 4, "max_partitions": 8, "deadline_seconds": 600}
+    monkeypatch.setattr(Path, "read_bytes", lambda self: json.dumps(limits).encode() if self.name == "fixture-limits.json"
+                        else pytest.fail(f"Unexpected read of {self.name}"))
+    monkeypatch.setenv("CLAUDE_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("CLAUDE_MAX_OUTPUT_TOKENS", "1024")
+    main = runpy.run_path(str(examples / "demo_rlm_corpus_research.py"))["main"]
+    assignments = []
+    for ticker in ("AAPL", "AMD", "NVDA"):
+        pairs = [SectionTarget(planned_corpus.list_filings(ticker=ticker, fiscal_year=year).items[0].document_id, RISK)
+                 for year in (2023, 2024)]
+        assignments.append(delegate(*pairs))
+    partial = converse_reply(finish(), "partial")
+    partial["stopReason"] = "max_tokens"
+    partial["output"]["message"]["content"].append({"reasoningContent": {"reasoningText": {
+        "text": "PRIVATE_TRACE_MARKER", "signature": "PRIVATE_SIGNATURE"}}})
+    close = converse_reply(finish(), "finish")
+    sessions = stub_bedrock(monkeypatch, [
+        [converse_batch(*assignments[:2]), partial, close], [partial, close], [partial, close],
+        [converse_reply(assignments[2], "delegate"), partial, close], [partial, close],
+    ])
+    assert main(["--live", "--trace", "--profile", "expanded", "--limits-file", "fixture-limits.json",
+                 "--company", "AAPL", "--company", "AMD", "--company", "NVDA"]) == 0
+    raw = capsys.readouterr().out
+    assert "PRIVATE_TRACE_MARKER" not in raw and "PRIVATE_SIGNATURE" not in raw
+    report = json.loads(raw)
+    result = report["result"]
+    assert result["execution_status"] == "finished" and result["research_status"] == "incomplete"
+    policy = report["tree_configuration"]["finalization"]
+    assert policy["root_token_headroom"] == policy["child_token_headroom"] == 24000
+    assert policy["finalization_timeout_retries"] == 1
+    for session in (sessions[0], sessions[3]):
+        assert session.requests[0]["toolConfig"]["toolChoice"] == {"tool": {"name": "delegate_research"}}
+        assert "Reassess the strongest delivered spans" in str(session.requests[0]["messages"][0])
+    for session in sessions:
+        investigate, protected = session.requests[-2:]
+        assert investigate["inferenceConfig"]["maxTokens"] == 1024
+        assert "get_spans" in {tool["toolSpec"]["name"] for tool in investigate["toolConfig"]["tools"]}
+        assert protected["inferenceConfig"]["maxTokens"] == 2048
+        assert protected["toolConfig"]["toolChoice"] == {"tool": {"name": "finish_research"}}
+        assert session.timeouts[-2:] == [(20, 20), (60, 60)]
+        assert investigate["messages"] == protected["messages"]
+    for invocation in result["diagnostics"]:
+        first, recovery = invocation["decisions"][-2:]
+        assert first["attempts"][0]["stop_reason"] == "max_tokens" and first["attempts"][0]["output_cap"] == 1024
+        assert recovery["phase"] == "finalization" and recovery["recovery"] == "truncated_response"
+        assert recovery["attempts"][0]["output_cap"] == 2048
+
+
 @pytest.fixture
 def comparative_demo(planned_corpus, monkeypatch):
     examples = Path(__file__).resolve().parents[1] / "examples"
@@ -1779,6 +1832,68 @@ def test_truncated_investigation_replays_only_valid_bedrock_history(snapshot, mo
     assert trace.model_attempts[1].response_received and trace.model_attempts[1].output_tokens == 1024
     assert trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
     assert {ref.chunk_id for ref in trace.coverage.visible_chunks} == {chunk.chunk_id}
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_truncated_first_protected_finish_reuses_second_slot(snapshot, monkeypatch, nested):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+
+    corpus, (doc, _, _) = snapshot
+    pair = SectionTarget(doc, RISK)
+    chunk = corpus.read_chunks(doc, RISK, limit=1).items[0]
+    partial = converse_reply(finish("unseen"), "partial")
+    partial["stopReason"] = "max_tokens"
+    reader = [converse_reply(tool("get_chunk", chunk_id=chunk.chunk_id), "read"), partial,
+              converse_reply(finish(chunk.chunk_id, findings=[finding(chunk)]), "reader-finish")]
+    if nested:
+        ancestor = [converse_reply(delegate(pair), "delegate"),
+                    converse_reply(finish(chunk.chunk_id, used=["child-1:finding-1"]), "root-finish")]
+    sessions = stub_bedrock(monkeypatch, [ancestor, reader] if nested else [reader])
+    trace = RecursiveResearch(corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+                              local_limits=RootLimits(max_tool_calls=1), shared_limits=SharedLimits(max_delegations=1),
+                              finalization=FinalizationPolicy(finalization_attempts=2)).run("Review risk.", partitions=(pair,))
+    read_trace = trace.steps[0].delegation.child if nested else trace
+    assert trace.stop_reason == read_trace.stop_reason == "finished" and trace.cited_chunk_ids == (chunk.chunk_id,)
+    assert read_trace.steps[-2].phase == read_trace.steps[-1].phase == "finalization"
+    assert read_trace.steps[-1].recovery == "truncated_response"
+    assert read_trace.steps[-1].model_attempts[0].output_cap == 2048
+    assert sessions[-1].requests[1]["messages"] == sessions[-1].requests[2]["messages"]
+    assert read_trace.steps[0].observation_sent and read_trace.steps[0].observation_attempted
+
+
+def test_comparative_delegation_batch_compacts_results_without_losing_sibling(snapshot, monkeypatch):
+    from evidenceroute.research.rlm.bedrock import BedrockRootClient
+    from evidenceroute.research.rlm.comparison import scan_research_plan
+    from evidenceroute.research.rlm.spans import passage_spans
+
+    corpus, (old, new, _) = snapshot
+    pairs = [SectionTarget(doc, RISK) for doc in (old, new)]
+    replies, keys = [], []
+    for pair in pairs:
+        chunk = corpus.read_chunks(pair.document_id, RISK, limit=1).items[0]
+        keys.append(chunk.chunk_id)
+        span = next(iter(passage_spans(chunk.text)))
+        drafts = [{"claim": str(i) + "x" * 575, "analysis_status": "incomplete",
+                   "evidence": [{"chunk_id": chunk.chunk_id, "span_id": span}]} for i in range(3)]
+        replies.append([converse_reply(tool("get_spans", chunk_id=chunk.chunk_id, span_ids=[span]), "read"),
+                        converse_reply(finish(findings=drafts), "finish")])
+    sessions = stub_bedrock(monkeypatch, [[converse_batch(*(delegate(pair) for pair in pairs)),
+        converse_reply(finish(*keys, used=["child-1:finding-1", "child-2:finding-1"]), "root-finish")], *replies])
+    trace = RecursiveResearch(corpus, lambda _: BedrockRootClient.from_env(disable_retries=True),
+                              comparison_scan=scan_research_plan(corpus, _company_plan(corpus), ("operations",)),
+                              local_limits=RootLimits(max_response_bytes=4400)).run("Review risk.", partitions=tuple(pairs))
+    assert trace.stop_reason == "finished" and set(trace.cited_chunk_ids) == set(keys)
+    step = trace.steps[0]
+    assert step.envelope_bytes <= 4400
+    edges = [op.delegation for op in step.operations]
+    assert sum(edge.full_observation_bytes for edge in edges) > 4400
+    assert all(edge.full_observation_bytes <= 4400 for edge in edges)
+    for index, ((_, response), edge) in enumerate(zip(_batch_feedback(sessions[0].requests[-1]), edges)):
+        assert response["ok"] and response["result"]["omitted_findings"] > 0
+        assert len(edge.child.findings) == 3 and len(edge.delivered_finding_ids) in (1, 2)
+        excerpt = response["result"]["findings"][0]["evidence"][0]
+        assert excerpt["quote"] == edge.child.findings[0].evidence[0].quote
+        assert excerpt["source"]["chunk_id"] == keys[index]
 
 
 @pytest.mark.parametrize("failure", ["truncated", "invalid_quote", "unseen_citation"])

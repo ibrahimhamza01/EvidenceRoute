@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -60,6 +61,7 @@ class TargetCoverage:
     generated_finding_ids: tuple[str, ...]
     acknowledged_finding_ids: tuple[str, ...]
     used_finding_ids: tuple[str, ...]
+    delivered_span_ids: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,10 +88,17 @@ class _Access:
     generated: set[str] = field(default_factory=set)
     acknowledged: set[str] = field(default_factory=set)
     used: set[str] = field(default_factory=set)
+    spans: set[tuple[str, str]] = field(default_factory=set)
 
 
 def aggregate_research_coverage(
     corpus: CorpusEnvironment, plan: ResearchPlan, trace: ExecutionTrace | None,
+) -> ResearchCoverage:
+    return aggregate_research_trees(corpus, plan, () if trace is None else (trace,))
+
+
+def aggregate_research_trees(
+    corpus: CorpusEnvironment, plan: ResearchPlan, traces: Iterable[ExecutionTrace],
 ) -> ResearchCoverage:
     """Traverse invocation edges once. Only successful acknowledged operations add access."""
     access = {pair: _Access() for pair in plan.resolved_targets}
@@ -121,6 +130,8 @@ def aggregate_research_coverage(
                 if finding.finding_id in delivered:
                     target.acknowledged.add(finding.finding_id)
                     target.excerpts.add(source.chunk_id)
+                    if item.span_id is not None:
+                        target.spans.add((source.chunk_id, item.span_id))
                     if finding.finding_id in parent_used:
                         target.used.add(finding.finding_id)
 
@@ -165,6 +176,7 @@ def aggregate_research_coverage(
                         target = access.get(SectionTarget(ref.document_id, ref.section_id))
                         if target is not None:
                             target.direct_spans.add(ref.chunk_id)
+                            target.spans.update((ref.chunk_id, span) for span in observation["span_ids"][ref.chunk_id])
 
         outcomes.append(InvocationOutcome(
             invocation, run.stop_reason if run else None, run.budget_stop if run else None,
@@ -176,13 +188,13 @@ def aggregate_research_coverage(
             assert child.invocation is not None
             visit(child.invocation, child.child, child, child_acknowledged, run.used_finding_ids)
 
-    admitted = ()
-    if trace is not None:
+    admitted: set[SectionTarget] = set()
+    for trace in traces:
         if trace.invocation is None or trace.invocation.partitions is None:
             raise ValueError("Research coverage requires an explicitly scoped recursive trace.")
-        admitted = trace.invocation.partitions
-        if not set(admitted).issubset(access):
+        if not set(trace.invocation.partitions).issubset(access):
             raise ValueError("The recursive trace includes targets outside the research plan.")
+        admitted.update(trace.invocation.partitions)
         visit(trace.invocation, trace)
 
     targets = []
@@ -197,6 +209,6 @@ def aggregate_research_coverage(
             status, tuple(sorted(seen.discovered)), tuple(sorted(seen.chunks)), meta.chunk_count, chunks_complete,
             ranges, meta.char_count, text_complete, tuple(sorted(seen.excerpts)), tuple(sorted(seen.direct_spans)),
             tuple(sorted(seen.generated)),
-            tuple(sorted(seen.acknowledged)), tuple(sorted(seen.used)),
+            tuple(sorted(seen.acknowledged)), tuple(sorted(seen.used)), tuple(sorted(seen.spans)),
         ))
     return ResearchCoverage(tuple(targets), plan.missing_requirements, tuple(outcomes), tuple(rejected))

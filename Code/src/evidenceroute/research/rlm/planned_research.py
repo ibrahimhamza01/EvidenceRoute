@@ -61,14 +61,16 @@ class PlannedResearchResult:
                 if not edge or not edge.child or not operation.observation_sent or operation.delivery_error:
                     continue
                 delivered = set(edge.delivered_finding_ids)
-                comparisons.extend(item for item in edge.child.comparisons if delivered.issuperset(item.finding_ids))
+                comparisons.extend(edge.child.comparisons[i] for i in edge.offered_comparison_indices
+                                   if delivered.issuperset(edge.child.comparisons[i].finding_ids))
         return tuple(comparisons)
 
     @property
     def partial_comparative_result(self) -> PartialComparativeResult | None:
         if not self.trace or self.trace.stop_reason == "finished":
             return None
-        findings = tuple(finding for child in self.coverage.invocations if child.invocation.parent_id == "root"
+        findings = tuple(finding for child in self.coverage.invocations
+                         if child.invocation.parent_id == self.trace.invocation.invocation_id
                          for finding in child.findings if finding.finding_id in child.findings_acknowledged_by_parent)
         if not findings:
             return None
@@ -83,17 +85,14 @@ class PlannedResearchResult:
         )
 
 
-def execute_research_plan(
-    plan: ResearchPlan, runner: RecursiveResearch, *, max_groups: int = 2, root_guidance: str | None = None,
-    delegation_first: bool | None = None,
-) -> PlannedResearchResult:
+def admit_company_groups(
+    plan: ResearchPlan, runner: RecursiveResearch, *, max_groups: int, delegation_first: bool,
+) -> tuple[list[CompanyPartition], dict[str, str]]:
     if type(max_groups) is not int or max_groups < 0:
         raise ValueError("max_groups must be a nonnegative integer.")
 
     limits = runner.shared_limits
     local = runner.local_limits
-    if delegation_first is None:
-        delegation_first = plan.intent.comprehensive
     # Preflight with the same allocation rules as the runner, including slots
     # held for prospective children even when fewer groups are selected.
     preflight = SharedBudget(limits, finalization=runner.finalization)
@@ -127,31 +126,46 @@ def execute_research_plan(
             pairs_left -= len(group.targets)
             continue
         pending[group.ticker] = reason
+    return admitted, pending
+
+
+def execute_research_plan(
+    plan: ResearchPlan, runner: RecursiveResearch, *, max_groups: int = 2, root_guidance: str | None = None,
+    delegation_first: bool | None = None, _budget: SharedBudget | None = None, _id_prefix: str = "",
+    _requested_scope: tuple[int, int] | None = None,
+) -> PlannedResearchResult:
+    if delegation_first is None:
+        delegation_first = plan.intent.comprehensive
+    admitted, pending = admit_company_groups(plan, runner, max_groups=max_groups, delegation_first=delegation_first)
+    unresolved = {entry.company for entry in plan.missing_requirements}
 
     trace = None
     if admitted:
         manifest = observation_json([
             {"ticker": group.ticker, "partitions": [asdict(pair) for pair in group.targets]} for group in admitted
         ])
+        company_count = _requested_scope[0] if _requested_scope else len(plan.requested_companies)
         question = (
             f"{plan.intent.question}\nObjective: {plan.intent.objective}. Topic: {plan.intent.topic}\n"
-            f"This run admits {len(admitted)} of {len(plan.requested_companies)} requested companies. "
+            f"This run admits {len(admitted)} of {company_count} requested companies. "
             f"Use one whole group per delegation: {manifest}\n"
             "Compare the same topic across the assigned filings. Synthesize only supported findings and cite "
             "original chunks. Disclose unexamined targets and unresolved or conflicting evidence. "
             "A search miss cannot establish that a risk was absent or newly introduced."
         )
+        if _requested_scope:
+            question += f"\nThe full research plan requires {_requested_scope[1]} filing-section targets."
         if root_guidance:
             question += f"\nSynthesis guidance: {root_guidance}"
         trace = runner.run(question, partitions=tuple(pair for group in admitted for pair in group.targets),
                            root_delegation_groups=tuple(group.targets for group in admitted),
-                           delegation_first=delegation_first)
+                           delegation_first=delegation_first, _budget=_budget, _id_prefix=_id_prefix)
 
     coverage = aggregate_research_coverage(runner.corpus, plan, trace)
     by_pair = {target.pair: target for target in coverage.targets}
     root_delegations = {}
     for outcome in coverage.invocations:
-        if outcome.invocation.parent_id == "root":
+        if trace is not None and outcome.invocation.parent_id == trace.invocation.invocation_id:
             root_delegations.setdefault(frozenset(outcome.invocation.partitions or ()), []).append(outcome)
 
     admitted_tickers = {group.ticker for group in admitted}
@@ -162,7 +176,8 @@ def execute_research_plan(
         delegates = root_delegations.get(frozenset(pairs), ())
         first = delegates[0] if delegates else None
         acknowledged = {child.invocation.invocation_id for child in delegates
-                        if child.parent_acknowledged and child.delegation_status in {"finished", "incomplete"}}
+                        if child.parent_acknowledged and child.delegation_status in {"finished", "incomplete"}
+                        and (not child.findings or child.findings_acknowledged_by_parent)}
         is_admitted = ticker in admitted_tickers
         if ticker in unresolved:
             assignment_status = "unresolved"

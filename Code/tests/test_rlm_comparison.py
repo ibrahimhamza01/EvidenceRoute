@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from evidenceroute.research.rlm import CorpusEnvironment
-from evidenceroute.research.rlm.comparison import ComparisonDraft, resolve_comparison, scan_research_plan
+from evidenceroute.research.rlm.comparison import ComparisonDraft, render_comparisons, resolve_comparison, scan_research_plan
 from evidenceroute.research.rlm.controller import RootLimits, ScriptedModelClient
 from evidenceroute.research.rlm.coverage import SectionTarget
 from evidenceroute.research.rlm.findings import Finding, FindingEvidence
@@ -100,6 +100,43 @@ def test_infrastructure_support_requires_a_connection(amd):
     result = resolve_comparison(draft, amd, (2023, 2024))
     assert result.outcome == "insufficient" and result.both_years_contributed
     assert result.assessments[1].relevance == "uncertain"
+
+
+@pytest.mark.parametrize(("category", "context_index", "explicit", "contextual"), [
+    (None, None, (), ()), ("explicit", None, (), ()), ("contextual", 2, (), (2024,)),
+])
+def test_water_risk_requires_separate_support_for_contextual_ai(corpus, category, context_index, explicit, contextual):
+    chunk = corpus.get_chunk("4f9a71476fee75c3bb848dd2")
+    findings = []
+    for i, phrase in enumerate(("unavailable power or water supply", "demand for AI services"), 1):
+        span, quote = next((span, chunk.text[start:end]) for span, (start, end) in passage_spans(chunk.text).items()
+                           if phrase in chunk.text[start:end])
+        findings.append(Finding(f"test-{i}", "Microsoft", "Scoped excerpt", (FindingEvidence(EvidenceRef.from_chunk(chunk),
+                                      quote, span),), "incomplete", "partial", None, None))
+    draft = ComparisonDraft.model_validate({"risk": "Datacenter water supply", "same_risk": "uncertain", "assessments": [
+        {**_assessment(1), "ai_specific_connection": "The reported expansion supports AI workloads.",
+         "ai_specificity": category, "ai_context_finding_index": context_index},
+    ]})
+    result = resolve_comparison(draft, findings, (2023, 2024))
+    assert result.ai_specific_years == explicit and result.ai_contextual_years == contextual
+    assert result.finding_ids == (("test-1", "test-2") if contextual else ("test-1",))
+    answer = render_comparisons([result])
+    assert "Datacenter water supply" in answer and chunk.chunk_id in answer and "insufficient" in answer
+
+
+def test_explicit_ai_supply_risk_uses_exact_span(corpus):
+    chunk = corpus.get_chunk("4d1474550060251037c5f981")
+    span, quote = next((span, chunk.text[start:end]) for span, (start, end) in passage_spans(chunk.text).items()
+                       if "artificial intelligence infrastructure" in chunk.text[start:end])
+    finding = Finding("test-1", "Amazon", "Supplier concentration", (FindingEvidence(EvidenceRef.from_chunk(chunk), quote, span),),
+                      "incomplete", "partial", None, None)
+    draft = ComparisonDraft.model_validate({"risk": "Semiconductor supply", "same_risk": "uncertain", "assessments": [
+        {**_assessment(1), "ai_specific_connection": "The passage ties limited suppliers to AI infrastructure products.",
+         "ai_specificity": "explicit"},
+    ]})
+    result = resolve_comparison(draft, [finding], (2023, 2024))
+    assert result.ai_specific_years == (2024,) and not result.ai_contextual_years
+    assert result.outcome == "insufficient"
 
 
 def _finish(item, used=()):

@@ -57,6 +57,9 @@ class DelegationTrace:
     child: ExecutionTrace | None = None
     delivered_finding_ids: tuple[str, ...] = ()
     initial_assignment: bool = False
+    offered_finding_ids: tuple[str, ...] = ()
+    offered_comparison_indices: tuple[int, ...] = ()
+    full_observation_bytes: int | None = None
 
 
 class RecursiveResearch:
@@ -90,10 +93,12 @@ class RecursiveResearch:
         run_id: str | None = None,
         root_delegation_groups: tuple[tuple[SectionTarget, ...], ...] | None = None,
         delegation_first: bool = False,
+        _budget: SharedBudget | None = None,
+        _id_prefix: str = "",
     ) -> ExecutionTrace:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Research question must be a non-blank string.")
-        budget = SharedBudget(self.shared_limits, self.clock, finalization=self.finalization)
+        budget = _budget if _budget is not None else SharedBudget(self.shared_limits, self.clock, finalization=self.finalization)
         if partitions is not None:
             partitions = tuple(partitions)
             if not partitions or len(partitions) > self.shared_limits.max_partitions:
@@ -113,7 +118,7 @@ class RecursiveResearch:
                 raise ValueError("Initial groups must fit the shared delegation and depth limits.")
             budget.initial_delegations_left = len(groups)
             budget.initial_partitions_left = len(partitions)
-        invocation = Invocation(run_id or uuid4().hex, "root", None, 0, question, None, partitions)
+        invocation = Invocation(run_id or uuid4().hex, f"{_id_prefix}root", None, 0, question, None, partitions)
         return self._invoke(invocation, budget, [], budget.deadline, groups)
 
     def _validate_partitions(self, partitions: tuple[SectionTarget, ...]) -> None:
@@ -273,7 +278,7 @@ class RecursiveSession:
         }
 
     def delegate(
-        self, arguments: dict, deadline: float, *, initial_assignment: bool = False,
+        self, arguments: dict, deadline: float, *, initial_assignment: bool = False, batch_share: int | None = None,
     ) -> tuple[DispatchResult, DelegationTrace]:
         cap = self.runner.local_limits.max_response_bytes
         validated = None
@@ -314,7 +319,8 @@ class RecursiveSession:
 
         if initial_assignment:
             self.unassigned_groups.remove(group)
-        invocation = Invocation(self.invocation.run_id, f"child-{number}", self.invocation.invocation_id,
+        namespace, separator, _ = self.invocation.invocation_id.rpartition(".")
+        invocation = Invocation(self.invocation.run_id, f"{namespace}{separator}child-{number}", self.invocation.invocation_id,
                                 depth, request.question, request.goal, pairs)
         try:
             child = self.runner._invoke(invocation, self.budget, self.clients, deadline)
@@ -342,6 +348,18 @@ class RecursiveSession:
             body["error"] = {"code": "child_not_finished", "message": "Inspect the child stop reason and coverage."}
         content = observation_json(body)
         delegation = DelegationTrace(status, invocation=invocation, child=child, initial_assignment=initial_assignment)
+        delegation.full_observation_bytes = len(content.encode("utf-8"))
+        if self.runner.comparison_scan is not None and successful:
+            share = min(cap, batch_share) if batch_share is not None else cap
+            if delegation.full_observation_bytes > share:
+                content, findings, indices = self._compact_child_result(body["result"], child, share)
+                delegation.offered_comparison_indices = indices
+                if content is None:
+                    delegation.status = "oversized"
+                    delegation.error = "child_result_deferred"
+                    content = error_observation("child_result_deferred", "Validated findings are retained in the report.", cap)
+            else:
+                delegation.offered_comparison_indices = tuple(range(len(child.comparisons)))
         if len(content.encode("utf-8")) > cap:
             delegation.status = "oversized"
             delegation.error = "response_too_large"
@@ -350,8 +368,46 @@ class RecursiveSession:
                 cap, max_response_bytes=cap, response_bytes=len(content.encode("utf-8")),
             )
             return DispatchResult(validated, content), delegation
+        delegation.offered_finding_ids = tuple(finding.finding_id for finding in findings)
         refs = tuple(dict.fromkeys(item.source for finding in findings for item in finding.evidence))
         return DispatchResult(validated, content, refs), delegation
+
+    @staticmethod
+    def _compact_child_result(result: dict, child: ExecutionTrace, cap: int) -> tuple[str | None, tuple[Finding, ...], tuple[int, ...]]:
+        """Keep whole validated findings and send a bounded summary when the full result cannot fit."""
+        findings: list[Finding] = []
+        indices: list[int] = []
+        summaries: list[dict] = []
+        record = {key: result[key] for key in ("child_invocation_id", "status", "analysis_status")}
+
+        def encode() -> str:
+            return observation_json({"ok": True, "result": {**record, "findings": findings, "comparisons": summaries,
+                "omitted_findings": len(child.findings) - len(findings),
+                "omitted_comparisons": len(child.comparisons) - len(summaries)}})
+
+        content = encode()
+        if len(content.encode("utf-8")) > cap:
+            return None, (), ()
+        for finding in child.findings:
+            findings.append(finding)
+            candidate = encode()
+            if len(candidate.encode("utf-8")) > cap:
+                findings.pop()
+            else:
+                content = candidate
+        offered = {finding.finding_id for finding in findings}
+        for index, comparison in enumerate(child.comparisons):
+            if not offered.issuperset(comparison.finding_ids):
+                continue
+            summaries.append({"risk": comparison.risk, "outcome": comparison.outcome,
+                              "finding_ids": comparison.finding_ids, "evidence_years": comparison.evidence_years})
+            candidate = encode()
+            if len(candidate.encode("utf-8")) > cap:
+                summaries.pop()
+            else:
+                indices.append(index)
+                content = candidate
+        return content, tuple(findings), tuple(indices)
 
     def record_delivery(self, step: ToolTrace) -> None:
         if step.delegation is None:
@@ -359,8 +415,9 @@ class RecursiveSession:
                 self.direct_ids.update(ref.chunk_id for ref in step.evidence)
             for chunk_id, spans in (step.observation or {}).get("span_ids", {}).items():
                 self.direct_spans.setdefault(chunk_id, set()).update(spans)
-        elif step.delegation.child is not None and step.delegation.status in {"finished", "incomplete"}:
-            findings = step.delegation.child.findings
+        elif step.delegation.child is not None and (step.observation or {}).get("ok"):
+            offered = set(step.delegation.offered_finding_ids)
+            findings = [finding for finding in step.delegation.child.findings if finding.finding_id in offered]
             self.delivered_findings.update((finding.finding_id, finding) for finding in findings)
             step.delegation.delivered_finding_ids = tuple(finding.finding_id for finding in findings)
 

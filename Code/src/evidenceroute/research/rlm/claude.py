@@ -288,7 +288,9 @@ class ClaudeRootClient:
         if self._finish_allowed:
             tools = [*tools, {
                 "name": _FINISH,
-                "description": "Submit the answer and any chunk IDs supplied by the corpus tools.",
+                "description": ("Submit a brief answer and exact-span findings. Each finding covers one document and "
+                                "section. Use comparisons for cross-year relationships. Avoid repeating excerpts."
+                                if self._comparative else "Submit the answer and any chunk IDs supplied by the corpus tools."),
                 "input_schema": finish_input_schema(recursive=self._budget is not None, comparative=self._comparative),
             }]
         response = self._request(self._payload(tools), deadline)
@@ -391,7 +393,8 @@ class ClaudeRootClient:
                 raise ClaudeModelError("deadline")
             if self._budget is not None:
                 self._budget.start_provider_attempt(estimated_tokens=estimate)
-            telemetry = {"request_bytes": request_bytes, "estimated_tokens": estimate, "timeout_seconds": min(timeout, remaining)}
+            telemetry = {"request_bytes": request_bytes, "estimated_tokens": estimate,
+                         "timeout_seconds": min(timeout, remaining), "output_cap": output_cap}
             try:
                 response = self._transport.send(deepcopy(payload), timeout_seconds=telemetry["timeout_seconds"])
             except ProviderTransportError as exc:

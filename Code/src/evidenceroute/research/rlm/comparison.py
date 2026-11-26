@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from time import monotonic
 from typing import Literal
@@ -78,7 +80,8 @@ class CorpusScan:
 
 
 def scan_research_plan(corpus: CorpusEnvironment, plan: ResearchPlan, terms: tuple[str, ...], *,
-                       max_chunks: int = 30_000, deadline_seconds: float = 30.0) -> CorpusScan:
+                       max_chunks: int = 30_000, deadline_seconds: float = 30.0,
+                       clock: Callable[[], float] = monotonic) -> CorpusScan:
     """Inspect canonical chunk pages locally. Matches are candidates, never absence evidence."""
     years = sorted(set(plan.intent.fiscal_years))
     if len(years) != 2 or plan.intent.objective != "year_over_year":
@@ -88,7 +91,7 @@ def scan_research_plan(corpus: CorpusEnvironment, plan: ResearchPlan, terms: tup
         raise ValueError("Supply 1 to 32 nonempty terms of at most 200 characters.")
     if max_chunks < 1 or not 0 < deadline_seconds < float("inf"):
         raise ValueError("Use a positive scan chunk limit and finite deadline.")
-    started = monotonic()
+    started = clock()
     rows = []
     pages = chars = scanned = 0
     stop = None
@@ -97,7 +100,7 @@ def scan_research_plan(corpus: CorpusEnvironment, plan: ResearchPlan, terms: tup
         matches = []
         offset = 0
         while offset is not None and not stop:
-            if scanned >= max_chunks or monotonic() - started >= deadline_seconds:
+            if scanned >= max_chunks or clock() - started >= deadline_seconds:
                 stop = "chunk_limit" if scanned >= max_chunks else "deadline"
                 break
             page = corpus.read_chunks(pair.document_id, pair.section_id, offset=offset,
@@ -116,7 +119,7 @@ def scan_research_plan(corpus: CorpusEnvironment, plan: ResearchPlan, terms: tup
         rows.append(ScannedSection(pair, meta.ticker, meta.fiscal_year, meta.chunk_count,
                                    meta.chunk_count if offset is None else offset,
                                    tuple(sorted(matches, key=lambda hit: -len(hit.terms)))))
-    return CorpusScan(terms, (years[0], years[1]), tuple(rows), pages, chars, monotonic() - started, stop)
+    return CorpusScan(terms, (years[0], years[1]), tuple(rows), pages, chars, clock() - started, stop)
 
 
 class EvidenceAssessment(StrictInput):
@@ -132,6 +135,12 @@ class EvidenceAssessment(StrictInput):
         "If supported by this exact source span, describe how the risk mechanism specifically affects AI infrastructure. "
         "Leave empty for general infrastructure exposure or unrelated AI demand."
     ))
+    ai_specificity: Literal["explicit", "contextual"] | None = Field(
+        default=None, description="Use explicit when this finding directly links the risk to AI, or contextual for a supported inference."
+    )
+    ai_context_finding_index: int | None = Field(
+        default=None, ge=1, le=8, description="For contextual support, use a same-year finding with an exact AI span."
+    )
 
 
 class ComparisonDraft(StrictInput):
@@ -153,6 +162,10 @@ class Comparison:
     evidence_years: tuple[int, ...]
     both_years_contributed: bool
     ai_specific_years: tuple[int, ...]
+    ai_contextual_years: tuple[int, ...] = ()
+
+
+_AI_TEXT = re.compile(r"\b(?:AI|artificial intelligence|machine learning)\b", re.IGNORECASE)
 
 
 def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: tuple[int, int]) -> Comparison:
@@ -181,12 +194,32 @@ def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: t
     else:
         outcome = "insufficient"
     evidence_years = tuple(sorted({source.fiscal_year for source in sources}))
-    ai_years = {finding.evidence[0].source.fiscal_year for assessment, finding in zip(assessments, selected)
-                if assessment.relevance == "infrastructure" and assessment.entailment == "supports"
-                and assessment.ai_specific_connection}
+    explicit, contextual = set(), set()
+    context_indices = set()
+    for assessment, finding in zip(assessments, selected):
+        if (assessment.relevance != "infrastructure" or assessment.entailment != "supports"
+                or not assessment.ai_specific_connection):
+            continue
+        year = finding.evidence[0].source.fiscal_year
+        direct = any(_AI_TEXT.search(item.quote) for item in finding.evidence)
+        if assessment.ai_specificity == "explicit" and direct:
+            explicit.add(year)
+        if assessment.ai_specificity == "contextual":
+            index = assessment.ai_context_finding_index
+            if index is not None and index > len(findings):
+                raise ValueError("AI context must refer to a finding in this finish.")
+            context = findings[index - 1].evidence if index is not None else ()
+            anchored = any(item.span_id and item.source.fiscal_year == year and item.source.ticker == sources[0].ticker
+                           and _AI_TEXT.search(item.quote) for item in context)
+            if direct or anchored:
+                contextual.add(year)
+                if anchored and not direct:
+                    context_indices.add(index)
+    referenced = [*selected, *(findings[index - 1] for index in sorted(context_indices) if index not in indices)]
     return Comparison(draft.risk, sources[0].ticker, years, outcome, draft.same_risk, assessments,
-                      tuple(f.finding_id for f in selected), tuple(sorted({s.chunk_id for s in sources})),
-                      evidence_years, evidence_years == years, tuple(sorted(ai_years)))
+                      tuple(f.finding_id for f in referenced),
+                      tuple(sorted({item.source.chunk_id for finding in referenced for item in finding.evidence})),
+                      evidence_years, evidence_years == years, tuple(sorted(explicit)), tuple(sorted(contextual - explicit)))
 
 
 def render_comparisons(comparisons: tuple[Comparison, ...] | list[Comparison]) -> str:
@@ -196,12 +229,41 @@ def render_comparisons(comparisons: tuple[Comparison, ...] | list[Comparison]) -
         earlier, later = (f"FY{year}" for year in item.years)
         conclusion = {
             "comparable_both_years": f"The assessed spans support the same underlying infrastructure risk in {earlier} and {later}.",
-            "possible_new_needs_review": f"The assessed spans support a risk in {later}. Whether it is new remains unresolved.",
+            "possible_new_needs_review": (f"The assessed spans support a risk in {later}. Whether it is new remains unresolved. "
+                                          "New wording alone cannot establish a new underlying risk."),
             "conflicting": "The assessed evidence is conflicting. Novelty remains unresolved.",
             "insufficient": "The assessed evidence is insufficient to establish novelty.",
         }[item.outcome]
         ai_years = ", ".join(f"FY{year}" for year in item.ai_specific_years)
-        ai = (f"Model assessments identify an AI-specific connection in {ai_years}." if ai_years
-              else "The assessments leave an AI-specific connection unestablished.")
-        lines.append(f"{item.ticker} ({earlier} and {later}). {conclusion} {ai}")
+        context_years = ", ".join(f"FY{year}" for year in item.ai_contextual_years)
+        ai = []
+        if ai_years:
+            ai.append(f"The model identified an explicit AI-specific connection in {ai_years}.")
+        if context_years:
+            ai.append(f"The model identified a contextual AI connection in {context_years}.")
+        if not ai:
+            ai.append("The assessments leave an AI-specific connection unestablished.")
+        risk = " ".join(item.risk.split())
+        lines.append(f'{item.ticker} ({earlier} and {later}), risk label “{risk}” [{item.outcome}]. '
+                     f'{conclusion} {" ".join(ai)} Evidence chunks {", ".join(item.assessed_chunk_ids)}.')
     return "\n".join(lines) if lines else "No validated structured comparison was produced."
+
+
+def render_comparative_scope(
+    comparisons: tuple[Comparison, ...], answer: str, *, requested: tuple[str, ...], admitted: set[str],
+    incomplete: bool,
+) -> str:
+    comparable = {item.ticker for item in comparisons if item.outcome == "comparable_both_years"}
+    inconclusive = {item.ticker for item in comparisons if item.outcome != "comparable_both_years"}
+    unresolved = [ticker for ticker in requested if ticker in admitted and (ticker not in comparable or ticker in inconclusive)]
+    not_admitted = [ticker for ticker in requested if ticker not in admitted]
+    return "\n\n".join([
+        "Research is incomplete. Conclusions apply to the assessed passages only. "
+        "This result cannot establish absence of a risk or answer for the full requested scope."
+        if incomplete else "Research conclusions await independent semantic verification.",
+        "Supported novelty. The validated comparisons establish no novelty conclusion.",
+        "Comparable existing risks. " + (", ".join(sorted(comparable)) or "None established in the assessed comparisons."),
+        "Structured assessments.\n" + answer,
+        "Admitted companies with unresolved assessments. " + (", ".join(unresolved) or "None identified."),
+        f"Companies outside the admitted scope ({len(not_admitted)}). " + (", ".join(not_admitted) or "None."),
+    ])

@@ -493,7 +493,7 @@ The course Sonnet 4.5 profile accepted named choice in the successful run below.
 
 Reservations protect request slots. The finish output cap is separately configurable and defaults to 2,048 tokens, while investigation defaults to 1,024. The experiment asks each child for a one-sentence answer plus one supported finding with the quote given once. The root is asked for a concise comparison with original citations, the IDs of findings it used, and coverage limits. Queries remain model-driven. These prompt and cap changes affect comparability with earlier live runs.
 
-A `max_tokens` investigation reply supplies usage but no executable action. If a protected slot and the other limits permit, the controller makes one transition to finish-only. It resends the last valid history with the original pending tool results and IDs, including batches. It never appends the partial assistant reply or duplicates result messages. Previously unacknowledged evidence becomes eligible only after the provider acknowledges delivery. The recovery attempt spends the existing finish allowance. A truncated finish ends the invocation, and a transport retry still spends an attempt from the current phase. The shared 60,000-token admission threshold and cooperative deadline still apply. This recovery is verified offline only.
+A `max_tokens` investigation reply supplies usage but no executable action. The implementation at this milestone could replay a valid history in a reserved finish slot after investigation truncation. A truncated protected finish still ended the invocation. The later corpus checkpoint extends that recovery to remaining protected slots and records the live outcome. See [protected replay](#protected-replay-and-its-limit).
 
 ### First successful end-to-end live run
 
@@ -505,7 +505,7 @@ Run `1b803beef0f948d9943f23e582c57cd7` ended with status `success` and stop reas
 | FY2024 child | 3 / 2 | 12,825 | Two searches delivered two unique chunks. Finished during investigation and released one unused provider slot. Delivered `child-2:finding-1`, citing `02834a6d106b2138d0425352`. |
 | Root | 2 / 0 | 10,287 | Received and declared both findings used. Its final response used 976 output tokens to synthesize a comparison citing both original chunks. Both partitions retained partial coverage. |
 
-This establishes live model-directed delegation, protected finalization, child-to-parent evidence transfer, and synthesis with Claude. The protected finish used fewer than 1,024 output tokens, so this run does not establish a need for the increased finish cap. Depth-two delegation and truncation recovery remain offline-tested.
+This establishes live model-directed delegation, protected finalization, child-to-parent evidence transfer, and synthesis with Claude. The protected finish used fewer than 1,024 output tokens, so this run does not establish a need for the increased finish cap. At this milestone, depth-two delegation and truncation recovery had only been tested offline.
 
 ### Configuration and manual reproduction
 
@@ -568,6 +568,102 @@ The starvation regression reproduces 12 provider attempts, 13 model decisions, 8
 | Default scripted demo on the canonical corpus | Exit 0, two original chunk citations, zero provider attempts |
 
 Both test runs reported the existing AnyIO pytest deprecation. Reproduction uses the same offline test commands from the recursive milestone above.
+
+## Sequential corpus-wide research
+
+The V4 checkpoint finished one two-company tree and left 23 companies outside model investigation. `execute_corpus_research()` takes the original resolved `ResearchPlan` and uses the same admission policy to schedule whole company groups in ticker order. Each batch starts a fresh delegation-first tree. A group keeps its requested years and sections together. Unresolved requirements, groups too large to fit, and batches left pending at a resource stop remain in the original denominator. Explicit company subsets use the same scheduler.
+
+`CorpusLimits` sets the maximum batches, provider attempts, reported tokens, corpus tool calls, delegations, partition assignments, and elapsed time. Admission requires enough remaining allowance for one full configured tree, including the final smaller batch. The scheduler charges actual counters after each tree, including work already charged when a tree raises an exception. This conservative policy can leave unused capacity below the next tree's allocation. The existing profiles, protected finish reservations, and local limits apply within each tree. Each tree inherits the earlier of the overall deadline and its own deadline. The deadline is cooperative and cannot interrupt a blocking request or filesystem read.
+
+The optional lexical scan runs once inside the overall deadline with separate chunk and time caps. Its pages, scanned chunks, candidates, and matching spans are reported separately from model tool calls and assessed evidence. A group with zero lexical matches remains eligible. Estimates from attempted provider requests are reported separately from measured tokens and missing counters. A response can cross a reported-token threshold, and missing usage can hide consumption. The next tree starts only if the remaining reported-token allowance can cover its allocation.
+
+Aggregation runs in Python without a corpus-sized model conversation. Invocation and finding IDs carry a run and batch namespace. Coverage unions original chunk IDs, delivered span IDs, and section character ranges against the full plan. Accepted root findings, citations, and comparisons remain separate from acknowledged child findings and comparisons. A failed or unacknowledged result can appear in the diagnostic ledger but contributes no accepted findings. Exact source excerpts and SEC provenance survive deduplication. Conflicting assessments and uncertainty stay visible. The deterministic answer separates completed execution, unresolved assessments, and pending scope. Partial access or lexical coverage cannot establish absence or novelty.
+
+Run from the repository root. The first command uses scripted providers. The limited command deliberately exits `1` after returning its partial report. A live invocation requires both `--live` and an explicit JSON `--limits-file` containing `CorpusLimits`.
+
+```bash
+PYTHONPATH=Code/src python Code/examples/demo_rlm_corpus_research.py
+PYTHONPATH=Code/src python Code/examples/demo_rlm_corpus_research.py --limited
+PYTHONPATH=Code/src python Code/examples/demo_rlm_corpus_research.py --company AMD --company NVDA
+```
+
+| Offline canonical run | Full | Limited |
+| --- | ---: | ---: |
+| Required / resolved filing-section targets | 50 / 50 | 50 / 50 |
+| Batches launched | 13 (12 pairs and one singleton) | 1 |
+| Company groups attempted / finished / pending | 25 / 25 / 0 | 2 / 2 / 23 |
+| Lexical chunks / pages | 3,038 / 328 | 3,038 / 328 |
+| Model corpus calls / partition assignments | 2 / 50 | 2 / 4 |
+| Original citations / provider attempts | 2 / 0 | 2 / 0 |
+
+The scripted AMD example delivers the two original water-and-power spans and one batch-root comparison. The other company scripts abstain and remain semantically unassessed. Both reports retain incomplete research status. The limited run stops at the overall partition allowance and keeps the first batch's evidence. Independent semantic verification and live corpus-wide reliability remain unmeasured. Scheduling and aggregation state is in memory for this milestone.
+
+Verification passed **246 focused RLM tests** and **53 related retrieval, provenance, and corpus integrity regressions** with the existing AnyIO deprecation warning. The offline corpus-wide, limited, explicit-subset, planning, planned research, recursive, and comparative demos ran with zero provider attempts. The focused and related test commands are in the earlier verification section.
+
+### Six-company live checkpoint and bounded recovery
+
+Run `4255c0412c34480882f8fde99e5fcace` (`rlm-corpus-six-expanded.json`) used the expanded profile on AAPL, AMD, AMZN, GOOGL, MSFT, and NVDA. All **6 requested companies were scheduled and attempted**. All **12 resolved Item 1A targets** had partial access. Of three batch roots, one finished and two failed. Five children finished and one failed. Five companies had pending work. The report held **17 acknowledged child findings, 4 root findings, 20 retained evidence spans in the accepted inventory, and 3 final root citations**. Execution and research both remained `incomplete`.
+
+| Measure | Two-company V4 | Simple V4 × 3 | Six-company run |
+| --- | ---: | ---: | ---: |
+| Provider attempts | 19 | 57 | 52 |
+| Reported tokens | 141,521 | 424,563 | 401,314 |
+| Corpus operations | 26 | 78 | 76 |
+| Elapsed seconds | 86.4068 | 259.2204 | 308.505648646 |
+| Finished roots | 1 | 3 | 1 |
+
+The six-company run estimated **438,919 tokens** and had **zero missing usage records**. Batches reported **127,700**, **137,172**, and **136,442** tokens. The lexical scan covered **762 chunks across 82 pages** in **0.016620522 seconds**. The six-company timer includes scan and coordination, while the V4 figure measures its recursive tree. The extrapolation is arithmetic. Different filings, tool choices, findings, and failed invocations prevent causal efficiency comparisons or cost conclusions.
+
+#### Six-company reliability validation
+
+Run `c00c4eda1b6640719a18e4ee87790f4d` (`rlm-corpus-six-expanded-validation.json`) used the same expanded ceilings and company pairs. The corpus demo now shares the standalone synthesis guidance. Both runs scheduled and attempted all six companies, scanned all 762 requested chunks across 82 pages, and recorded partial access for all 12 sections. Execution and research remained `incomplete` with independent semantic verification `false`.
+
+| Measure | First six-company run | Reliability validation |
+| --- | ---: | ---: |
+| Finished children / roots | 5 / 1 | 6 / 2 |
+| Companies with pending work | 5 | 2 (AMZN, GOOGL) |
+| Acknowledged child findings / root findings / final root citations | 17 / 4 / 3 | 19 / 10 / 10 |
+| Provider attempts / corpus operations | 52 / 76 | 59 / 74 |
+| Reported / estimated tokens | 401,314 / 438,919 | 460,211 / 505,122 |
+| Elapsed seconds | 308.51 | 315.32 |
+
+The validation reported no provider timeout, missing usage, or shared-budget exhaustion. The number of finished roots rose alongside token and attempt counts. Different retrieval and generation workloads and incomplete roots limit performance comparisons.
+
+#### Shared observation-byte delivery
+
+The first run logged `batch_observation_limit` and `tool_call_limit` at the Batch 1 root. AMD finished with four validated findings and no acknowledgements. Code inspection confirmed that an overflowing batch member was replaced wholesale with an error. The original telemetry cannot identify AMD as the overflowing member or prove that overflow caused the missing acknowledgements.
+
+The controller reserves error envelopes for native tool IDs, then apportions remaining bytes across remaining operations. The comparative fallback packs whole validated findings and comparison summaries whose referenced findings fit in the same result. The full byte cap still applies. Omitted findings retain their original IDs and exact SEC provenance in the ledger. Only offered findings in a successful, acknowledged observation enter the parent's evidence. Submitted IDs mark an attempted request. The stub regression delivers both siblings when their individual payloads fit and their combined full payloads exceed the cap. Failure-isolation tests keep unacknowledged excerpts outside accepted evidence and citations.
+
+In validation, the three delegation envelopes measured **10,438**, **14,302**, and **12,741 bytes**, below the **16,000-byte** cap. Full and offered payload sizes matched for all children. All **19** generated findings were offered, submitted, and acknowledged. The finished roots declared **10** child finding IDs used. The unacknowledged inventory was empty. This verifies live delivery of the full results. The compact fallback remains covered by offline tests, and it can still omit findings when the byte share is small.
+
+#### Protected replay and its limit
+
+The first run logged terminal truncations at the first two roots and the NVIDIA child. The old controller rejected replay in the protected phase even with a finish slot available. This was a code defect, but the original telemetry cannot assign each truncation to a phase or establish that another slot remained.
+
+The controller now permits replay in either phase when valid request history and a protected slot remain. Recovery discards partial output, keeps pending native tool results and IDs, and credits acknowledged evidence once. Finish-only restrictions and decision, provider, token, and deadline checks still apply. The comparative prompt asks for shorter output on replay. Root and child Bedrock stubs verify recovery using a second protected slot, and the multi-batch stub verifies policy propagation and sanitized diagnostics.
+
+In validation, Batch 1 recovered from an investigation truncation and finished with **1,990 output tokens**. Batch 2 truncated during investigation, then reached **2,048 output tokens** on both protected attempts. Each protected request measured **24,496 bytes** and **7,554 input tokens**. The root stopped on the second truncation, leaving Amazon and Alphabet pending despite acknowledged child findings. This verifies bounded protected replay in live execution, with successful protected recovery still unobserved. Default diagnostics record phases, stop reasons, output caps, recovery, observation sizes, and delivery status. `--trace` adds tool IDs, timing, and usage without raw messages or reasoning blocks.
+
+The validation search ledger recovers Microsoft passages despite zero fixed-term candidates and Amazon's semiconductor supply excerpts in both years despite both relevant chunks missing from the shortlist. Public comparisons identify the risk and cite assessed chunk IDs. The explicit AI category requires an AI reference in an exact span, and contextual claims can use a separate same-company, same-year exact span. These checks preserve attribution for model assessments.
+
+Microsoft FY2024 adds water to the reviewed operational risk wording. Alphabet's prior-year excerpt describes general data-center supply interruption, while its later excerpts name AI accelerator supply and deployment dependencies. NVIDIA's reviewed earlier excerpt concerns its own facilities, while the later excerpt describes customer expansion constraints. The model labeled these comparisons `conflicting` by treating missing support or differently scoped evidence as contradiction. The excerpts support differences in reviewed disclosure. Establishing contradiction requires evidence that opposes the same proposition, and establishing novelty requires stronger prior-year coverage.
+
+Reproduce the targeted validation from the repository root with authorized Bedrock credentials. The existing root-level `evidenceroute-six-company-limits.json` specifies 3 batches, 108 provider attempts, 90 corpus operations, 6 delegations, 12 partition assignments, 600,000 reported tokens, and a 900-second deadline.
+
+```bash
+BEDROCK_REGION=us-east-1 \
+  BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
+  CLAUDE_TIMEOUT_SECONDS=20 CLAUDE_MAX_OUTPUT_TOKENS=1024 PYTHONPATH=Code/src \
+  python Code/examples/demo_rlm_corpus_research.py --live --trace --profile expanded \
+    --limits-file evidenceroute-six-company-limits.json \
+    --company AAPL --company AMD --company AMZN --company GOOGL --company MSFT --company NVDA \
+    > rlm-corpus-six-expanded-validation-rerun.json
+```
+
+Remaining work includes compact reference-based root synthesis to reduce repeated evidence and generated structure, generalized candidate discovery beyond the fixed shortlist, and independent semantic verification of relevance, entailment, and disclosure changes. The two protected truncations motivate testing a more compact finish representation under the existing ceilings. The trace measures saturation and leaves the reason for the long generation unresolved.
+
+Verification passed **254 focused RLM tests** and **53 related regressions**, each with the existing AnyIO deprecation warning. Bedrock stubs exercised compact sibling delivery, replay from a truncated protected finish, and shared policy propagation across trees. Offline six-company, full and limited corpus, comparative, planning, recursive, and Standard RAG demos passed their expected checks with zero provider attempts.
 
 ## Ongoing engineering record
 
