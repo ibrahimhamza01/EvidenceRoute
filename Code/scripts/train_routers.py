@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
@@ -64,9 +65,15 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for kind in ("logreg", "naive_bayes"):
+        start = time.perf_counter()
         router = BaselineRouter(kind, seed=args.seed).fit(train_q, train_y)
+        train_seconds = time.perf_counter() - start
         result = evaluate(router, eval_q, eval_y)
         result["config"] = {name: str(value) for name, value in router.pipeline.get_params(deep=False)["steps"]}
+        start = time.perf_counter()
+        router.predict_many(eval_q)
+        inference_ms = (time.perf_counter() - start) * 1000 / len(eval_q)
+        result["latency"] = {"train_seconds": round(train_seconds, 4), "inference_ms_per_question": round(inference_ms, 4)}
         report["models"][kind] = result
 
         # Confusion matrix as a small CSV for the report.

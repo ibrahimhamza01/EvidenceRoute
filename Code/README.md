@@ -74,7 +74,12 @@ Real-filing regressions require original HTML; corpus integration tests require 
 - [Ingestion](docs/ingestion.md): acquisition, parsing, financial statements, Item 1C, chunking, audits, hashes and S3 integrity.
 - [Hybrid retrieval — Issue #4](docs/retrieval.md): BM25, embeddings, Qdrant, RRF, filtering, reproducible indexes and tests.
 - [Standard RAG — Issue #5](docs/standard-rag.md): prompts, Gemini, citations, abstention, tests and limitations.
-- [Question routing — Issue #6](docs/routing.md): TF-IDF classifiers, annotation inputs, train/eval splits, training and metrics.
-- [Evaluation — Issue #10](docs/evaluation.md): annotation requirements, evidence mapping, metrics, validation and limitations.
+- [Question routing — Issues #6 and #18](docs/routing.md): TF-IDF classifiers, annotation inputs, train/eval splits, training, metrics and full-corpus results.
+- [Evaluation — Issues #10 and #18](docs/evaluation.md): full-corpus benchmark, labeling guidelines, annotation requirements, evidence mapping, metrics, validation and limitations.
 
-No annotated benchmark, gold answers or routing results are currently shipped as validated against the full corpus. Routing and evaluation utilities require explicit reviewed annotation inputs; see their guides before running them.
+The reviewed full-corpus benchmark (65 questions, 142 evidence passages) is in `data/benchmark/`, and router results on it are in `Code/results/routing_full/`. Validate and train with:
+
+```bash
+PYTHONPATH=Code/src python Code/scripts/validate_benchmark.py --benchmark data/benchmark/questions.csv --gold data/benchmark/gold_evidence.csv --processed-dir data/processed/full-v1
+PYTHONPATH=Code/src python Code/scripts/train_routers.py --questions data/benchmark/questions.csv --out-dir Code/results/routing_full --seed 42
+```
