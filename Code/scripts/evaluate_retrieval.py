@@ -6,6 +6,9 @@ Each answerable question with supporting gold evidence is searched with every mo
 * ``none``: the question text only.
 * ``metadata``: the question text plus a filter on the question's annotated tickers
   and fiscal years, as a planner that already knows the target filings would use.
+  Corpus-wide questions are never filtered: their ``tickers`` and ``fiscal_years``
+  annotate the filings that answer the question ("which filers ..."), so filtering
+  on them would leak the answer. They are scored as in ``none``.
 
 Recall@K is the share of a question's evidence groups with at least one supporting
 chunk in the top K; MRR@10 uses the first supporting chunk. Results are reported
@@ -56,7 +59,12 @@ def split_field(value: str) -> list[str]:
     return [v.strip() for v in (value or "").split(";") if v.strip()]
 
 
+UNFILTERED_SCOPES = frozenset({"corpus_wide"})
+
+
 def metadata_filter(question: dict) -> ChunkFilter | None:
+    if question.get("scope") in UNFILTERED_SCOPES:
+        return None  # annotated tickers/years are the answer for these questions
     tickers = split_field(question.get("tickers", ""))
     years = [int(y) for y in split_field(question.get("fiscal_years", ""))]
     filters = ChunkFilter(tickers=tickers or None, fiscal_years=years or None)
@@ -96,7 +104,8 @@ def aggregate(rows: list[dict]) -> dict:
     if not rows:
         return {"n": 0}
     keys = [k for k in rows[0] if k != "question_id"]
-    return {"n": len(rows), **{k: round(float(np.mean([r[k] for r in rows])), 4) for k in keys}}
+    # Keep 6 decimals so the 3-decimal summary is not rounded twice.
+    return {"n": len(rows), **{k: round(float(np.mean([r[k] for r in rows])), 6) for k in keys}}
 
 
 def paired(base: list[dict], other: list[dict], metric: str) -> dict:
@@ -184,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         "benchmark": str(args.benchmark), "gold": str(args.gold), "split": args.split,
         "questions_scored": len(questions), "questions_skipped": skipped,
         "scope_counts": {s: sum(q["scope"] == s for q in questions) for s in SCOPES},
+        "metadata_filter_skipped_scopes": sorted(UNFILTERED_SCOPES),
         "embedding_model": embedder.model_id,
         "rerankers": args.rerankers, "rerank_candidates": args.rerank_candidates, "ks": ks,
         "conditions": report_modes,

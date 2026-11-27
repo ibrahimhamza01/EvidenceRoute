@@ -34,8 +34,9 @@ from evidenceroute.schemas import Chunk, RetrievalResult
 
 # Default chosen from the gold-evidence evaluation on full-v1 (59 answerable questions;
 # see Code/docs/retrieval.md). Over hybrid retrieval, bge-reranker-base raised MRR@10
-# from 0.372 to 0.528 without filters and from 0.551 to 0.641 with ticker/year filters,
-# while cross-encoder/ms-marco-MiniLM-L-6-v2 left both roughly unchanged. The cost is
+# from 0.372 to 0.528 without filters and from 0.470 to 0.588 with ticker/year filters
+# (simple and multi-source questions), while cross-encoder/ms-marco-MiniLM-L-6-v2
+# changed MRR@10 much less and lowered Recall@10 slightly. The cost is
 # latency: about 1.8 s per query for 50 candidates on Apple Silicon (MPS), versus
 # 0.33 s for MiniLM. Strategies that search many times can lower candidate_k or set
 # RerankConfig(enabled=False).

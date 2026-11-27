@@ -56,7 +56,7 @@ A cross-encoder reads the question and a passage together and scores their relev
 - **Failures are explicit.** When reranking is enabled and the model cannot be loaded or scored, `RerankerUnavailableError` is raised with the underlying cause, for example `Cross-encoder reranker 'BAAI/bge-reranker-base' could not be loaded: OSError: ...`, followed by how to install the dependency or disable reranking. The pipeline never silently falls back to an unreranked ranking; the fallback is choosing `RerankConfig(enabled=False)`. Unusable scores (wrong length, non-finite) raise `RerankerError`.
 - **Model inputs** are truncated at 512 tokens. Chunks are at most 1,800 characters.
 
-**Why `bge-reranker-base` is the default.** In the gold-evidence evaluation below it was the only reranker that improved on hybrid retrieval: MRR@10 rose from 0.372 to 0.528 without filters and from 0.551 to 0.641 with ticker/year filters. `cross-encoder/ms-marco-MiniLM-L-6-v2` left both roughly unchanged (0.404 and 0.538). The cost is latency: about 1.8 s per query for 50 candidates versus 0.33 s for MiniLM on the benchmark machine. Single-search strategies such as Standard RAG can absorb this. Strategies that search many times (Agentic RAG sub-queries, RLM sweeps) can lower `candidate_k` or disable reranking, and should measure the trade-off for their workload. An earlier qualitative look at four engineering queries suggested MiniLM was better; the gold-evidence scores contradicted it, which is why the choice rests on the scored evaluation.
+**Why `bge-reranker-base` is the default.** In the gold-evidence evaluation below it gave the largest improvement over hybrid retrieval: MRR@10 rose from 0.372 to 0.528 without filters and from 0.470 to 0.588 with ticker/year filters on simple and multi-source questions. `cross-encoder/ms-marco-MiniLM-L-6-v2` changed MRR@10 much less (0.404 and 0.511) and lowered Recall@10 slightly in both conditions. The cost is latency: about 1.8 s per query for 50 candidates versus 0.33 s for MiniLM on the benchmark machine. Single-search strategies such as Standard RAG can absorb this. Strategies that search many times (Agentic RAG sub-queries, RLM sweeps) can lower `candidate_k` or disable reranking, and should measure the trade-off for their workload. An earlier qualitative look at four engineering queries suggested MiniLM was better; the gold-evidence scores contradicted it, which is why the choice rests on the scored evaluation.
 
 ## Full-corpus workflow
 
@@ -138,7 +138,7 @@ All modes returned identical rankings across repeats, and every result satisfied
 
 Scored with `evaluate_retrieval.py` against the reviewed full-corpus benchmark from Issue #18 (65 questions, 142 gold passages mapped to full-v1 chunk IDs; at the time of measurement it was in an open pull request and had not been merged). The 59 answerable questions with supporting gold evidence were scored (22 simple, 22 multi-source, 15 corpus-wide); the 6 unanswerable questions were skipped. Recall@K is the share of a question's evidence groups with a supporting chunk in the top K; MRR@10 uses the first supporting chunk; full coverage@10 requires every group in the top 10.
 
-Two conditions: **none** searches with the question text only; **metadata** adds a filter on the question's annotated tickers and fiscal years, as a planner that already knows the target filings would.
+Two conditions: **none** searches with the question text only; **metadata** adds a filter on the question's annotated tickers and fiscal years, as a planner that already knows the target filings would. Corpus-wide questions are not filtered in either condition: for them the `tickers` and `fiscal_years` columns list the filings that answer the question (for example, q052 "Which companies list Hon Hai among their contract manufacturers?" is annotated NVDA), so filtering on them would leak the answer. The metadata condition therefore filters only the 44 simple and multi-source questions.
 
 **No filter**
 
@@ -150,15 +150,15 @@ Two conditions: **none** searches with the question text only; **metadata** adds
 | Hybrid + MiniLM @50 | 0.245 | 0.436 | 0.517 | 0.646 | 0.404 | 0.390 |
 | **Hybrid + bge @50** | **0.324** | **0.572** | **0.630** | **0.682** | **0.528** | **0.491** |
 
-**Ticker/year filter**
+**Ticker/year filter (simple and multi-source only; corpus-wide unfiltered)**
 
 | Mode | R@1 | R@5 | R@10 | R@20 | MRR@10 | Full cov.@10 |
 | --- | --- | --- | --- | --- | --- | --- |
-| BM25 | 0.266 | 0.560 | 0.683 | 0.749 | 0.495 | 0.525 |
-| Dense | 0.321 | 0.518 | 0.566 | 0.688 | 0.484 | 0.475 |
-| Hybrid | 0.316 | 0.552 | 0.657 | 0.784 | 0.551 | 0.525 |
-| Hybrid + MiniLM @50 | 0.324 | 0.519 | 0.640 | 0.735 | 0.538 | 0.525 |
-| **Hybrid + bge @50** | **0.427** | **0.625** | **0.699** | **0.801** | **0.641** | **0.576** |
+| BM25 | 0.264 | 0.525 | 0.663 | 0.711 | 0.467 | 0.525 |
+| Dense | 0.264 | 0.445 | 0.513 | 0.656 | 0.419 | 0.424 |
+| Hybrid | 0.281 | 0.522 | 0.620 | 0.758 | 0.470 | 0.525 |
+| Hybrid + MiniLM @50 | 0.321 | 0.503 | 0.602 | 0.705 | 0.511 | 0.492 |
+| **Hybrid + bge @50** | **0.400** | **0.606** | 0.656 | **0.775** | **0.588** | **0.542** |
 
 **By scope (R@10 / MRR@10)**
 
@@ -166,24 +166,23 @@ Two conditions: **none** searches with the question text only; **metadata** adds
 | --- | --- | --- | --- |
 | Hybrid, no filter | 0.727 / 0.504 | 0.409 / 0.269 | 0.404 / 0.328 |
 | bge @50, no filter | 0.864 / 0.659 | 0.523 / 0.499 | 0.447 / 0.380 |
-| Hybrid, filter | 0.818 / 0.642 | 0.568 / 0.396 | 0.552 / 0.644 |
-| bge @50, filter | 0.909 / 0.811 | 0.545 / 0.507 | 0.616 / 0.589 |
+| Hybrid, filter | 0.818 / 0.642 | 0.568 / 0.396 | (unfiltered) |
+| bge @50, filter | 0.909 / 0.811 | 0.545 / 0.507 | (unfiltered) |
 
 **Per-question comparison with hybrid** (better / same / worse; two-sided sign test on non-ties)
 
 | Mode | Condition | R@10 | MRR@10 |
 | --- | --- | --- | --- |
 | bge @50 | none | 10 / 46 / 3 (p = 0.09) | 23 / 25 / 11 (p = 0.06) |
-| bge @50 | filter | 9 / 43 / 7 (p = 0.80) | 18 / 29 / 12 (p = 0.36) |
+| bge @50 | filter | 7 / 48 / 4 (p = 0.55) | 19 / 28 / 12 (p = 0.28) |
 | MiniLM @50 | none | 5 / 48 / 6 | 15 / 30 / 14 (p = 1.0) |
-| MiniLM @50 | filter | 9 / 41 / 9 | 15 / 26 / 18 (p = 0.73) |
+| MiniLM @50 | filter | 7 / 43 / 9 (p = 0.80) | 17 / 25 / 17 (p = 1.0) |
 
 **Observations**
 
-- `bge-reranker-base` improves ranking quality, mostly by moving gold evidence toward the top (largest gain at R@1 and MRR@10, and for simple questions). The gain is clearer without filters than with them.
-- `ms-marco-MiniLM-L-6-v2` does not improve on hybrid retrieval for this corpus.
-- BM25 alone has higher R@10 than hybrid in both conditions (0.552 vs 0.527, 0.683 vs 0.657), although hybrid has higher MRR@10 with filters. The weaker dense ranking appears to displace some BM25 hits during fusion. This is reported for the team; RRF was not changed in this work.
-- With filters, bge lowers corpus-wide MRR@10 (0.644 to 0.589) while raising R@10.
+- `bge-reranker-base` improves ranking quality, mostly by moving gold evidence toward the top (largest gain at R@1 and MRR@10, and for simple questions). Its Recall@10 gain is smaller, especially with filters.
+- `ms-marco-MiniLM-L-6-v2` does not clearly improve on hybrid retrieval for this corpus.
+- BM25 alone has higher R@10 than hybrid in both conditions (0.552 vs 0.527, 0.663 vs 0.620) and, with filters, about the same R@10 as bge (0.663 vs 0.656), although bge ranks gold evidence higher (MRR@10 0.588 vs 0.467). The weaker dense ranking appears to displace some BM25 hits during fusion. This is reported for the team; RRF was not changed in this work.
 - Corpus-wide questions can have more evidence groups than 10, so their R@10 is bounded below 1 by design. These questions are the motivation for decomposed or recursive strategies rather than a single top-k search.
 
 **Limitations.** 59 questions is a small sample; only the unfiltered MRR@10 improvement for bge approaches conventional significance. Scores cover both dev and heldout splits; use `--split heldout` for held-out numbers. The benchmark has one embedding model and one candidate depth for reranking quality. These are retrieval metrics only, not answer quality.
