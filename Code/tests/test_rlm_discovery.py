@@ -97,6 +97,25 @@ def test_budgets_interleave_sections_and_record_unscanned_work(limits, seconds, 
     assert [pair for pair, _, _ in corpus.pages] == list(pairs[:scan.pages_read])
 
 
+def test_question_coverage_outranks_an_incidental_phrase():
+    pair = SectionTarget("ABC-2024", "item_7")
+    corpus = SectionFixture({pair: [
+        ("incidental", "The Widget acquisition closed during a reorganization."),
+        ("component", "Widget contributed 1 million of product revenue to one segment."),
+        ("answer", "Widget contributed 4 million in total revenue during the year."),
+    ]})
+    intent = interpret_intent("What does MD&A say Widget contributed to revenue?", lambda *_: {
+        "company_selection": "explicit", "companies": ("ABC",), "fiscal_years": (2024,),
+        "section_ids": ("item_7",), "objective": "review", "topic": "Widget revenue contribution",
+        "comprehensive": False, "inferred_fields": (),
+    })
+    plan = ResearchPlan(intent, ("ABC",), (CompanyPartition("ABC", intent.question, (pair,)),), ())
+    spec = DiscoverySpec(topic=intent.topic, phrases=("widget", "widget acquisition", "widget contributed"),
+                         max_candidates_per_section=3)
+    scan = discover_research_plan(corpus, plan, spec)
+    assert [hit.chunk_id for hit in scan.sections[0].candidates] == ["answer", "component", "incidental"]
+
+
 def test_generic_topic_does_not_use_ai_infrastructure_anchors():
     pair = SectionTarget("ABC-2024", "item_1a")
     corpus = SectionFixture({pair: [

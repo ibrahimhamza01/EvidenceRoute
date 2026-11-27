@@ -3,10 +3,10 @@
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, ValidationError
 
 from evidenceroute.research.rlm.coverage import CoverageReport, SectionTarget
-from evidenceroute.research.rlm.findings import Finding
+from evidenceroute.research.rlm.findings import Finding, FindingValidationIssue, finding_schema_issues
 from evidenceroute.research.rlm.tools import FiscalYear, Identifier, StrictInput
 
 AnswerDisposition = Literal["answered", "partial", "insufficient_evidence"]
@@ -18,11 +18,17 @@ class SourceOperand(StrictInput):
     ticker: Identifier
     filing_year: FiscalYear
     section_id: Identifier
-    period_text: Note | None = Field(default=None, description="Exact reporting-period text in the bound excerpt, if needed.")
+    period_text: Note | None = Field(
+        default=None,
+        description="Leave null unless the question names this period and the bound finding contains that exact text.",
+    )
 
 
 class DraftBinding(SourceOperand):
-    ref: str = Field(pattern=r"^(s[1-8]|d[1-9][0-9]{0,8})$")
+    ref: str = Field(
+        pattern=r"^(s[1-8]|d[1-9][0-9]{0,8})$",
+        description="Acknowledged alias dN or sN from the delivered finding. Do not send finding_id.",
+    )
 
 
 class BoundOperand(SourceOperand):
@@ -37,7 +43,10 @@ class Assessment(StrictInput):
 
 
 class ConclusionDraft(Assessment):
-    bindings: list[DraftBinding] = Field(min_length=2, max_length=8)
+    bindings: list[DraftBinding] = Field(
+        min_length=2, max_length=8,
+        description="Bind each required source to a different acknowledged finding. Omit conclusions when cite_refs is enough.",
+    )
 
 
 class Conclusion(Assessment):
@@ -69,39 +78,63 @@ def validate_conclusion(record: Conclusion, available: Mapping[str, Finding], re
         raise ValueError("missing_operand")
 
 
+_CONCLUSION_CODES = frozenset({"unknown_finding", "wrong_source", "missing_period_text", "missing_operand"})
+
+
 def resolve_conclusions(proposals: object, references: Mapping[str, Finding], required: Sequence[SourceOperand],
                         scope: Sequence[SectionTarget] | None, selected: Sequence[Finding],
-                        coverage: CoverageReport) -> tuple[tuple[Conclusion, ...], bool]:
+                        coverage: CoverageReport) -> tuple[tuple[Conclusion, ...], tuple[FindingValidationIssue, ...]]:
+    """Accept supported conclusions and return sanitized reasons for the rest."""
     if proposals == []:
-        return (), False
+        return (), ()
     if not isinstance(proposals, list) or len(proposals) > 3:
-        return (), True
+        return (), (FindingValidationIssue("synthesis.conclusions", "schema", "invalid_conclusions"),)
     known = {f.finding_id: f for f in references.values()}
     visible = {source.chunk_id for source in coverage.visible_chunks}
     cited = {item.source.chunk_id for f in selected for item in f.evidence}
     inherited = {f.finding_id for ref, f in references.items() if ref.startswith("d")}
     used = {f.finding_id for f in selected}
     records = []
-    withheld = False
-    for raw in proposals:
+    rejections: list[FindingValidationIssue] = []
+
+    def reject(issue: FindingValidationIssue) -> None:
+        if len(rejections) < 4:
+            rejections.append(issue)
+
+    for index, raw in enumerate(proposals):
+        path = f"synthesis.conclusions[{index}]"
         try:
             draft = ConclusionDraft.model_validate(raw)
+        except ValidationError as exc:
+            for issue in finding_schema_issues(exc, path) or (FindingValidationIssue(path, "schema", "invalid_conclusion"),):
+                reject(issue)
+            continue
+        try:
             bindings = tuple(BoundOperand(**b.model_dump(exclude={"ref"}), finding_id=references[b.ref].finding_id)
                              for b in draft.bindings)
             record = Conclusion(**draft.model_dump(exclude={"bindings"}), bindings=bindings)
             validate_conclusion(record, known, required, scope)
-        except (ValueError, KeyError):
-            withheld = True
+        except KeyError:
+            reject(FindingValidationIssue(f"{path}.bindings", "provenance", "unacknowledged_finding_reference"))
+            continue
+        except ValueError as exc:
+            code = str(exc)
+            if code not in _CONCLUSION_CODES:
+                code = "invalid_conclusion"
+            reject(FindingValidationIssue(path, "provenance" if code in _CONCLUSION_CODES else "validation", code))
             continue
         ids = {b.finding_id for b in bindings}
         chunks = {item.source.chunk_id for fid in ids for item in known[fid].evidence}
-        if not chunks <= visible or len(cited | chunks) > 50 or len((used | ids) & inherited) > 32:
-            withheld = True
+        if not chunks <= visible:
+            reject(FindingValidationIssue(path, "provenance", "unacknowledged_evidence"))
+            continue
+        if len(cited | chunks) > 50 or len((used | ids) & inherited) > 32:
+            reject(FindingValidationIssue(path, "limit", "synthesis_limit"))
             continue
         records.append(record)
         used.update(ids)
         cited.update(chunks)
-    return tuple(records), withheld
+    return tuple(records), tuple(rejections)
 
 
 def render_conclusion(record: Conclusion, known: Mapping[str, Finding]) -> str:

@@ -16,6 +16,7 @@ from evidenceroute.research.rlm.environment import MAX_CHUNK_ROWS, CorpusEnviron
 from evidenceroute.research.rlm.planning import ResearchIntent, ResearchPlan
 from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import Identifier, StrictInput
+from evidenceroute.retrieval.bm25 import BM25Config, score_texts
 from evidenceroute.retrieval.tokenization import tokenize
 
 
@@ -68,6 +69,65 @@ _RISK = re.compile(
     r"disrupt\w*|availab\w*|limit\w*|fail\w*|outages?|supply|sufficient|unable)\b"
 )
 _DISRUPTION = re.compile(r"\b(?:shortages?|outages?|constrain\w*|disrupt\w*|interrupt\w*|impair\w*)\b")
+# Standard filing-section names. Used only to align a question clause with the
+# section being ranked. They do not add evidence or change scope.
+_SECTION_ALIASES = {
+    "item_1": ("business",),
+    "item_1a": ("risk factors", "risk factor"),
+    "item_1c": ("cybersecurity",),
+    "item_7": ("md&a", "mda", "management's discussion", "management discussion"),
+    "item_7a": ("market risk",),
+    "item_8": ("financial statements",),
+    "item_15": ("exhibits",),
+}
+_QUERY_BOILERPLATE = frozenset({
+    "fiscal", "form", "filing", "annual", "report", "section", "item", "say", "10k",
+})
+# A component or balance the question did not name is a different measure.
+_MEASURE_QUALIFIERS = frozenset({
+    "product", "products", "service", "services", "segment", "segments", "deferred",
+    "subscription", "software", "geographic", "component", "components", "balance", "balances",
+})
+# Question-term coverage leads. With length normalization off, repeated query
+# terms still matter and equal scores fall through to the existing phrase rank.
+_QUESTION_BM25 = BM25Config(b=0)
+
+
+def _section_query_terms(question: str, section_id: str, section_name: str, companies: tuple[str, ...]) -> tuple[str, ...]:
+    """Terms that ask for information from this section, without scope boilerplate."""
+    aliases = _SECTION_ALIASES.get(section_id.lower(), ())
+    title_terms = set(tokenize(section_name))
+    title_terms.update(tokenize(" ".join(aliases)))
+    clauses = re.split(r"\s*,?\s+and\s+(?=what\b|how\b|whether\b)|;\s*", question, flags=re.IGNORECASE)
+    selected = []
+    for clause in clauses:
+        folded = clause.casefold()
+        if any(alias in folded for alias in aliases) or (set(tokenize(clause)) & (title_terms - _QUERY_BOILERPLATE)):
+            selected.append(_clause_focus(clause, aliases, title_terms))
+    text = " ".join(selected) if selected else question
+    blocked = set(_QUERY_BOILERPLATE)
+    blocked.update(title_terms)
+    blocked.update(tokenize(" ".join(companies)))
+    return tuple(dict.fromkeys(
+        token for token in tokenize(text)
+        if token not in blocked and not (len(token) == 4 and token.isdigit())
+    ))
+
+
+def _clause_focus(clause: str, aliases: tuple[str, ...], title_terms: set[str]) -> str:
+    folded = clause.casefold()
+    start = len(clause)
+    for alias in aliases:
+        index = folded.find(alias)
+        if index >= 0:
+            start = min(start, index)
+    for term in title_terms - _QUERY_BOILERPLATE:
+        match = re.search(rf"\b{re.escape(term)}\b", folded)
+        if match:
+            start = min(start, match.start())
+    return clause[start:] if start < len(clause) else clause
+
+
 _INFLECTIONS = {
     "accelerators": "accelerator", "centers": "center", "centres": "center", "centre": "center",
     "chips": "chip", "constraints": "constraint", "dependencies": "dependency",
@@ -136,6 +196,7 @@ class CorpusScan:
 
     def shortlist(
         self, pairs: tuple[SectionTarget, ...], *, per_section: int = 3, mechanism_hint: bool = False,
+        include_identity: bool = True,
     ) -> list[dict]:
         authorized = set(pairs)
         shortlist = []
@@ -143,10 +204,12 @@ class CorpusScan:
             if row.pair not in authorized:
                 continue
             candidates = row.candidates[:per_section]
-            entry = {"ticker": row.ticker, "fiscal_year": row.fiscal_year, "section_id": row.pair.section_id,
-                     "document_id": row.pair.document_id, "candidate_count": len(row.candidates),
-                     "chunks": [item.chunk_id for item in candidates], "matching_span_ids": self._span_hints(candidates),
+            entry = {"section_id": row.pair.section_id, "document_id": row.pair.document_id,
+                     "candidate_count": len(row.candidates), "chunks": [item.chunk_id for item in candidates],
+                     "matching_span_ids": self._span_hints(candidates),
                      "next_offset": per_section if len(row.candidates) > per_section else None}
+            if include_identity:
+                entry = {"ticker": row.ticker, "fiscal_year": row.fiscal_year, **entry}
             if mechanism_hint:
                 for hit in row.candidates:
                     if hit.matching_span_ids and any(_INFRA_STRONG.fullmatch(term) for term in hit.terms) and any(
@@ -203,6 +266,36 @@ class _SectionScan:
     scanned: int = 0
     candidates: list[Candidate] = field(default_factory=list)
     ranks: dict[str, tuple] = field(default_factory=dict)
+    passages: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    question_rank: dict[str, tuple[int, float]] = field(default_factory=dict)
+
+
+def _rank_question_passages(sections: list[_SectionScan], question: str, companies: tuple[str, ...]) -> None:
+    """Rank lexical hits by how many requested terms a matching passage covers."""
+    for section in sections:
+        name = getattr(section.metadata, "section_name", "") or ""
+        terms = _section_query_terms(question, section.pair.section_id, name, companies)
+        if not terms or not section.passages:
+            continue
+        documents = [" ".join(tokens) for _, tokens in section.passages if tokens]
+        owners = [chunk_id for chunk_id, tokens in section.passages if tokens]
+        token_rows = [tokens for _, tokens in section.passages if tokens]
+        if not documents:
+            continue
+        scores = score_texts(" ".join(terms), documents, _QUESTION_BM25)
+        wanted = set(terms)
+        asked = set(tokenize(question))
+        best: dict[str, tuple[int, int, float]] = {}
+        for chunk_id, tokens, score in zip(owners, token_rows, scores):
+            covered = len(wanted.intersection(tokens))
+            narrower = sum(1 for token in set(tokens) if token in _MEASURE_QUALIFIERS and token not in asked
+                           and token.rstrip("s") not in asked)
+            # Coverage first, then the measure the question named. Equal term
+            # frequencies stay tied for the phrase-rank fallback.
+            candidate = (covered, -narrower, round(score, 6))
+            if candidate > best.get(chunk_id, (-1, -10**9, -1.0)):
+                best[chunk_id] = candidate
+        section.question_rank = best
 
 
 def _scan(
@@ -268,14 +361,21 @@ def _scan(
             for chunk in page.items:
                 matched, rank = matching_terms(chunk.text)
                 if matched:
-                    spans = tuple(span for span, (start, end) in passage_spans(chunk.text).items()
-                                  if matching_terms(chunk.text[start:end])[0])
+                    spans = []
+                    for span, (start, end) in passage_spans(chunk.text).items():
+                        if not matching_terms(chunk.text[start:end])[0]:
+                            continue
+                        spans.append(span)
+                        section.passages.append((chunk.chunk_id, tuple(tokenize(chunk.text[start:end]))))
                     section.ranks[chunk.chunk_id] = rank
-                    section.candidates.append(Candidate(chunk.chunk_id, matched, spans))
+                    section.candidates.append(Candidate(chunk.chunk_id, matched, tuple(spans)))
                 chars += len(chunk.text)
             scanned += len(page.items)
             section.scanned += len(page.items)
         active = [section for section in active if section.scanned < section.metadata.chunk_count]
+
+    if spec is not None and not use_context:
+        _rank_question_passages(sections, plan.intent.question, plan.intent.companies)
 
     rows = []
     for section in sections:
@@ -284,6 +384,7 @@ def _scan(
             candidates = sorted(section.candidates, key=lambda hit: -len(hit.terms))
         else:
             candidates = sorted(section.candidates, key=lambda hit: (
+                tuple(-value for value in section.question_rank.get(hit.chunk_id, (0, 0.0))),
                 tuple(-value for value in section.ranks[hit.chunk_id]), hit.chunk_id,
             ))[:spec.max_candidates_per_section]
         rows.append(ScannedSection(section.pair, meta.ticker, meta.fiscal_year, meta.chunk_count, section.scanned,

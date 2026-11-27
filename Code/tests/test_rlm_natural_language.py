@@ -853,7 +853,8 @@ def test_non_ai_cross_year_comparison_uses_the_generic_executor(corpus):
     ]
     assert intent.section_ids == ("item_1a",) and "section_ids" in intent.inferred_fields
     _assert_generic_publication(result, statement)
-    assert result.research.answer_disposition == "partial"
+    assert result.research.answer_disposition == "answered"
+    assert result.research.research_status == "incomplete"
     root, child = prompts
     assert question in root.prompts[0] and "AAPL" in root.prompts[0] and "Each conclusion requires these source operands" in root.prompts[0]
     assert "Required source operands" in root.prompts[0]

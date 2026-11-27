@@ -48,11 +48,15 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   inferred_fields. Ask for clarification when the appropriate section is unclear. Broad all-section or full-filing
   requests are unsupported, since the corpus has selected sections.
 - The review mode covers descriptive, evidence-based disclosure research. That includes corpus-wide description
-  and a question one filing can answer, including comparative figures that filing already discloses. Its objective
-  is review and required_operands is []. generic_synthesis covers ordinary filing-grounded comparisons and
-  cross-source synthesis across companies, filing years (including more than two), or sections. Its objective
-  stays review so the generic research executor is used. Keep the comparison in the topic and required_operands.
-  Mark it comprehensive within the requested sources. ai_infrastructure_comparison remains the explicit two-fiscal-year
+  and a question one filing section can answer, including comparative figures that section already discloses. Its
+  objective is review and required_operands is []. generic_synthesis covers ordinary filing-grounded comparisons
+  and cross-source synthesis across companies, filing years (including more than two), or sections. An explicit
+  question that needs two or more filing sections is generic_synthesis even when those sections are in one filing
+  and one fiscal year. Give each requested section its own operand. Do not drop a named section because the filing
+  is singular. Keep the objective as review so the generic research executor is used. Keep the comparison in the topic
+  and required_operands. Mark it comprehensive within the requested sources. Comprehensive means every requested
+  source must be considered. It does not mean every chunk in a section must be read before the evidence can answer
+  the question. ai_infrastructure_comparison remains the explicit two-fiscal-year
   AI infrastructure novelty question, with objective year_over_year. Ranking, forecasting, investment advice,
   external data, and arbitrary calculations are unsupported. Never turn those into a review or synthesis, and never
   keep only two years from a larger comparison. If a comparison needs more than eight source operands, return
@@ -62,9 +66,9 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   and section. Supply two to eight operands. Add an operand only when the question requires that source, not for
   every filing merely in scope. Keep an operand whose company, year, or section is unavailable. Every operand must
   use a requested company, filing year, and section. Leave period_text null. Do not invent a reporting-period anchor
-  before evidence is retrieved. A single filing that already states figures for several periods is a review of that
-  filing year, not two findings and not two period anchors. For review and ai_infrastructure_comparison,
-  required_operands is [].
+  before evidence is retrieved. A single section that already states figures for several periods is a review of that
+  filing year, not two findings and not two period anchors. Named sections are source operands even inside that
+  one filing. For review and ai_infrastructure_comparison, required_operands is [].
 - For ready modes include requirements and question-specific lexical phrases likely to occur verbatim in the
   filing text. Prefer short topic variants, synonyms and acronyms. Use inferred_fields for every inferred
   requirement other than section scope and briefly document those assumptions in scope_notes.

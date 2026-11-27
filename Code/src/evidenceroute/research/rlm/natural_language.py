@@ -106,15 +106,26 @@ def research_question(
     result = None
     if plan is not None and remaining_seconds > 0:
         scoped_runner = copy(runner)
-        scoped_runner.child_guidance = "\n".join(filter(None, (
-            runner.child_guidance, f"Original research question: {plan.intent.question}\nResearch topic: {plan.intent.topic}",
-        )))
+        child_extra = f"Original research question: {plan.intent.question}\nResearch topic: {plan.intent.topic}"
+        if plan.intent.objective != "year_over_year":
+            child_extra += (
+                " Preserve the requested metric, unit, period, and qualifiers. "
+                "Do not substitute a related measure, component, balance, or segment figure. "
+                "Before finishing, examine each unresolved part of the question. "
+                "Unread chunks are not a reason to skip a part while tool slots remain."
+            )
+        scoped_runner.child_guidance = "\n".join(filter(None, (runner.child_guidance, child_extra)))
         root_guidance = (
             "Requested fiscal years " + ", ".join(map(str, sorted(set(plan.intent.fiscal_years)))) + ". "
             "Requested filing sections " + ", ".join(sorted(set(plan.intent.section_ids))) + ". "
-            + ("The question requires comprehensive review of the requested scope."
+            + ("The question requires every requested source. Unread section text does not by itself make supported evidence insufficient."
                if plan.intent.comprehensive else "The question requests a bounded, evidence-based answer.")
         )
+        if plan.intent.objective != "year_over_year":
+            root_guidance += (
+                " Preserve the requested metric, unit, period, and qualifiers. "
+                "Do not substitute a related measure, component, balance, or segment figure."
+            )
         if plan.intent.required_operands:
             root_guidance += (
                 " Compare these required source operands and bind each one. A missing operand is insufficient "

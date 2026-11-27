@@ -166,6 +166,10 @@ def test_bad_synthesis_keeps_eligible_atomic_evidence(corpus, mode):
         assert all(e[2] in result.answer for e in EXCERPTS.values())
     assert result.publication_state == ("partial_evidence" if mode == "unfinished" else
                                        "insufficient_evidence" if mode == "undelivered" else "selected_evidence")
+    if mode == "wrong_company":
+        assert "wrong_source" in result.answer
+    if mode == "wrong_ref":
+        assert "unacknowledged_finding_reference" in result.answer
 
 
 @pytest.mark.parametrize("years, sections", [((2023, 2024), ("item_1a",)), ((2024,), ("item_1a", "item_7"))])

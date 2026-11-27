@@ -810,7 +810,7 @@ def test_live_recursive_experiment_with_stubbed_converse(snapshot, recursive_dem
     first_result = sessions[0].requests[1]["messages"][-1]["content"][0]["toolResult"]
     assert first_result["toolUseId"] == "old-delegate"
     evidence = first_result["content"][0]["json"]["result"]["findings"][0]["evidence"][0]
-    assert evidence["quote"] == QUOTE and evidence["source"]["chunk_id"] == old_chunk.chunk_id
+    assert evidence["quote"] == QUOTE and evidence["chunk_id"] == old_chunk.chunk_id
     assert len(QUOTE) <= len(old_chunk.text)
     root_trace = report["trace"]
     first_child, second_child = root_trace["delegations"]

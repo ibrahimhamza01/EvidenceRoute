@@ -421,6 +421,11 @@ class RootController:
                             notice += (" Copy aliases from receipts exactly. Use empty synthesis if no aliases were issued. "
                                        "Use neutral mechanism labels of 2–8 words (120 characters max). "
                                        "Omit optional AI context unless a same-year excerpt grounds the link.")
+                        elif not self._comparative:
+                            notice += (" Bind required operands with dN or sN aliases, not finding IDs. "
+                                       "Leave period_text null unless the quote contains that exact text. "
+                                       "Keep the requested metric, unit, period, and qualifier. "
+                                       "If a requested part has no supporting excerpt, name that part instead of substituting a related measure.")
                         if replay_reason == "truncated_response" and self._comparative:
                             notice += " Prioritize one comparison per company and reference the strongest evidence."
                     else:
@@ -633,10 +638,9 @@ class RootController:
                         citations = _recursive.finish_references(
                             action.synthesis, coverage.report(), issues=issues, proposals=proposals,
                         )
-                        if _recursive.withheld_conclusions:
-                            step.finding_validation = (FindingValidationIssue("synthesis.conclusions", "validation", "withheld_conclusion"),)
-                        if issues:
-                            step.finding_validation = tuple(issues)
+                        validation = (*(issues or ()), *_recursive.conclusion_rejections)
+                        if validation:
+                            step.finding_validation = validation
                     except FindingValidationError as exc:
                         pending = self._finding_feedback(step, exc)
                         continue

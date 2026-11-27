@@ -99,14 +99,18 @@ def publish_research_findings(
         sections.append("Conclusions selected by finished roots.\n" + "\n".join(conclusion_lines))
         whole_question = len(roots) == 1 and not unresolved
         if generic_plan is not None and whole_question:
+            # Evidence sufficiency is the bound conclusion. Unread chunks in an
+            # authorized section do not by themselves make that conclusion partial.
             whole_question = (not generic_plan.missing_requirements
-                              and set(roots[0].invocation.partitions or ()) == set(generic_plan.resolved_targets)
-                              and (not generic_plan.intent.comprehensive or not incomplete))
+                              and set(roots[0].invocation.partitions or ()) == set(generic_plan.resolved_targets))
         disposition = ("insufficient_evidence" if all(d == "insufficient_evidence" for d in dispositions)
                        else "answered" if whole_question
                        and all(d == "answered" for d in dispositions) else "partial")
     if unresolved:
         gap = "Evidence bindings are missing or invalid for a requested conclusion."
+        reasons = [issue for root in roots for issue in root.conclusion_rejections]
+        if reasons:
+            gap += " " + "; ".join(f"{issue.path} {issue.code}" for issue in reasons[:4]) + "."
         if generic_plan and generic_plan.intent.required_operands:
             sources = [f"{o.ticker} FY{o.filing_year} {o.section_id}" + (f" ({o.period_text})" if o.period_text else "")
                        for o in generic_plan.intent.required_operands]

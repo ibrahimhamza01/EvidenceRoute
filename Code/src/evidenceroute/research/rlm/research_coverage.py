@@ -9,7 +9,7 @@ from typing import Literal
 from evidenceroute.research.rlm.controller import ExecutionTrace
 from evidenceroute.research.rlm.coverage import SectionTarget, _merge_ranges
 from evidenceroute.research.rlm.environment import CorpusEnvironment
-from evidenceroute.research.rlm.findings import AnalysisStatus, Finding
+from evidenceroute.research.rlm.findings import AnalysisStatus, Finding, FindingValidationIssue
 from evidenceroute.research.rlm.planning import MissingRequirement, ResearchPlan
 from evidenceroute.research.rlm.recursive import DelegationTrace, Invocation
 from evidenceroute.research.rlm.synthesis import Conclusion
@@ -48,6 +48,7 @@ class InvocationOutcome:
     acknowledged_local_finding_ids: tuple[str, ...] = ()
     conclusions: tuple[Conclusion, ...] = ()
     withheld_conclusions: bool = False
+    conclusion_rejections: tuple[FindingValidationIssue, ...] = ()
 
     @property
     def acknowledged_findings(self) -> tuple[Finding, ...]:
@@ -226,6 +227,8 @@ def aggregate_research_trees(
                                 for step in run.steps for op in step.operations for ref in op.acknowledged_finding_refs))
             if run and run.conclusions else (),
             run.conclusions if run else (), run.withheld_conclusions if run else False,
+            tuple(issue for step in (run.steps if run else ()) for issue in step.finding_validation
+                  if issue.path.startswith("synthesis.conclusions")),
         ))
         for child, child_acknowledged in children:
             assert child.invocation is not None

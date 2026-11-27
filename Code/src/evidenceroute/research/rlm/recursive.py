@@ -198,23 +198,34 @@ class RecursiveResearch:
             enable = getattr(model, "enable_generic_root", None)
             if callable(enable):
                 enable()
-            prompt += (" For a supported synthesis, bind each operand to an acknowledged sN or dN finding. "
-                       "Preserve reporting periods, units, conditions and conflicting evidence. Use cite_refs alone "
-                       "for descriptive findings or when a relationship lacks support.")
+            prompt += (" For a supported synthesis, bind every required operand to an acknowledged alias: "
+                       "dN from a delivered finding or sN from a submission receipt. "
+                       "Copy ticker, filing_year, and section_id from that finding. Do not send finding_id as ref. "
+                       "Leave period_text null unless that exact text is in the bound quote. "
+                       "Preserve the requested metric, unit, period, and qualifiers. A related measure is not a substitute. "
+                       "Use cite_refs alone for descriptive findings or when a relationship lacks support.")
             if invocation.required_operands:
                 prompt += "\nEach conclusion requires these source operands: " + observation_json(invocation.required_operands)
         if invocation.goal is not None:
             prompt += f"\nAnalysis goal: {invocation.goal}"
         if invocation.depth > 0 and self.child_guidance:
-            prompt += f"\nInvestigation guidance: {self.child_guidance}"
+            lines = [
+                line for line in self.child_guidance.split("\n")
+                if not (line.startswith("Original research question: ")
+                        and line.removeprefix("Original research question: ") in invocation.question)
+            ]
+            if lines:
+                prompt += "\nInvestigation guidance: " + "\n".join(lines)
         if partitions is not None:
             prompt += "\nAuthorized partitions: " + observation_json([vars(pair) for pair in partitions])
         if self.discovery_scan is not None and not session.delegation_first:
-            shortlist = self.discovery_scan.shortlist(partitions or ())
+            shortlist = self.discovery_scan.shortlist(partitions or (), include_identity=False)
             prompt += (
-                "\nLexical candidates (IDs, at most three per section): " + observation_json(shortlist)
-                + "\nUse list_candidates for scoped IDs and get_spans or get_chunk to read promising evidence. "
-                "Use scoped search_chunks for gaps or different wording. No lexical miss proves absence."
+                "\nQuestion-ranked candidates, at most three per section: " + observation_json(shortlist)
+                + "\nRead the best candidate for each unresolved part before extra hits from a part you already support. "
+                "One get_spans call can take four span IDs from one chunk. "
+                "Keep the requested metric, unit, period, and qualifiers; a related measure is not a substitute. "
+                "Search for different wording when the list is insufficient. No lexical miss proves absence."
             )
         if self.comparison_scan is not None and not session.delegation_first:
             shortlist = self.comparison_scan.shortlist(partitions or (), mechanism_hint=session.compact_comparative)
@@ -308,6 +319,7 @@ class RecursiveSession:
         self.generic_root = invocation.depth == 0 and runner.comparison_scan is None
         self.conclusions: tuple[Conclusion, ...] = ()
         self.withheld_conclusions = False
+        self.conclusion_rejections: tuple = ()
         self.acknowledged_references: dict[str, Finding] = {}
         self.submitted_findings: dict[str, Finding] = {}
         self.retained_findings: dict[FindingKey, Finding] = {}
@@ -591,6 +603,18 @@ class RecursiveSession:
                 record.update({key: value for key, value in (
                     ("uncertainty", finding.uncertainty), ("conflict", finding.conflict)) if value is not None})
                 finding_records[finding.finding_id] = record
+            elif self.runner.comparison_scan is None:
+                source = finding.evidence[0].source
+                record = {
+                    "ref": ref, "ticker": source.ticker, "filing_year": source.fiscal_year,
+                    "section_id": source.section_id, "claim": finding.claim,
+                    "analysis_status": finding.analysis_status,
+                    "evidence": [{"chunk_id": item.source.chunk_id, "span_id": item.span_id, "quote": item.quote}
+                                 for item in finding.evidence],
+                }
+                record.update({key: value for key, value in (
+                    ("uncertainty", finding.uncertainty), ("conflict", finding.conflict)) if value is not None})
+                finding_records[finding.finding_id] = record
             else:
                 finding_records[finding.finding_id] = {"ref": ref, **asdict(finding)}
         body = {
@@ -821,10 +845,11 @@ class RecursiveSession:
                             raise
                         raise issue from exc
                     issues.append(exc.issue if isinstance(exc, FindingValidationError) else issue.issue)
-        conclusions, withheld = resolve_conclusions(
+        conclusions, rejections = resolve_conclusions(
             proposals, self.acknowledged_references, self.invocation.required_operands, self.invocation.partitions,
             [f for f in available.values() if f.finding_id in selected], coverage,
         )
+        self.conclusion_rejections = rejections
         selected.update(b.finding_id for record in conclusions for b in record.bindings)
         selected.update(fid for item in comparisons for fid in item.finding_ids)
         inherited = tuple(dict.fromkeys(finding for ref, finding in self.acknowledged_references.items()
@@ -846,7 +871,7 @@ class RecursiveSession:
             raise FindingValidationError("synthesis", "provenance", "unacknowledged_evidence",
                                          "Citations require acknowledged evidence.")
         self.conclusions = conclusions
-        self.withheld_conclusions = withheld
+        self.withheld_conclusions = bool(rejections)
         self.retained_findings.update(staged)
         self.comparisons = tuple(comparisons)
         self.selected_local_finding_ids = tuple(item.finding_id for item in local)
