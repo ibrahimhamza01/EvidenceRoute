@@ -19,7 +19,7 @@ from evidenceroute.research.rlm.comparison import Comparison
 from evidenceroute.research.rlm.corpus_research import (
     BatchOutcome, CorpusGroupOutcome, CorpusLimits, CorpusResearchResult, CorpusUsage, execute_corpus_research,
 )
-from evidenceroute.research.rlm.discovery import DiscoverySpec
+from evidenceroute.research.rlm.discovery import CorpusScan, DiscoverySpec
 from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import Finding, FindingEvidence
 from evidenceroute.research.rlm.interpretation import InterpretationLimits
@@ -60,6 +60,7 @@ class CheckpointRun(_CheckpointModel):
     stop_reason: str
     execution_status: Literal["finished", "incomplete"]
     research_status: Literal["incomplete", "unverified"]
+    comparative_capture: bool = False
 
     @classmethod
     def from_result(cls, result: CorpusResearchResult, companies: tuple[str, ...]) -> CheckpointRun:
@@ -69,6 +70,7 @@ class CheckpointRun(_CheckpointModel):
             root_comparisons=result.root_comparisons,
             acknowledged_child_comparisons=result.acknowledged_child_comparisons, citations=result.citations,
             stop_reason=result.stop_reason, execution_status=result.execution_status, research_status=result.research_status,
+            comparative_capture=result.comparative_capture,
         )
 
 
@@ -79,13 +81,14 @@ def _sum_usage(entries: Iterable[CorpusUsage]) -> CorpusUsage:
 
 
 class ResearchCheckpoint(_CheckpointModel):
-    version: Literal[1, 2]
+    version: Literal[1, 2, 3]
     corpus_identity: Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
     plan: ResearchPlan
     runs: tuple[CheckpointRun, ...] = Field(min_length=1, max_length=MAX_CHECKPOINT_RUNS)
     interpretation: CheckpointInterpretation | None = None
     discovery: DiscoverySpec | None = None
     scan_terms: tuple[Annotated[str, Field(min_length=1, max_length=200)], ...] = Field(default=(), max_length=32)
+    discovery_cache: CorpusScan | None = None
     verification_runs: tuple[VerificationRun, ...] = Field(default=(), max_length=MAX_VERIFICATION_RUNS)
 
     @property
@@ -193,19 +196,30 @@ def create_checkpoint(
         if discovery is None:
             scan_terms = scan_terms or result.scan.terms
     checkpoint = ResearchCheckpoint(
-        version=1, corpus_identity=corpus.snapshot_identity, plan=result.plan,
+        version=3 if result.comparative_capture else 1, corpus_identity=corpus.snapshot_identity, plan=result.plan,
         runs=(CheckpointRun.from_result(result, result.plan.requested_companies),), interpretation=interpretation,
         discovery=discovery, scan_terms=scan_terms,
+        discovery_cache=_complete_scan(result.scan, result.plan) if discovery is not None and result.comparative_capture else None,
     )
     validate_checkpoint(checkpoint, corpus)
     return checkpoint
+
+
+def _complete_scan(scan: CorpusScan | None, plan: ResearchPlan) -> CorpusScan | None:
+    if (scan is not None and scan.stop_reason is None and not scan.unvisited_targets
+            and tuple(row.pair for row in scan.sections) == plan.resolved_targets
+            and all(row.inventory_chunks == row.scanned_chunks for row in scan.sections)):
+        return scan
+    return None
 
 
 def plan_continuation(checkpoint: ResearchCheckpoint, companies: tuple[str, ...] | None = None) -> ContinuationPlan:
     """Choose unresolved executions by default, with explicit company selection for evidence gaps."""
     plan = checkpoint.plan
     if companies is None:
-        selected = {group.ticker for group in checkpoint.assignments if group.pending_reason is not None}
+        completed = {group.ticker for run in checkpoint.runs if run.comparative_capture
+                     for group in run.groups if group.outcome and group.outcome.assignment_status == "completed"}
+        selected = {group.ticker for group in checkpoint.assignments if group.pending_reason is not None} - completed
     else:
         selected = set(companies)
         if len(selected) != len(companies) or not selected.issubset(plan.requested_companies):
@@ -236,8 +250,12 @@ def continue_research(
     result = execute_corpus_research(
         checkpoint.plan, runner, limits=limits, max_groups=max_groups, discovery=checkpoint.discovery,
         scan_terms=checkpoint.scan_terms or None, root_guidance=goal, _target_companies=targets,
+        _cached_scan=checkpoint.discovery_cache,
     )
-    updated = checkpoint.model_copy(update={"runs": (*checkpoint.runs, CheckpointRun.from_result(result, targets))})
+    updated = checkpoint.model_copy(update={
+        "version": 3 if result.comparative_capture else checkpoint.version,
+        "runs": (*checkpoint.runs, CheckpointRun.from_result(result, targets)),
+    })
     validate_checkpoint(updated, runner.corpus)
     return updated
 
@@ -290,7 +308,9 @@ def load_checkpoint(path: Path | str, corpus: CorpusEnvironment) -> ResearchChec
 def save_checkpoint(path: Path | str, checkpoint: ResearchCheckpoint) -> None:
     """Write one checkpoint atomically using a same-directory, private temporary file."""
     target = Path(path)
-    exclude = {"verification_runs"} if checkpoint.version == 1 and not checkpoint.verification_runs else None
+    exclude = {"verification_runs"} if not checkpoint.verification_runs else set()
+    if checkpoint.discovery_cache is None:
+        exclude.add("discovery_cache")
     payload = checkpoint.model_dump_json(exclude=exclude).encode("utf-8")
     _decode_checkpoint(payload)
     temporary = None

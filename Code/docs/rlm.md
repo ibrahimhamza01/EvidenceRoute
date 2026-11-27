@@ -719,7 +719,7 @@ BEDROCK_REGION=us-east-1 \
 
 The targeted live run scanned **208 chunks** and found **15** initial candidates with the fixed terms. Five of its seven assessed chunks were outside that set. Subsequent scoped exploration found the missing passages, including both Amazon semiconductor-supply chunks and Alphabet's references to third-party infrastructure. The earlier six-company run likewise recovered Microsoft evidence after a zero-candidate scan.
 
-`DiscoverySpec` validates the intent topic and up to 32 caller-supplied phrases, including spelling, acronym, and word-form variants. When phrases are omitted, the leading clause of the topic supplies the search phrase. The scanner reuses the BM25 tokenizer's case, Unicode compatibility, and punctuation normalization with stop words preserved, then matches contiguous token phrases. This catches formatting variants such as hyphenation. Fused words, abbreviations, and inflections still need suitable phrases. Ranking favors the longest matched phrase, then the number of distinct matches, then the original chunk ID. Each section retains at most 16 candidates by default and reports its total matches separately. The example phrase set lives in the demo. The engine works with any resolved plan, including the one-year review below.
+`DiscoverySpec` validates the intent topic and up to 32 caller-supplied phrases, including spelling, acronym, and word-form variants. When phrases are omitted, the leading clause of the topic supplies the search phrase. The scanner reuses the BM25 tokenizer's case, Unicode compatibility, and punctuation normalization with stop words preserved, then matches contiguous token phrases. This catches formatting variants such as hyphenation. The original phrase-only scan required explicit variants for fused words, abbreviations, and inflections. In the original phrase-only scan, ranking favors the longest matched phrase, then the number of distinct matches, then the original chunk ID. The expansion in the corpus-wide follow-up adds contextual anchors and inflection handling. Each section retains at most 16 candidates by default and reports its total matches separately. The example phrase set lives in the demo. The engine works with any resolved plan, including the one-year review below.
 
 Reads interleave exact filing sections and divide the remaining chunk allowance across the current round. A large filing or high candidate count cannot take another section's candidate allowance. The scanner records section metadata reads, page reads, scanned chunks, unvisited targets, and deadline or limit stops. The page cap defaults to the chunk cap and can be set lower with `max_scan_pages` in corpus limits. Metadata lookups have a separate upper bound of one per resolved section, and all discovery runs inside the existing scan and overall deadlines. A budget too small for one round can leave some sections unscanned. The deadline is cooperative at corpus-call boundaries.
 
@@ -957,6 +957,81 @@ The saved Apple and Alphabet runs sent scripted research controls to the live ve
 The actual checkpoint used 21 research attempts, 150,616 reported tokens and 81.81 seconds. Adding verification brought the recorded sums to 25 attempts, 160,103 reported tokens and 97.23 seconds. Verification added approximately **6.3%** in reported tokens and **18.9%** in measured execution time relative to the recorded research run. These figures describe one checkpoint. The aggregate 16 of 17 measures structured-assessment completion and includes repeated subject matter.
 
 The verdicts are model assessments. For example, the actual Alphabet accelerator finding received support for a causal link between competitors claiming capacity first and difficulty negotiating terms. Its selected SEC sentence presents those as alternative conditions that could cause supply constraints. Control agreement and valid evidence references leave this kind of entailment error possible.
+
+## Corpus-wide acceptance follow-up
+
+The saved Sonnet 4.5 run `ce45e24c55744535b81e80a0756e3428` in `rlm-acceptance-corpus-live.json` asked which companies introduced a new AI-related infrastructure risk in FY2024. It resolved all **25 companies and 50 Item 1A targets**. The scan took **0.250 s** over 3,038 chunks and 4,603,503 characters, including overlap. The 22 candidates were distributed across AMD (15), Amazon (4), and NVIDIA (3). Three batches attempted six companies. Five assignments completed, AMD failed, and 19 groups stopped at the batch limit.
+
+The trace records **55 attempts**, 442,230 input and 23,559 output tokens (**465,789 reported**), 76 corpus operations, and **240.72 s** including interpretation. Research requests summed to 1,357,610 serialized bytes, with a 26,040-byte median and 45,918-byte maximum. The acknowledged retrieval operations delivered 58 chunk-ID occurrences across invocations, 14 of which repeated an ID within the invocation. This count includes distinct spans from the same chunk. The report lacks enough detail to recover the number of verbatim repeat excerpts. The root acknowledged 12 findings, selected nine and cited nine original chunks. It recorded zero finding submissions, zero established novelty conclusions and no separate verification. Execution and research remained incomplete.
+
+AMD exceeded `comparisons[1].assessments[0].rationale` and then combined sources from different filings in one finding. Apple hit the mixed-scope rule. Bank of America exceeded `infrastructure_connection` before recovering and treated prior-year nonmention as contradiction. Some Apple and Amazon claims described both years using excerpts from one year. ConocoPhillips' root and child disagreed on a comparison that conflated support for the underlying risk with support for novelty.
+
+### Discovery, comparative capture and final reporting
+
+- **Discovery.** Apply normalized question phrases and conservative singular/plural variants. For AI infrastructure topics, rank contextual co-occurrence of AI, infrastructure and risk anchors. Strong infrastructure/risk co-occurrence can surface prior-year counterparts with no AI wording. Specific phrase and contextual matches outrank generic terms. Each section keeps its own deterministic candidate cap. Scoped BM25 remains available for gaps. Candidates and lexical misses grant no evidence authority or absence verdict.
+- **Capture.** The `full-corpus` profile reserves one existing investigator decision and tool opportunity before the protected finish slots. A dedicated turn uses named native `submit_findings` when the investigator has yet to complete a submission. An empty list is valid. Each accepted finding is retained immediately, with canonical filing scope and exact excerpts derived in Python. The controller records submission attempts, accepted findings, rejected records and unused dedicated turns. Provider failure, token admission or the deadline can still stop an invocation before capture. Finishing by reference avoids regenerating accepted evidence. Legacy profiles retain their prior finish contracts.
+- **Comparisons.** Atomic captures cite spans from one filing and section. The capture path rejects explicit comparisons against the other requested year and common relative-year formulations in the claim. The comparative finish links year-specific references. It separates passage support, risk category, AI specificity and disclosure relationship. Nonmention, different risks and explicit opposing evidence have separate representations. Python derives source years and requires appropriate evidence from both years for a resolved relationship. Risk categories distinguish AI infrastructure dependencies, AI-enabled threats, general infrastructure risks, unrelated risks and uncertainty. Invalid reference assessments produce sanitized per-record diagnostics while valid peers remain usable. Semantic errors in unrestricted claim text can still require verification.
+- **Reporting.** `create_checkpoint`, `review_checkpoint`, and `verification_report` give a supported investigation-and-review path. The verifier receives the selected exact canonical excerpts and adjudicates components. Original findings and comparisons stay in the audit inventory. The final answer identifies unverified, insufficient, partial, supported and contradicted comparisons. It presents supported components from selected evidence with SEC references, and leaves flagged investigator disagreements unresolved. Related comparisons are matched by normalized risk label or overlapping evidence. Rephrasings over disjoint passages can require human review. Filing-wide novelty remains unresolved. Select a gap's company and goal for a caller-authorized continuation and then authorize a separate verification pass. New comparison identities require their own review. No automatic investigation-verification loop runs.
+
+### Full-corpus scheduling and accounting
+
+`full-corpus` uses two company groups per batch and the diagnostic profile's per-tree ceilings. The tree allows depth 1, 18 provider attempts, 6 child attempts, 12 corpus operations, 100,000 reported tokens and a 180-second deadline. Local limits are 6 decisions, 6 tool attempts and 6,000 observation bytes. Two finish attempts per invocation have a 2,048-token output cap and named finish selection. Root and child token headroom are 12,000 each. The profile disables root follow-up retrieval and uses explicit targeted continuation for evidence gaps. Singleton batches reserve only one delegation and the group's two filing sections. Other per-tree ceilings still apply.
+
+Scheduling prioritizes groups with candidates across both years and higher candidate counts, with deterministic ticker tie breaking. All resolved groups, including zero-match groups, remain eligible. The overall allowance must cover the next tree's configured resources before admission. Reported-token thresholds can be exceeded by an in-flight response, and the deadline is cooperative. Checkpoint version 3 stores the complete, validated initial candidate inventory for compact comparative runs and preserves verification history from the earlier format. Resume reuses the inventory without another lexical scan. Earlier checkpoint versions still load. The original denominator and historical finding IDs survive continuation. Completed assignments stay out of default reinvestigation even if root synthesis failed. The report retains pending execution, failures, unresolved semantic outcomes and separate research, verification and combined usage. Save at bounded pass boundaries. An interruption inside a pass resumes from the last saved checkpoint.
+
+### Offline measurements
+
+Both scans below used the original interpretation phrases and the same 50 sections. Toggle `DiscoverySpec.expand_context` to reproduce the phrase-only policy. Times are local medians of five runs. Known evidence contains seven historical Amazon and Alphabet chunks plus two Microsoft chunks. It is a regression set.
+
+| Measure | Original phrase matching | Contextual discovery |
+| --- | ---: | ---: |
+| Chunks / characters scanned | 3,038 / 4,603,503 | 3,038 / 4,603,503 |
+| Matches before caps / retained candidates | 22 / 22 | 172 / 162 |
+| Companies / sections with candidates | 3 / 6 | 15 / 29 |
+| Known evidence found | 2 of 9 | 9 of 9 |
+| Alphabet / Microsoft candidates | 0 / 0 | 12 / 12 |
+| Median scan time | 0.250 s | 0.553 s |
+
+Contextual discovery adds incidental candidates. Distribution is uneven. NVIDIA had 30, AMD 28, Intel 21, Meta 19 and Amazon 17. Ten companies had zero candidates. The foreign-exchange regression retained the same candidates under both modes. This comparison measures candidate recall on known passages. It leaves retrieval precision and held-out semantic quality unmeasured.
+
+For the same AMD excerpt, the dispatcher serialized 1,479 bytes for a whole chunk, 566 for a single exact span and 166 for a repeated span reference. The last saves 400 bytes each time that result appears in native history, or 1,200 bytes across three subsequent requests. Exact duplicates within an authorized section can reference a previously acknowledged canonical span in an overlapping chunk. New chunk IDs receive no access credit from such references. Native tool ordering, original result IDs, and acknowledgement rules are preserved. The JSON finish schema fell from 4,707 bytes in the legacy child or 3,772 in the legacy compact root to 2,273 bytes in the capture workflow. These are serialized sizes. They exclude any live token or latency effect and depend on the actual turn sequence.
+
+Bedrock documents explicit prompt caching for Sonnet 4.5 through Converse, including cross-region inference, with a 1,024-token prefix minimum and up to four checkpoints. The installed SDK exposes `cachePoint` for `tools`, `system` and message content. The adapter sends no cache checkpoints. Tool sets and budget notices change at phase boundaries, so a later trial should measure eligible stable prefixes within phases and examine actual cache reads and writes. The current implementation claims no cache benefit. [Sonnet 4.5 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-5.html) · [Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
+
+The canonical scripted profile scheduled **25 companies in 13 batches**, including a singleton, and retained all **50 required targets**. The constrained pass used six delegations and 12 partitions before admission stopped it with `insufficient_delegations`. A fresh process resumed the other 19 groups across ten batches from the saved checkpoint, scanning zero additional lexical chunks. The merged report preserved two historical findings and two original SEC citation chunks. It recorded 28 corpus operations, 25 submission attempts including empty submissions, and 50 partition assignments. A separate AMD failure fixture accepted two findings and cited both after two deliberately invalid finishes. A native stub also covered truncation followed by an invalid reference. The separate verifier fixture used two mocked requests and 1,500 synthetic reported tokens. The merged answer reported partial support for the AMD comparison and printed the supported general infrastructure component while leaving the AI link and novelty unresolved. The remaining company outcomes were scripted abstentions. These experiments exercised execution and accounting with zero paid provider calls.
+
+### Live validation commands
+
+Use the [README budget generator](../README.md#recursive-research-rlm) and the Sonnet 4.5 AWS environment printed there. The CLI uses fixed scope for reproducibility. The Python integration adds natural-language interpretation and charges it to the overall allowance. These live commands await validation.
+
+```bash
+export PYTHONPATH=Code/src
+
+# AMD capture and finish regression
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus --live --trace \
+  --company AMD --limits-file rlm-milestone-single-limits.json \
+  --save-checkpoint rlm-amd-live-checkpoint.json > rlm-amd-live.json
+
+# Small comparison with separately budgeted verification
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus --live --trace \
+  --company AMD --company GOOGL --limits-file rlm-milestone-single-limits.json \
+  --verification-limits-file rlm-milestone-verify-limits.json \
+  --save-checkpoint rlm-small-verified-live-checkpoint.json > rlm-small-verified-live.json
+
+# Full denominator, bounded first pass
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus --live --trace \
+  --limits-file rlm-milestone-constrained-limits.json \
+  --save-checkpoint rlm-full-live-checkpoint.json > rlm-full-live-initial.json
+
+# In a new process, continue from the settled checkpoint
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus --live \
+  --resume rlm-full-live-checkpoint.json --limits-file rlm-milestone-continuation-limits.json \
+  --verification-limits-file rlm-milestone-verify-limits.json \
+  --save-checkpoint rlm-full-live-checkpoint.json > rlm-full-live-continued.json
+```
+
+Use `rlm-milestone-full-limits.json` on the first call for an allowance covering all 13 trees in one pass. Inspect pending assignments after any live allowance stops. For a specific verification gap, add `--company TICKER --goal "Find earlier-year evidence for the same mechanism"` to a resume call and supply fresh allowances. A separate verifier invocation, even with the same model, provides a semantic assessment whose accuracy remains subject to review. Full-corpus live execution, live cost and latency changes, and held-out quality remain open.
+
 
 ## Issue #16 acceptance review
 

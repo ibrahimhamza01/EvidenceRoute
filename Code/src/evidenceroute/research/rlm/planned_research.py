@@ -108,7 +108,8 @@ def admit_company_groups(
     pending: dict[str, str] = {}
     admitted: list[CompanyPartition] = []
     pairs_left = limits.max_partitions
-    for group in sorted(plan.groups, key=lambda item: item.ticker):
+    ordered = plan.groups if runner.comparative_capture and runner.comparison_scan else sorted(plan.groups, key=lambda item: item.ticker)
+    for group in ordered:
         if group.ticker in unresolved or not group.targets:
             reason = "unresolved_requirements"
         elif limits.max_depth < 1:

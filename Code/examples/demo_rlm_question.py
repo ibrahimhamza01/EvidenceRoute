@@ -122,6 +122,7 @@ def main(argv=None) -> int:
         runner = RecursiveResearch(
             corpus, factory, shared_limits=shared, local_limits=profile.local_limits,
             finalization=profile.finalization, max_root_reinvestigation_calls=profile.max_root_reinvestigation_calls,
+            comparative_capture=profile.comparative_capture,
         )
         interpreter_factory = None
         if not args.live:

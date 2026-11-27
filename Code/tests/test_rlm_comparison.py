@@ -342,6 +342,7 @@ def test_comparative_profiles_preserve_diagnostic_and_expand_without_changing_pr
     diagnostic, expanded = (COMPARATIVE_PROFILES[key] for key in ("diagnostic", "expanded"))
     assert diagnostic.shared_limits.max_provider_attempts == 18 and diagnostic.local_limits.max_response_bytes == 6_000
     assert expanded.model_dump() == {
+        "comparative_capture": False,
         "max_groups": 2,
         "max_root_reinvestigation_calls": 2,
         "shared_limits": {"max_depth": 1, "max_delegations": 2, "max_provider_attempts": 36,

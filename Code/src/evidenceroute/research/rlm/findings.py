@@ -47,6 +47,12 @@ class SubmitFindings(StrictInput):
     findings: list[SpanFindingDraft] = Field(min_length=1, max_length=MAX_FINDINGS_PER_SUBMISSION)
 
 
+class CaptureFindings(SubmitFindings):
+    findings: list[SpanFindingDraft] = Field(max_length=MAX_FINDINGS_PER_SUBMISSION, description=(
+        "One year and one filing section per finding. Submit an empty list when acknowledged evidence is insufficient."
+    ))
+
+
 @dataclass(frozen=True)
 class FindingValidationIssue:
     path: str

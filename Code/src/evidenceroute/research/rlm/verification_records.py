@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from hashlib import sha256
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
-from evidenceroute.research.rlm.comparison import Comparison
+from evidenceroute.research.rlm.comparison import Comparison, ResolvedReferenceAssessment
 from evidenceroute.research.rlm.findings import Finding
 from evidenceroute.research.rlm.tools import Identifier, StrictInput, observation_json
 
@@ -154,7 +155,16 @@ class VerificationRun(_Record):
 
 def comparison_id(comparison: Comparison) -> str:
     """Stable identity of a specific historical conclusion and its evidence links."""
-    return sha256(observation_json(comparison).encode("utf-8")).hexdigest()
+    # Keep historical version-2 verification identities stable.
+    content = asdict(comparison)
+    if comparison.relationship is None:
+        content.pop("relationship")
+    content["assessments"] = [
+        item.model_dump(exclude={"risk_category"} if isinstance(item, ResolvedReferenceAssessment)
+                        and item.risk_category is None else None)
+        for item in comparison.assessments
+    ]
+    return sha256(observation_json(content).encode("utf-8")).hexdigest()
 
 
 def subject_digest(findings: tuple[Finding, ...], comparison: Comparison | None) -> str:
@@ -188,6 +198,9 @@ def validate_review_evidence(item: VerificationItem, findings: dict[str, Finding
     if (comparison.outcome == "comparable_both_years" and item.status == "supported"
             and review.relationship not in {"same_risk", "more_specific_wording"}):
         raise ValueError("Support for the same underlying risk requires a shared relationship.")
+    if comparison.relationship is not None and item.status == "supported":
+        if review.relationship in {"same_risk", "more_specific_wording"} and review.earlier_year != "supports_risk":
+            raise ValueError("A verified shared risk requires earlier evidence supporting that risk.")
     if review.earlier_year in {"nonmention", "insufficient"} and (
         any(component.status == "contradicted" and years == {earlier}
             for component, years in zip(item.components, component_years))

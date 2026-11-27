@@ -70,12 +70,52 @@ class ReferenceComparisonDraft(StrictInput):
     assessments: list[ReferenceAssessment] = Field(min_length=1, max_length=8)
 
 
+RiskCategory = Literal["ai_infrastructure_dependency", "ai_enabled_threat", "general_infrastructure", "other", "uncertain"]
+RiskRelationship = Literal["same", "more_specific", "different", "conflicting", "unclear"]
+
+
+class CompactAssessment(StrictInput):
+    ref: FindingReference
+    risk_category: RiskCategory
+    entailment: Literal["supports", "contradicts", "nonmention", "uncertain"] = Field(
+        description="Does the passage support or explicitly oppose the underlying risk? Use nonmention for silence."
+    )
+    ai_specificity: Literal["explicit", "contextual"] | None = None
+    context_ref: FindingReference | None = None
+
+    @property
+    def relevance(self) -> str:
+        return ("other" if self.risk_category == "other" else "uncertain" if self.risk_category == "uncertain"
+                else "infrastructure")
+
+    @property
+    def infrastructure_connection(self) -> str:
+        return self.risk_category
+
+    @property
+    def ai_specific_connection(self) -> str | None:
+        return self.ai_specificity if self.risk_category in {"ai_infrastructure_dependency", "ai_enabled_threat"} else None
+
+
+class CompactComparisonDraft(StrictInput):
+    risk: str = Field(min_length=1, max_length=120, description="Neutral underlying risk mechanism, without a novelty claim.")
+    relationship: RiskRelationship = Field(
+        description="Relationship between disclosures. Silence is nonmention, and different risks are distinct from conflict."
+    )
+    assessments: list[CompactAssessment] = Field(min_length=1, max_length=8)
+
+    @property
+    def same_risk(self) -> str:
+        return {"same": "yes", "more_specific": "yes", "different": "no"}.get(self.relationship, "uncertain")
+
+
 class ResolvedReferenceAssessment(StrictInput):
     finding_id: Identifier
     context_finding_id: Identifier | None = None
     relevance: Literal["infrastructure", "other", "uncertain"]
-    entailment: Literal["supports", "contradicts", "uncertain"]
-    rationale: str
+    entailment: Literal["supports", "contradicts", "nonmention", "uncertain"]
+    rationale: str = ""
+    risk_category: RiskCategory | None = None
     ai_specificity: Literal["explicit", "contextual"] | None = None
 
 
@@ -93,6 +133,7 @@ class Comparison:
     both_years_contributed: bool
     ai_specific_years: tuple[int, ...]
     ai_contextual_years: tuple[int, ...] = ()
+    relationship: RiskRelationship | None = None
 
 
 _AI_TEXT = re.compile(r"\b(?:AI|artificial intelligence|machine learning)\b", re.IGNORECASE)
@@ -114,7 +155,7 @@ def resolve_comparison(draft: ComparisonDraft, findings: list[Finding], years: t
 
 
 def resolve_reference_comparison(
-    draft: ReferenceComparisonDraft, findings: Mapping[str, Finding], years: tuple[int, int],
+    draft: ReferenceComparisonDraft | CompactComparisonDraft, findings: Mapping[str, Finding], years: tuple[int, int],
 ) -> Comparison:
     refs = [assessment.ref for assessment in draft.assessments]
     if len(set(refs)) != len(refs):
@@ -159,10 +200,23 @@ def _resolve_comparison(draft, selected, lookup_context, years: tuple[int, int])
                  if assessment.relevance == "infrastructure" and assessment.entailment == "supports"}
     contradicts = any(item.relevance == "infrastructure" and item.entailment == "contradicts"
                       for item in assessments)
+    relationship = draft.relationship if isinstance(draft, CompactComparisonDraft) else None
+    if relationship is not None:
+        opposing_years = {finding.evidence[0].source.fiscal_year
+                          for assessment, finding in zip(assessments, selected)
+                          if assessment.relevance == "infrastructure" and assessment.entailment == "contradicts"}
+        contradicts = relationship == "conflicting" and any(left != right for left in supported for right in opposing_years)
+        if relationship == "conflicting" and not contradicts:
+            relationship = "unclear"
+        underlying = {finding.evidence[0].source.fiscal_year for assessment, finding in zip(assessments, selected)
+                      if assessment.entailment == "supports"}
+        if ((relationship in {"same", "more_specific"} and supported != set(years))
+                or (relationship == "different" and underlying != set(years))):
+            relationship = "unclear"
     if (supported and contradicts) or (isinstance(draft, ComparisonDraft)
                                         and any(f.analysis_status == "conflicting" for f in selected)):
         outcome = "conflicting"
-    elif supported == set(years) and draft.same_risk == "yes":
+    elif supported == set(years) and (relationship in {"same", "more_specific"} or relationship is None and draft.same_risk == "yes"):
         outcome = "comparable_both_years"
     elif supported == {years[1]} and any(source.fiscal_year == years[0] for source in sources):
         outcome = "possible_new_needs_review"
@@ -185,12 +239,12 @@ def _resolve_comparison(draft, selected, lookup_context, years: tuple[int, int])
                 anchored = context is not None and _has_ai_context(context, sources[0].ticker, year)
                 if direct or anchored:
                     contextual.add(year)
-                if anchored and (not direct or isinstance(assessment, ReferenceAssessment)):
+                if anchored and (not direct or isinstance(assessment, (ReferenceAssessment, CompactAssessment))):
                     context_id = context.finding_id
                     contexts[context_id] = context
-        if isinstance(assessment, ReferenceAssessment):
+        if isinstance(assessment, (ReferenceAssessment, CompactAssessment)):
             resolved.append(ResolvedReferenceAssessment(finding_id=finding.finding_id, context_finding_id=context_id,
-                            **assessment.model_dump(exclude={"ref", "context_ref"})))
+                            relevance=assessment.relevance, **assessment.model_dump(exclude={"ref", "context_ref", "relevance"})))
         else:
             resolved.append(assessment)
     referenced = {finding.finding_id: finding for finding in selected}
@@ -198,7 +252,7 @@ def _resolve_comparison(draft, selected, lookup_context, years: tuple[int, int])
     return Comparison(draft.risk, sources[0].ticker, years, outcome, draft.same_risk, tuple(resolved),
                       tuple(referenced),
                       tuple(sorted({item.source.chunk_id for finding in referenced.values() for item in finding.evidence})),
-                      evidence_years, evidence_years == years, tuple(sorted(explicit)), tuple(sorted(contextual - explicit)))
+                      evidence_years, evidence_years == years, tuple(sorted(explicit)), tuple(sorted(contextual - explicit)), relationship)
 
 
 def render_comparisons(comparisons: tuple[Comparison, ...] | list[Comparison]) -> str:
@@ -213,6 +267,10 @@ def render_comparisons(comparisons: tuple[Comparison, ...] | list[Comparison]) -
             "conflicting": "The assessed evidence is conflicting. Novelty remains unresolved.",
             "insufficient": "The assessed evidence is insufficient to establish novelty.",
         }[item.outcome]
+        if item.relationship == "more_specific" and item.outcome == "comparable_both_years":
+            conclusion = f"The assessed spans describe the same underlying risk, with more specific wording in {later}."
+        elif item.relationship == "different":
+            conclusion = "The assessed spans describe different risks. Novelty remains unresolved."
         ai_years = ", ".join(f"FY{year}" for year in item.ai_specific_years)
         context_years = ", ".join(f"FY{year}" for year in item.ai_contextual_years)
         ai = []

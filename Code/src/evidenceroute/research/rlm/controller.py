@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 from pydantic import ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, BudgetUsage, SharedBudget
-from evidenceroute.research.rlm.comparison import Comparison, ComparisonDraft, FindingReference, ReferenceComparisonDraft
+from evidenceroute.research.rlm.comparison import CompactComparisonDraft, Comparison, ComparisonDraft, FindingReference, ReferenceComparisonDraft
 from evidenceroute.research.rlm.coverage import CoverageReport, CoverageTracker, ResearchScope
 from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import (
@@ -87,6 +87,25 @@ class _ReferenceFinishAction(StrictInput):
     synthesis: _ReferenceSynthesis
 
 
+class _CapturedSynthesis(StrictInput):
+    comparisons: list[CompactComparisonDraft] = Field(default_factory=list, max_length=3)
+    cite_refs: list[FindingReference] = Field(default_factory=list, max_length=MAX_FINDINGS)
+    analysis_status: AnalysisStatus | None = None
+
+
+class _CapturedFinishAction(_ReferenceFinishAction):
+    synthesis: _CapturedSynthesis
+
+
+class _CapturedSynthesisEnvelope(_ReferenceSynthesis):
+    new_findings: list[SpanFindingDraft] = Field(default_factory=list, max_length=0)
+    comparisons: list[object] = Field(default_factory=list, max_length=3)
+
+
+class _CapturedFinishEnvelope(_ReferenceFinishAction):
+    synthesis: _CapturedSynthesisEnvelope
+
+
 _ACTION = TypeAdapter(Annotated[_ToolAction | _ToolBatch | _FinishAction | _ReferenceFinishAction, Field(discriminator="type")])
 
 
@@ -95,11 +114,14 @@ def action_schema() -> dict:
     return _ACTION.json_schema()
 
 
-def finish_input_schema(*, recursive: bool = False, comparative: bool = False, reference_based: bool = False) -> dict:
+def finish_input_schema(*, recursive: bool = False, comparative: bool = False, reference_based: bool = False, compact: bool = False) -> dict:
     """Describe a finish payload whose action type is supplied by the adapter."""
-    schema = (_ReferenceFinishAction if reference_based else _FinishAction).model_json_schema()
+    model = _CapturedFinishAction if compact else _ReferenceFinishAction if reference_based else _FinishAction
+    schema = model.model_json_schema()
     del schema["properties"]["type"]
     schema["required"].remove("type")
+    if compact:
+        return schema
     if reference_based:
         if not comparative:
             del schema["$defs"]["_ReferenceSynthesis"]["properties"]["comparisons"]
@@ -225,7 +247,7 @@ class StepTrace(ToolTrace):
     provider_tool_requests: tuple[dict, ...] = ()
     provider_tool_request_count: int = 0
     batch_operations: tuple[ToolTrace, ...] = ()
-    phase: Literal["investigation", "finalization"] = "investigation"
+    phase: Literal["investigation", "capture", "finalization"] = "investigation"
     finalization_reason: str | None = None
     assignment_stage: Literal["assignment", "synthesis", "incomplete_finalization"] | None = None
     recovery: str | None = None
@@ -260,6 +282,7 @@ class ExecutionTrace:
     initial_assignment_stop: str | None = None
     selected_inherited_findings: tuple[Finding, ...] = ()
     selected_local_finding_ids: tuple[str, ...] = ()
+    unused_capture_reservation: bool = False
 
     @property
     def model_attempts(self) -> tuple[ModelAttempt, ...]:
@@ -321,6 +344,8 @@ class RootController:
             tools.append(_recursive.finding_schema())
         finalization_reason = None
         replay_reason = None
+        capture_turn_used = False
+        capture_next = False
         tool_limit = self._limits.max_tool_calls
         reinvestigation_limit = _recursive.runner.max_root_reinvestigation_calls if _recursive else None
 
@@ -331,6 +356,8 @@ class RootController:
                 break
             offered_tools = tools
             assignment_stage = None
+            capture_turn = False
+            turn_tool_limit = tool_limit
             if _recursive is not None:
                 budget = _recursive.budget
                 if _recursive.reference_synthesis:
@@ -342,6 +369,7 @@ class RootController:
                 if _recursive.delegation_first and not unassigned and reinvestigation_limit is not None:
                     tool_limit = min(tool_limit, calls + reinvestigation_limit)
                     reinvestigation_limit = None
+                turn_tool_limit = tool_limit
                 tool_slots = tool_limit - calls
                 reinvestigation_exhausted = not tool_slots and tool_limit < self._limits.max_tool_calls
                 corpus_slots = budget.limits.max_corpus_attempts - budget.corpus_attempts
@@ -400,7 +428,8 @@ class RootController:
                         f"reported-token headroom, {deadline - model_start:.0f}s remaining. "
                         f"{allocation.finalization_left} attempt(s) reserved for this invocation's finish."
                     )
-                    if not unassigned:
+                    if not unassigned and not (_recursive.capture_reserved and not _recursive.capture_attempted
+                                               and not capture_turn_used):
                         notice += " Finish once the evidence is sufficient."
                 if _recursive.delegation_first:
                     if not unassigned:
@@ -413,6 +442,31 @@ class RootController:
                     set_finish = getattr(self._model, "set_finish_allowed", None)
                     if callable(set_finish):
                         set_finish(assignment_stage != "assignment")
+                capture_pending = _recursive.capture_reserved and not _recursive.capture_attempted and not capture_turn_used
+                force = getattr(self._model, "set_required_tool", None)
+                if callable(force):
+                    force(None)
+                if capture_pending and not finalization_reason:
+                    capture_turn = (capture_next or allocation.investigation_left <= 1
+                                    or tool_slots <= 1 or corpus_slots <= 1
+                                    or self._limits.max_iterations - iteration <= allocation.finalization_left)
+                    set_finish = getattr(self._model, "set_finish_allowed", None)
+                    if callable(set_finish):
+                        set_finish(False)
+                    if capture_turn:
+                        offered_tools = [tool for tool in tools if tool["name"] == SUBMIT_FINDINGS]
+                        turn_tool_limit = min(tool_limit, calls + 1)
+                        if callable(force):
+                            force(SUBMIT_FINDINGS)
+                        notice = ("Evidence capture. Submit year-specific findings using acknowledged spans. "
+                                  "Submit an empty list if evidence is insufficient. Comparison follows in a separate turn.")
+                    else:
+                        turn_tool_limit = min(tool_limit - 1, calls + max(0, corpus_slots - 1))
+                        notice += " One local tool slot and one investigation turn are reserved for evidence capture."
+                elif _recursive.capture_reserved:
+                    set_finish = getattr(self._model, "set_finish_allowed", None)
+                    if callable(set_finish):
+                        set_finish(True)
                 notify = getattr(self._model, "set_research_budget_notice", None)
                 if callable(notify) and (allocation is not None or _recursive.delegation_first):
                     notify(notice)
@@ -424,11 +478,12 @@ class RootController:
                     stop = "deadline" if budget_stop == "deadline" else "budget_exhausted"
                     break
             step = StepTrace(
-                iteration, phase="finalization" if finalization_reason else "investigation",
+                iteration, phase="finalization" if finalization_reason else "capture" if capture_turn else "investigation",
                 finalization_reason=finalization_reason, assignment_stage=assignment_stage, recovery=replay_reason,
                 offered_tool_names=tuple(tool["name"] for tool in offered_tools),
             )
             steps.append(step)
+            capture_turn_used |= capture_turn
             prior = steps[-2] if pending is not None else replayed_observation
             recovering = False
             try:
@@ -483,7 +538,10 @@ class RootController:
                 pending = None
                 replay_reason = step.error["code"]
                 if finalization_reason is None and step.assignment_stage != "assignment":
-                    finalization_reason = "truncated_response"
+                    if _recursive is not None and _recursive.capture_reserved and not capture_turn_used:
+                        capture_next = True
+                    else:
+                        finalization_reason = "truncated_response"
                 continue
             replayed_observation = None
             replay_reason = None
@@ -494,7 +552,10 @@ class RootController:
                 if self._clock() >= deadline:
                     stop = "deadline"
                     break
-                action = _ACTION.validate_python(candidate)
+                if _recursive is not None and _recursive.compact_comparative and isinstance(candidate, dict) and candidate.get("type") == "synthesis":
+                    action = _CapturedFinishEnvelope.model_validate(candidate)
+                else:
+                    action = _ACTION.validate_python(candidate)
             except (TypeError, ValueError, RecursionError) as exc:
                 message = "Expected a JSON action."
                 if isinstance(exc, ValidationError):
@@ -514,6 +575,15 @@ class RootController:
                 break
 
             if isinstance(action, (_FinishAction, _ReferenceFinishAction)):
+                if _recursive is not None and _recursive.capture_reserved and not finalization_reason and (
+                    capture_turn or (not _recursive.capture_attempted and not capture_turn_used)
+                ):
+                    capture_next = True
+                    pending = self._feedback(step, "capture_required", "Use submit_findings, with an empty list if needed.")
+                    continue
+                if _recursive is not None and _recursive.compact_comparative and isinstance(action, _FinishAction):
+                    pending = self._feedback(step, "references_required", "Finish using accepted finding references.")
+                    continue
                 if step.assignment_stage == "assignment":
                     pending = self._feedback(step, "initial_assignment_required", "Attempt each whole group first.")
                     continue
@@ -522,7 +592,10 @@ class RootController:
                         pending = self._feedback(step, "invalid_action", "Reference synthesis requires a research session with reference support.")
                         continue
                     try:
-                        citations = _recursive.finish_references(action.synthesis, coverage.report())
+                        issues = [] if _recursive.compact_comparative else None
+                        citations = _recursive.finish_references(action.synthesis, coverage.report(), issues=issues)
+                        if issues:
+                            step.finding_validation = tuple(issues)
                     except FindingValidationError as exc:
                         pending = self._finding_feedback(step, exc)
                         continue
@@ -557,7 +630,7 @@ class RootController:
                     step.error = {"code": "invalid_tool_use"}
                     stop = "model_error"
                     break
-                pending, calls = self._execute_batch(action, step, calls, tool_limit, deadline, coverage, _recursive)
+                pending, calls = self._execute_batch(action, step, calls, turn_tool_limit, deadline, coverage, _recursive)
                 if pending is None:
                     stop = "batch_observation_limit"
                     break
@@ -573,7 +646,15 @@ class RootController:
                 step.outcome = "rejected"
                 pending = self._feedback(step, "finalization_only", "Call finish_research using delivered evidence.")
                 continue
-            if calls >= tool_limit:
+            if capture_turn and action.name != SUBMIT_FINDINGS:
+                step.outcome = "rejected"
+                pending = self._feedback(step, "capture_only", "Use submit_findings in the reserved turn.")
+                continue
+            if calls >= turn_tool_limit:
+                if _recursive is not None and _recursive.capture_reserved and not capture_turn_used:
+                    capture_next = True
+                    pending = self._feedback(step, "capture_reserved", "The remaining tool slot is reserved for findings.")
+                    continue
                 step.outcome = "skipped"
                 self._feedback(step, "tool_call_limit", "Tool call budget exhausted.")
                 stop = "tool_call_limit"
@@ -587,6 +668,8 @@ class RootController:
 
         report = coverage.report()
         metadata = _recursive.trace_fields(report) if _recursive is not None else {}
+        if _recursive is not None and _recursive.capture_reserved:
+            metadata["unused_capture_reservation"] = not capture_turn_used
         if _recursive is not None and _recursive.unassigned_groups:
             metadata["initial_assignment_stop"] = finalization_reason or budget_stop or stop
         return ExecutionTrace(question, tuple(steps), calls, self._clock() - start,
@@ -621,7 +704,9 @@ class RootController:
                 )
             else:
                 result = self._dispatcher.dispatch(action.name, action.arguments,
-                                                   delivered_chunks=recursive.direct_ids if recursive else None)
+                                                   delivered_chunks=recursive.direct_ids if recursive else None,
+                                                   delivered_spans=recursive.delivered_span_text
+                                                   if recursive and recursive.compact_comparative else None)
         operation.tool_seconds = self._clock() - started
         delegation = operation.delegation
         operation.outcome = ("rejected" if result.arguments is None or
@@ -666,6 +751,9 @@ class RootController:
             if step.phase == "finalization":
                 operation.outcome = "rejected"
                 self._feedback(operation, "finalization_only", "Call finish_research using delivered evidence.")
+            elif step.phase == "capture" and (len(batch.calls) != 1 or call.name != SUBMIT_FINDINGS):
+                operation.outcome = "rejected"
+                self._feedback(operation, "capture_only", "Submit findings in a single call.")
             elif mixed:
                 operation.outcome = "rejected"
                 self._feedback(operation, "mixed_finish_batch", "Call finish_research on its own.")

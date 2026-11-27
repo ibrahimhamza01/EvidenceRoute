@@ -124,7 +124,16 @@ def _cases(checkpoint: ResearchCheckpoint) -> tuple[_Case, ...]:
     results = [_Case("finding", finding.finding_id, (finding.finding_id,), finding.claim, subject_digest((finding,), None))
                for finding in findings.values()]
     for comparison in checkpoint.comparisons:
-        claim = f"{comparison.risk}. {_CONCLUSIONS[comparison.outcome]}"
+        conclusion = _CONCLUSIONS[comparison.outcome]
+        if comparison.relationship == "more_specific":
+            conclusion = "The selected evidence describes the same underlying risk with more specific later wording."
+        elif comparison.relationship == "different":
+            conclusion = "The selected evidence describes different risks. Novelty remains unresolved."
+        claim = f"{comparison.risk}. {conclusion}"
+        categories = {item.risk_category for item in comparison.assessments if getattr(item, "risk_category", None)
+                      and item.entailment == "supports"} - {"other", "uncertain"}
+        if categories:
+            claim += " Claimed risk categories: " + ", ".join(sorted(categories)) + "."
         if comparison.ai_specific_years:
             claim += " Direct AI-specific connection in " + ", ".join(map(str, comparison.ai_specific_years)) + "."
         if comparison.ai_contextual_years:
@@ -244,6 +253,7 @@ def verify_checkpoint(
     checkpoint: ResearchCheckpoint, corpus: CorpusEnvironment, verifier: BedrockSemanticVerifier, *,
     limits: VerificationLimits, finding_ids: tuple[str, ...] | None = None,
     comparison_ids: tuple[str, ...] | None = None, clock: Callable[[], float] = monotonic,
+    comparisons_first: bool = False,
 ) -> VerificationRun:
     """Review explicitly selected cases, or the entire checkpoint inventory by default."""
     started = clock()
@@ -256,6 +266,8 @@ def verify_checkpoint(
                                       or not set(selection).issubset(case.target_id for case in available if case.kind == kind)):
             raise CheckpointError("Select unique verification IDs from the checkpoint.")
     cases = tuple(case for case in available if requested[case.kind] is None or case.target_id in requested[case.kind])
+    if comparisons_first:
+        cases = tuple(sorted(cases, key=lambda case: case.kind != "comparison"))
     budget = EstimatedTokenBudget(max_attempts=limits.max_provider_attempts, token_limit=limits.max_tokens,
                                   deadline=started + limits.deadline_seconds, clock=clock)
     verifier.bind_execution_budget(budget)
@@ -305,9 +317,26 @@ def record_verification(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironmen
     """Attach a settled verification run, preserving the original findings and access records."""
     if len(checkpoint.verification_runs) >= MAX_VERIFICATION_RUNS:
         raise CheckpointError("Checkpoint verification history limit reached.")
-    updated = checkpoint.model_copy(update={"version": 2, "verification_runs": (*checkpoint.verification_runs, run)})
+    updated = checkpoint.model_copy(update={"version": max(2, checkpoint.version), "verification_runs": (*checkpoint.verification_runs, run)})
     validate_checkpoint(updated, corpus)
     return updated
+
+
+def review_checkpoint(
+    checkpoint: ResearchCheckpoint, corpus: CorpusEnvironment, verifier: BedrockSemanticVerifier, *,
+    limits: VerificationLimits, clock: Callable[[], float] = monotonic,
+) -> ResearchCheckpoint:
+    """Run one authorized verification pass, prioritizing unreviewed current comparisons."""
+    latest = _latest_reviews(checkpoint)
+    comparisons = tuple(comparison_id(item) for item in _current_comparisons(checkpoint))
+    reviewed = {key for key, entry in latest.items() if entry.status != "unverified"}
+    comparison_ids = tuple(key for key in comparisons if ("comparison", key) not in reviewed)
+    finding_ids = tuple(item.finding_id for item in checkpoint.findings if ("finding", item.finding_id) not in reviewed)
+    if not comparison_ids and not finding_ids:
+        return checkpoint
+    run = verify_checkpoint(checkpoint, corpus, verifier, limits=limits, comparison_ids=comparison_ids,
+                            finding_ids=finding_ids, comparisons_first=True, clock=clock)
+    return record_verification(checkpoint, corpus, run)
 
 
 @dataclass(frozen=True)
@@ -318,8 +347,7 @@ class EvidenceGapRecommendation:
     goal: str
 
 
-def verification_report(checkpoint: ResearchCheckpoint) -> dict:
-    """Summarize latest usable reviews and suggest scoped work without launching it."""
+def _latest_reviews(checkpoint: ResearchCheckpoint) -> dict:
     latest = {}
     for run in checkpoint.verification_runs:
         for item in run.items:
@@ -327,6 +355,24 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
             prior = latest.get(key)
             if prior is None or prior.status == "unverified" or item.status != "unverified":
                 latest[key] = item
+    return latest
+
+
+def _current_comparisons(checkpoint: ResearchCheckpoint) -> tuple[Comparison, ...]:
+    # Keep earlier comparisons of other mechanisms after focused continuation.
+    active = {}
+    for run in checkpoint.runs:
+        by_risk = {}
+        for item in (*run.root_comparisons, *run.acknowledged_child_comparisons):
+            key = (item.ticker, " ".join(item.risk.casefold().split()))
+            by_risk.setdefault(key, {})[comparison_id(item)] = item
+        active.update(by_risk)
+    return tuple(item for cases in active.values() for item in cases.values())
+
+
+def verification_report(checkpoint: ResearchCheckpoint) -> dict:
+    """Summarize latest usable reviews and suggest scoped work without launching it."""
+    latest = _latest_reviews(checkpoint)
     cases = _cases(checkpoint)
     items = tuple(latest[case.key] if case.key in latest else case.unverified("not_requested") for case in cases)
     findings = {finding.finding_id: finding for finding in checkpoint.findings}
@@ -343,6 +389,8 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
             novelty[item.target_id] = item.comparison.novelty
             if item.comparison.gap:
                 gaps.append(item.comparison.gap)
+            if item.status == "contradicted":
+                gaps.append("Inspect opposing evidence and reassess the exact risk mechanism.")
             partitions = tuple(pair for pair in groups[source.ticker]
                                if pair.document_id in {e.source.document_id for fid in case.finding_ids for e in findings[fid].evidence})
             # Earlier-year gaps can target the authorized year even when no excerpt was selected.
@@ -352,7 +400,70 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
             recommendations.append(EvidenceGapRecommendation(
                 item.target_id, source.ticker, partitions, "Find selected evidence for: " + " ".join(dict.fromkeys(gaps))[:700],
             ))
+    comparison_reviews = {item.target_id: item for item in items if item.kind == "comparison"}
+    current = _current_comparisons(checkpoint)
+    disputed = set()
+    for index, left in enumerate(current):
+        for right in current[index + 1:]:
+            if left.ticker != right.ticker:
+                continue
+            same_subject = (" ".join(left.risk.casefold().split()) == " ".join(right.risk.casefold().split())
+                            or bool(set(left.assessed_chunk_ids) & set(right.assessed_chunk_ids)))
+            if not same_subject or (left.outcome, left.relationship, left.ai_specific_years, left.ai_contextual_years) == (
+                right.outcome, right.relationship, right.ai_specific_years, right.ai_contextual_years
+            ):
+                continue
+            left_id, right_id = comparison_id(left), comparison_id(right)
+            disputed.update((left_id, right_id))
+            recommendations.append(EvidenceGapRecommendation(
+                left_id, left.ticker, groups[left.ticker],
+                "Reconcile the investigator assessments using year-specific evidence for the same underlying risk.",
+            ))
+
+    conclusions = []
+    for comparison in current:
+        target_id = comparison_id(comparison)
+        review = comparison_reviews[target_id]
+        supported = tuple(component for component in review.components if component.status == "supported")
+        verified_relationship = (
+            review.comparison.relationship if review.status == "supported" and target_id not in disputed else None
+        )
+        conclusions.append({
+            "target_id": target_id, "ticker": comparison.ticker, "risk_label": comparison.risk,
+            "verified_relationship": verified_relationship,
+            "status": review.status, "disagreement_unresolved": target_id in disputed,
+            "novelty": "unresolved",
+            "supported_components": supported if review.status in {"supported", "partially_supported"} else (),
+        })
+    comparative = checkpoint.plan.intent.objective == "year_over_year"
+    answer = ["No filing-wide novelty conclusion is established." if comparative else "Selected-evidence review."]
+    final_sources = {}
+    finding_conclusions = tuple(item for item in items if item.kind == "finding")
+    by_ticker = {}
+    for conclusion in conclusions:
+        by_ticker.setdefault(conclusion["ticker"], []).append(conclusion)
+    for group in checkpoint.assignments:
+        status = group.outcome.assignment_status if group.outcome else "pending"
+        reason = f" ({group.pending_reason})" if group.pending_reason else ""
+        qualification = " Novelty unresolved." if comparative else ""
+        answer.append(f"{group.ticker} assignment {status}{reason}.{qualification}")
+        for conclusion in by_ticker.get(group.ticker, ()):
+            disagreement = " Investigator disagreement remains unresolved." if conclusion["disagreement_unresolved"] else ""
+            answer.append(f'  {conclusion["risk_label"]} [{conclusion["status"]}].{disagreement}')
+            if conclusion["verified_relationship"] in {"same_risk", "more_specific_wording"}:
+                answer.append("  The verifier found a shared underlying risk in the selected earlier and later excerpts.")
+            if not disagreement:
+                for component in conclusion["supported_components"]:
+                    sources = tuple(dict.fromkeys(findings[pointer.finding_id].evidence[pointer.evidence_index].source
+                                                  for pointer in component.evidence))
+                    final_sources.update((source.chunk_id, source) for source in sources)
+                    chunks = ", ".join(source.chunk_id for source in sources)
+                    answer.append(f"  Verifier-supported component. {component.statement} [{chunks}]")
     return {
+        "answer": "\n".join(answer), "conclusions": tuple(conclusions), "assignments": checkpoint.assignments,
+        "citations": checkpoint.citations, "conclusion_citations": tuple(final_sources.values()),
+        "finding_conclusions": finding_conclusions, "original_findings": checkpoint.findings,
+        "original_comparisons": checkpoint.comparisons,
         "items": items, "comparative_novelty": novelty, "evidence_gaps": tuple(recommendations),
         "execution_status": checkpoint.execution_status, "research_status": checkpoint.research_status,
         "required_targets": checkpoint.plan.required_target_count,

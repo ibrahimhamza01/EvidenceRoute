@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from evidenceroute.research.rlm.budget import BudgetUsage, SharedBudget
+from evidenceroute.research.rlm.budget import BudgetUsage, SharedBudget, SharedLimits
 from evidenceroute.research.rlm.comparison import Comparison, render_comparative_scope, render_comparisons
 from evidenceroute.research.rlm.discovery import CorpusScan, DiscoverySpec, discover_research_plan, scan_research_plan
 from evidenceroute.research.rlm.controller import ExecutionTrace
@@ -72,6 +72,9 @@ class CorpusUsage:
     lexical_chunks_scanned: int
     elapsed_seconds: float
     finding_submission_attempts: int = 0
+    accepted_submissions: int = 0
+    rejected_submission_records: int = 0
+    unused_capture_reservations: int = 0
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,7 @@ class CorpusResearchResult:
     execution_status: Literal["finished", "incomplete"]
     research_status: Literal["incomplete", "unverified"]
     answer: str
+    comparative_capture: bool = False
 
     @property
     def group_counts(self) -> dict[str, int]:
@@ -157,6 +161,8 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
                          "error": (op.error or {}).get("code"), "delivery_error": op.delivery_error}
             if detailed:
                 operation.update(tool_use_id=op.tool_use_id, chunk_ids=[ref.chunk_id for ref in op.evidence])
+            if op.tool_name == "submit_findings" and op.outcome in {"executed", "rejected"}:
+                operation["capture_rejected_records"] = len(op.finding_validation)
             if op.finding_validation:
                 operation["finding_validation"] = [asdict(issue) for issue in op.finding_validation]
             if op.accepted_finding_refs:
@@ -201,6 +207,7 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
     return {"invocation_id": node.invocation.invocation_id, "stop_reason": node.stop_reason,
             "budget_stop": node.budget_stop, "generated_finding_ids": [item.finding_id for item in node.findings],
             "selected_local_finding_ids": node.selected_local_finding_ids,
+            "unused_capture_reservation": node.unused_capture_reservation,
             "decisions": decisions}
 
 
@@ -208,9 +215,9 @@ def execute_corpus_research(
     plan: ResearchPlan, runner: RecursiveResearch, *, limits: CorpusLimits, max_groups: int = 2,
     scan_terms: tuple[str, ...] | None = None, root_guidance: str | None = None,
     detailed_trace: bool = False, discovery: DiscoverySpec | None = None, _deadline: float | None = None,
-    _target_companies: tuple[str, ...] | None = None,
+    _target_companies: tuple[str, ...] | None = None, _cached_scan: CorpusScan | None = None,
 ) -> CorpusResearchResult:
-    """Run a resolved plan in ticker order, settling one tree before admitting the next."""
+    """Run a resolved plan, settling one bounded tree before admitting the next."""
     if runner.comparison_scan is not None or runner.discovery_scan is not None:
         raise ValueError("Pass discovery or scan_terms so the lexical scan is charged to this corpus execution.")
     if discovery is not None and scan_terms is not None:
@@ -238,22 +245,47 @@ def execute_corpus_research(
     scheduled = {group.ticker: number for number, groups in enumerate(schedule, 1) for group in groups}
     scan = None
     remaining_seconds = deadline - clock()
+
+    def tree_limits(groups: tuple[CompanyPartition, ...]) -> SharedLimits:
+        if comparative and runner.comparative_capture:
+            return runner.shared_limits.model_copy(update={
+                "max_delegations": len(groups),
+                "max_partitions": sum(len(group.targets) for group in groups),
+            })
+        return runner.shared_limits
+
     scan_allowed = _target_companies is None or (
         bool(schedule) and limits.max_batches > 0
-        and all(getattr(runner.shared_limits, cap) <= getattr(limits, cap) for cap in _RESOURCES)
+        and all(getattr(tree_limits(schedule[0]), cap) <= getattr(limits, cap) for cap in _RESOURCES)
     )
-    if scan_allowed and (comparative or review_discovery) and remaining_seconds > 0:
+    reused_scan = scan_allowed and _cached_scan is not None
+    if reused_scan:
+        scan = _cached_scan
+    elif scan_allowed and (comparative or review_discovery) and remaining_seconds > 0:
         options = dict(max_chunks=limits.max_scan_chunks, max_pages=limits.max_scan_pages,
                        deadline_seconds=min(limits.scan_deadline_seconds, remaining_seconds), clock=clock)
         if discovery is not None:
             scan = discover_research_plan(runner.corpus, work_plan, discovery, **options)
         else:
             scan = scan_research_plan(runner.corpus, work_plan, scan_terms, **options)
+    if scan is not None:
         runner = copy(runner)
         if comparative:
             runner.comparison_scan = scan
         else:
             runner.discovery_scan = scan
+
+    if comparative and runner.comparative_capture and scan is not None:
+        rank: dict[str, list[int]] = {}
+        for row in scan.sections:
+            rank.setdefault(row.ticker, []).append(len(row.candidates))
+        work_plan = replace(work_plan, groups=tuple(sorted(work_plan.groups, key=lambda group: (
+            -sum(bool(count) for count in rank.get(group.ticker, ())),
+            -sum(rank.get(group.ticker, ())), group.ticker,
+        ))))
+        schedule, blocked = _schedule(work_plan, runner, max_groups)
+        pending.update(blocked)
+        scheduled = {group.ticker: number for number, groups in enumerate(schedule, 1) for group in groups}
 
     batches = []
     traces = []
@@ -269,18 +301,23 @@ def execute_corpus_research(
         if len(batches) >= limits.max_batches:
             stop = "batch_limit"
             break
+        shared_limits = tree_limits(groups)
+        batch_runner = runner
+        if shared_limits is not runner.shared_limits:
+            batch_runner = copy(runner)
+            batch_runner.shared_limits = shared_limits
         blocked_resource = next((cap for cap, counter in _RESOURCES.items()
-                                 if used[counter] + getattr(runner.shared_limits, cap) > getattr(limits, cap)), None)
+                                 if used[counter] + getattr(batch_runner.shared_limits, cap) > getattr(limits, cap)), None)
         if blocked_resource is not None:
             stop = f"insufficient_{blocked_resource.removeprefix('max_')}"
             break
 
         companies = tuple(group.ticker for group in groups)
         batch_plan = replace(plan, groups=groups, requested_companies=companies, missing_requirements=())
-        budget = SharedBudget(runner.shared_limits, clock, finalization=runner.finalization, deadline=deadline)
+        budget = SharedBudget(batch_runner.shared_limits, clock, finalization=runner.finalization, deadline=deadline)
         prefix = f"{run_id}.batch-{number}."
         try:
-            result = execute_research_plan(batch_plan, runner, max_groups=max_groups, root_guidance=root_guidance,
+            result = execute_research_plan(batch_plan, batch_runner, max_groups=max_groups, root_guidance=root_guidance,
                                            delegation_first=True, _budget=budget, _id_prefix=prefix,
                                            _requested_scope=(len(plan.requested_companies), plan.required_target_count))
         except Exception as exc:
@@ -297,7 +334,9 @@ def execute_corpus_research(
             batch = BatchOutcome(number, companies, budget.snapshot(), trace.stop_reason, trace.budget_stop)
             for group in result.groups:
                 outcomes[group.ticker] = group
-                if group.assignment_status == "failed" and not group.result_acknowledged:
+                if group.assignment_status == "failed" and (
+                    (comparative and runner.comparative_capture) or not group.result_acknowledged
+                ):
                     pending[group.ticker] = "child_failed"
                 elif not group.result_acknowledged:
                     pending[group.ticker] = group.assignment_pending_reason or "child_result_unacknowledged"
@@ -331,10 +370,15 @@ def execute_corpus_research(
     citations = {ref.chunk_id: ref for result in results for ref in result.citations}
     estimates = []
     diagnostics = []
+    accepted_submissions = rejected_submissions = unused_reservations = 0
     for trace in traces:
         for node in _walk(trace):
             diagnostics.append(_diagnostics(node, detailed_trace))
             invocation_id = node.invocation.invocation_id
+            unused_reservations += node.unused_capture_reservation
+            submissions = [op for step in node.steps for op in step.operations if op.tool_name == "submit_findings"]
+            accepted_submissions += len({ref for op in submissions for ref in op.accepted_finding_refs})
+            rejected_submissions += sum(len(op.finding_validation) for op in submissions)
             for step in node.steps:
                 if step.error:
                     errors.append((invocation_id, step.error["code"]))
@@ -350,11 +394,12 @@ def execute_corpus_research(
                         estimates.append(attempt.estimated_tokens)
     usage = CorpusUsage(**used, attempts_with_missing_usage=sum(b.usage.attempts_with_missing_usage for b in batches),
                         estimated_tokens=sum(estimates), attempts_with_missing_estimate=used["provider_attempts"] - len(estimates),
-                        lexical_pages_read=scan.pages_read if scan else 0,
-                        lexical_metadata_reads=scan.metadata_reads if scan else 0,
-                        lexical_chunks_scanned=sum(row.scanned_chunks for row in scan.sections) if scan else 0,
+                        lexical_pages_read=scan.pages_read if scan and not reused_scan else 0,
+                        lexical_metadata_reads=scan.metadata_reads if scan and not reused_scan else 0,
+                        lexical_chunks_scanned=sum(row.scanned_chunks for row in scan.sections) if scan and not reused_scan else 0,
                         finding_submission_attempts=sum(b.usage.finding_submission_attempts for b in batches),
-                        elapsed_seconds=clock() - started)
+                        accepted_submissions=accepted_submissions, rejected_submission_records=rejected_submissions,
+                        unused_capture_reservations=unused_reservations, elapsed_seconds=clock() - started)
     evidence = tuple(dict.fromkeys(item for finding in (*root_findings, *child_findings, *selected) for item in finding.evidence))
     assessed = {key for item in (*root_comparisons, *child_comparisons) for key in item.assessed_chunk_ids}
     assessed.update(item.source.chunk_id for finding in (*root_findings, *child_findings)
@@ -371,7 +416,10 @@ def execute_corpus_research(
               f"Pending execution or scope. {pending_groups}")
     if retained:
         answer += f"\nRetained child findings without parent acknowledgement. {len(retained)}."
-    if comparative:
+    if comparative and runner.comparative_capture:
+        answer += ("\n\nNo filing-wide novelty conclusion is established. Investigator assessments await a separate "
+                   "semantic review. The original comparisons and citations are available in the structured report.")
+    elif comparative:
         assessment = "Batch-root comparisons.\n" + render_comparisons(root_comparisons)
         if child_comparisons:
             assessment += "\n\nAcknowledged child comparisons.\n" + render_comparisons(child_comparisons)
@@ -402,4 +450,5 @@ def execute_corpus_research(
                                 root_findings, selected, child_findings, retained, root_comparisons, child_comparisons, evidence,
                                 tuple(citations[key] for key in sorted(citations)), tuple(sorted(assessed)), tuple(errors),
                                 tuple(diagnostics), stop,
-                                "finished" if finished else "incomplete", "incomplete" if incomplete else "unverified", answer)
+                                "finished" if finished else "incomplete", "incomplete" if incomplete else "unverified",
+                                answer, comparative and runner.comparative_capture)

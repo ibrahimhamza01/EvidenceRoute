@@ -85,6 +85,8 @@ class BedrockConverseTransport:
             if exc.response.get("Error", {}).get("Code") == "ValidationException":
                 if choice == _FINISH:
                     error = ProviderTransportError("aws_required_finish_validation")
+                elif choice == "submit_findings":
+                    error = ProviderTransportError("aws_required_capture_validation")
                 elif choice == _DELEGATE:
                     error = ProviderTransportError("aws_required_delegation_validation")
             usage = exc.response.get("usage")
@@ -141,8 +143,10 @@ class BedrockRootClient(ClaudeRootClient):
     def _payload(self, tools: list[dict]) -> dict:
         policy = self._finalization_policy()
         choice = {"tool": {"name": _FINISH}} if policy and policy.finalization_tool_choice == "required" else {"auto": {}}
-        if not self._finish_allowed:
-            choice = {"tool": {"name": _DELEGATE}}
+        if self._required_tool:
+            choice = {"tool": {"name": self._required_tool}}
+        elif not self._finish_allowed and len(tools) == 1:
+            choice = {"tool": {"name": tools[0]["name"]}}
         return self._converse_payload(
             tools, choice, self._system_prompt(), self._messages,
             policy.finalization_max_output_tokens if policy else self.config.max_output_tokens,

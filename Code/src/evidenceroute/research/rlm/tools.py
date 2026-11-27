@@ -239,7 +239,8 @@ class CorpusToolDispatcher:
         self._include_spans = include_spans
         self._candidate_search = include_spans if candidate_search is None else candidate_search
 
-    def dispatch(self, name: str, arguments: dict, *, delivered_chunks: set[str] | None = None) -> DispatchResult:
+    def dispatch(self, name: str, arguments: dict, *, delivered_chunks: set[str] | None = None,
+                 delivered_spans: dict[tuple[str, str, str], tuple[str, str]] | None = None) -> DispatchResult:
         if not isinstance(name, str):
             return self._error("unknown_tool", "Tool is outside the SEC corpus allowlist.")
         args_schema = _Spans if self._include_spans and name == "get_spans" else _TOOLS.get(name, (None, None))[1]
@@ -258,7 +259,7 @@ class CorpusToolDispatcher:
         try:
             # Only names in the fixed registry reach attribute lookup.
             if name == "get_spans":
-                return self._get_spans(validated)
+                return self._get_spans(validated, delivered_spans)
             if name == "get_chunk" and self._include_spans and validated["chunk_id"] in (delivered_chunks or ()):
                 return DispatchResult(validated, observation_json({"ok": True, "result": {
                     "chunk_id": validated["chunk_id"], "already_delivered": True,
@@ -301,19 +302,32 @@ class CorpusToolDispatcher:
         )))
         return {"source": ref, "span_ids": ranked[:4]}
 
-    def _get_spans(self, arguments: dict) -> DispatchResult:
+    def _get_spans(
+        self, arguments: dict, delivered: dict[tuple[str, str, str], tuple[str, str]] | None,
+    ) -> DispatchResult:
         chunk = self._corpus.get_chunk(arguments["chunk_id"])
         spans = passage_spans(chunk.text)
         selected = arguments["span_ids"]
         if any(key not in spans for key in selected):
             return self._error("unknown_span", "Use canonical span IDs for this chunk.", arguments)
         ref = EvidenceRef.from_chunk(chunk)
-        content = observation_json({"ok": True, "result": {
-            "source": ref, "spans": {key: chunk.text[slice(*spans[key])] for key in selected},
-        }, "span_ids": {chunk.chunk_id: list(dict.fromkeys(selected))}})
+        excerpts = {}
+        repeated = {}
+        for key in dict.fromkeys(selected):
+            exact = chunk.text[slice(*spans[key])]
+            previous = (delivered or {}).get((chunk.document_id, chunk.section_id, exact))
+            if previous is None:
+                excerpts[key] = exact
+            else:
+                repeated[key] = {"chunk_id": previous[0], "span_id": previous[1]}
+        result = {"source": ref, "spans": excerpts} if excerpts else {"chunk_id": chunk.chunk_id}
+        if repeated:
+            result["already_delivered"] = repeated
+        content = observation_json({"ok": True, "result": result,
+                                    "span_ids": {chunk.chunk_id: list(excerpts)} if excerpts else {}})
         if len(content.encode("utf-8")) > self._max_bytes:
             return self._error("response_too_large", "Try fewer spans in one request.", arguments)
-        return DispatchResult(arguments, content, (ref,))
+        return DispatchResult(arguments, content, (ref,) if excerpts else ())
 
     def _oversized(
         self, name: str, arguments: dict, result, response_bytes: int, discovered: tuple[EvidenceRef, ...],

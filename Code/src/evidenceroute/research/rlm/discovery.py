@@ -30,6 +30,7 @@ class DiscoverySpec(StrictInput):
 
     topic: str = Field(min_length=1, max_length=2_000)
     phrases: DiscoveryPhrases
+    expand_context: bool = True
     max_candidates_per_section: int = Field(default=16, ge=1, le=50)
 
     @field_validator("phrases")
@@ -48,6 +49,50 @@ class DiscoverySpec(StrictInput):
 
 def _normalize(text: str) -> str:
     return " ".join(tokenize(text, remove_stopwords=False))
+
+
+# Domain vocabulary supplies retrieval anchors only. The investigator determines
+# whether the selected evidence actually describes a risk and its AI connection.
+_INFRA = re.compile(
+    r"\b(?:data cent(?:er|re)s?|comput(?:e|ing) capacity|cloud (?:services?|infrastructure)|"
+    r"accelerators?|gpus?|semiconductors?|chips?|servers?|third party (?:equipment|infrastructure)|"
+    r"power (?:supply|availability|capacity)|electricity|water supply|cooling|infrastructure)\b"
+)
+_AI = re.compile(r"\b(?:ai|artificial intelligence|machine learning|large language models?)\b")
+_INFRA_STRONG = re.compile(
+    r"\b(?:data cent(?:er|re)s?|comput(?:e|ing) capacity|third party (?:equipment|infrastructure)|"
+    r"power (?:supply|availability|capacity)|water supply|cooling)\b"
+)
+_RISK = re.compile(
+    r"\b(?:risks?|depend\w*|rely|reliance|constrain\w*|shortages?|interrupt\w*|"
+    r"disrupt\w*|availab\w*|limit\w*|fail\w*|outages?|supply|sufficient|unable)\b"
+)
+_INFLECTIONS = {
+    "accelerators": "accelerator", "centers": "center", "centres": "center", "centre": "center",
+    "chips": "chip", "constraints": "constraint", "dependencies": "dependency",
+    "gpus": "gpu", "models": "model", "processors": "processor", "risks": "risk",
+    "servers": "server", "shortages": "shortage", "units": "unit",
+}
+
+
+def _singularize(normalized: str) -> str:
+    return " ".join(_INFLECTIONS.get(token, token) for token in normalized.split())
+
+
+def _context(text: str) -> tuple[int, tuple[str, ...]]:
+    # Score nearby signals above incidental matches elsewhere in the chunk.
+    anchors = tuple(_INFRA.finditer(text))
+    best = (0, ())
+    for anchor in anchors:
+        window = text[max(0, anchor.start() - 320):anchor.end() + 320]
+        ai, risk = _AI.search(window), _RISK.search(window)
+        if ai and risk:
+            best = max(best, (3, (anchor.group(), ai.group(), risk.group())))
+        elif risk and _INFRA_STRONG.fullmatch(anchor.group()):
+            best = max(best, (2, (anchor.group(), risk.group())))
+        elif ai:
+            best = max(best, (1, (anchor.group(), ai.group())))
+    return best
 
 
 class CandidatePageRequest(StrictInput):
@@ -142,6 +187,7 @@ class _SectionScan:
     metadata: SectionMetadata
     scanned: int = 0
     candidates: list[Candidate] = field(default_factory=list)
+    ranks: dict[str, tuple] = field(default_factory=dict)
 
 
 def _scan(
@@ -165,12 +211,27 @@ def _scan(
         meta = corpus.get_section(pair.document_id, pair.section_id, limit=1).metadata
         sections.append(_SectionScan(pair, meta))
 
-    def matching_terms(text: str, queries: tuple[str, ...]) -> tuple[str, ...]:
+    expanded = bool(spec and spec.expand_context)
+    # The interpreted topic gates domain expansion. Unrelated questions keep
+    # their own phrases and inflections, without AI infrastructure candidates.
+    topic = _normalize(spec.topic) if spec else ""
+    use_context = expanded and bool(_AI.search(topic) and _INFRA.search(topic))
+    normalized_queries = {term: f" {_singularize(term) if expanded else term} " for term in terms}
+
+    def matching_terms(text: str) -> tuple[tuple[str, ...], tuple]:
         if spec is None:
             folded = text.casefold()
-            return tuple(term for term in queries if term in folded)
-        normalized = f" {_normalize(text)} "
-        return tuple(term for term in queries if f" {term} " in normalized)
+            return tuple(term for term in terms if term in folded), ()
+        normalized = _normalize(text)
+        searchable = f" {_singularize(normalized) if expanded else normalized} "
+        exact = tuple(term for term, query in normalized_queries.items() if query in searchable)
+        length = max((len(term.split()) for term in exact), default=0)
+        score, anchors = _context(normalized) if use_context else (0, ())
+        # Specific phrases and local AI + risk co-occurrence lead. Single
+        # broad terms (including GPU) cannot crowd out risk-bearing passages.
+        rank = (max(4 if length >= 3 else 3 if length == 2 else length, score),
+                score, length, len(exact))
+        return tuple(dict.fromkeys((*exact, *anchors))), rank
 
     active = [section for section in sections if section.metadata.chunk_count]
     while active and stop is None:
@@ -190,10 +251,11 @@ def _scan(
                                       limit=min(MAX_CHUNK_ROWS, share))
             pages += 1
             for chunk in page.items:
-                matched = matching_terms(chunk.text, terms)
+                matched, rank = matching_terms(chunk.text)
                 if matched:
                     spans = tuple(span for span, (start, end) in passage_spans(chunk.text).items()
-                                  if matching_terms(chunk.text[start:end], matched))
+                                  if matching_terms(chunk.text[start:end])[0])
+                    section.ranks[chunk.chunk_id] = rank
                     section.candidates.append(Candidate(chunk.chunk_id, matched, spans))
                 chars += len(chunk.text)
             scanned += len(page.items)
@@ -207,7 +269,7 @@ def _scan(
             candidates = sorted(section.candidates, key=lambda hit: -len(hit.terms))
         else:
             candidates = sorted(section.candidates, key=lambda hit: (
-                -max(len(term.split()) for term in hit.terms), -len(hit.terms), hit.chunk_id,
+                tuple(-value for value in section.ranks[hit.chunk_id]), hit.chunk_id,
             ))[:spec.max_candidates_per_section]
         rows.append(ScannedSection(section.pair, meta.ticker, meta.fiscal_year, meta.chunk_count, section.scanned,
                                    tuple(candidates), len(section.candidates)))

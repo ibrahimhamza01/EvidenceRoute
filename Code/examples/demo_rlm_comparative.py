@@ -41,7 +41,7 @@ ROOT_GUIDANCE = (
 )
 
 
-def _offline_factory(corpus, plan):
+def _offline_factory(corpus, plan, *, compact=False, fail_amd_finish=False):
     # Fixed regression inputs for the scripted demo only. Live research gets the lexical shortlist.
     chunks = tuple(corpus.get_chunk(key) for key in ("043757f52188a8c6fb2a2857", "483314af3b949a29920abbbf"))
     spans = [next(span for span, (start, end) in passage_spans(chunk.text).items()
@@ -67,6 +67,8 @@ def _offline_factory(corpus, plan):
             }} for group in groups]
             if not any(group.ticker == "AMD" for group in groups):
                 return ScriptedModelClient([*actions, {"type": "synthesis", "synthesis": {}}])
+            if compact:
+                return ScriptedModelClient([*actions, {"type": "synthesis", "synthesis": {"cite_refs": ["d1", "d2"]}}])
             assessments = [{"ref": f"d{i}", "relevance": "infrastructure", "entailment": "supports",
                             "rationale": "Power or water shortages can constrain data-center capacity."} for i in (1, 2)]
             return ScriptedModelClient([*actions, {"type": "synthesis", "synthesis": {"analysis_status": "incomplete",
@@ -74,10 +76,25 @@ def _offline_factory(corpus, plan):
             }}])
         selected = {pair.document_id for pair in invocation.partitions}
         if any(chunk.document_id not in selected for chunk in chunks):
+            if compact:
+                return ScriptedModelClient([
+                    {"type": "tool", "name": "submit_findings", "arguments": {"findings": []}},
+                    {"type": "synthesis", "synthesis": {}},
+                ])
             return ScriptedModelClient([{"type": "finish", "answer": "No scoped assessment in this scripted example."}])
         # Start with FY2024, then investigate the specific prior-year counterpart.
         reads = [{"type": "tool", "name": "get_spans", "arguments": {"chunk_id": chunk.chunk_id, "span_ids": [span]}}
                  for chunk, span in reversed(list(zip(chunks, spans)))]
+        if compact:
+            submit = {"type": "tool", "name": "submit_findings", "arguments": {"findings": findings}}
+            if fail_amd_finish:
+                bad = {"type": "synthesis", "synthesis": {"cite_refs": ["s8"]}}
+                return ScriptedModelClient([*reads, reads[0], submit, bad, bad])
+            assessments = [{"ref": f"s{i}", "risk_category": "general_infrastructure", "entailment": "supports"}
+                           for i in (1, 2)]
+            return ScriptedModelClient([*reads, reads[0], submit, {"type": "synthesis", "synthesis": {
+                "comparisons": [{"risk": comparison["risk"], "relationship": "same", "assessments": assessments}],
+            }}])
         return ScriptedModelClient([*reads, {"type": "finish", "answer": "The underlying risk appears in both years.",
                                             "findings": findings, "comparisons": [comparison],
                                             "analysis_status": "incomplete"}])
@@ -184,7 +201,7 @@ def main(argv=None) -> int:
     parser.add_argument("--live", action="store_true", help="Explicitly authorize bounded Bedrock inference.")
     parser.add_argument("--trace", action="store_true", help="Include sanitized provider actions and per-step diagnostics.")
     profiles = parser.add_mutually_exclusive_group()
-    profiles.add_argument("--profile", choices=tuple(COMPARATIVE_PROFILES), default="diagnostic")
+    profiles.add_argument("--profile", choices=("diagnostic", "expanded"), default="diagnostic")
     profiles.add_argument("--profile-file", type=Path, help="JSON comparative budget profile.")
     parser.add_argument("--term", action="append", help="Replace the example phrases. Repeat for variants.")
     parser.add_argument("--fixed-terms", action="store_true", help="Reproduce the literal-term baseline.")

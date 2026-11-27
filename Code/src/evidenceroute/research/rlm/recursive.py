@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+
 from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Literal
@@ -11,7 +13,10 @@ from uuid import uuid4
 from pydantic import Field, ValidationError
 
 from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
-from evidenceroute.research.rlm.comparison import Comparison, render_comparisons, resolve_comparison, resolve_reference_comparison
+from evidenceroute.research.rlm.comparison import (
+    CompactAssessment, CompactComparisonDraft, Comparison, _has_ai_context, render_comparisons,
+    resolve_comparison, resolve_reference_comparison,
+)
 from evidenceroute.research.rlm.discovery import CandidatePageRequest, CorpusScan
 from evidenceroute.research.rlm.controller import (
     ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction, _ReferenceSynthesis,
@@ -21,7 +26,7 @@ from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import (
     MAX_FINDINGS, MAX_FINDINGS_PER_SUBMISSION, AnalysisStatus, EvidenceDraft, Finding, FindingDraft, FindingEvidence,
     FindingValidationError, FindingValidationIssue, PartitionCoverage, SpanEvidenceDraft, SpanFindingDraft,
-    SubmitFindings, finding_schema_issues, partition_status, render_findings,
+    CaptureFindings, SubmitFindings, finding_schema_issues, partition_status, render_findings,
 )
 from evidenceroute.research.rlm.scoped import ScopedCorpus
 from evidenceroute.research.rlm.spans import passage_spans
@@ -30,6 +35,11 @@ from evidenceroute.research.rlm.tools import (
     validation_message,
 )
 
+
+_CROSS_YEAR_CLAIM = re.compile(
+    r"\b(?:both (?:fiscal )?years|year over year|year-over-year|"
+    r"(?:prior|previous|earlier|later)[ -]year (?:filings?|disclosures?))\b", re.IGNORECASE,
+)
 
 class _Partition(StrictInput):
     document_id: Identifier
@@ -86,6 +96,7 @@ class RecursiveResearch:
         comparison_scan: CorpusScan | None = None,
         discovery_scan: CorpusScan | None = None,
         max_root_reinvestigation_calls: int | None = None,
+        comparative_capture: bool = False,
         clock: Callable[[], float] = monotonic,
     ):
         self.corpus = corpus
@@ -93,7 +104,10 @@ class RecursiveResearch:
         self.shared_limits = shared_limits if shared_limits is not None else SharedLimits()
         self.local_limits = local_limits if local_limits is not None else RootLimits()
         self.clock = clock
+        if comparative_capture and finalization is None:
+            raise ValueError("Comparative evidence capture requires a protected finalization policy.")
         self.finalization = finalization
+        self.comparative_capture = comparative_capture
         self.child_guidance = child_guidance
         self.comparison_scan = comparison_scan
         self.discovery_scan = discovery_scan
@@ -196,8 +210,8 @@ class RecursiveResearch:
                 "Read promising evidence in each fiscal "
                 "year and check the same risk in both filings. Choose chunk_id and span_id from acknowledged "
                 "evidence to create findings. Evaluate relevance to the topic separately from what the passage supports or contradicts. "
-                "Accelerator demand alone does not establish an infrastructure risk. Explain the connection in the "
-                "assessment and state separately whether the exact source links it to AI infrastructure. "
+                "Accelerator demand alone does not establish an infrastructure risk. Assess separately whether the exact "
+                "source links the mechanism to AI infrastructure. "
                 "Mark relevance other or uncertain where appropriate and abstain if support is insufficient. "
                 "Investigate counterevidence and report gaps. No lexical miss proves absence."
             )
@@ -212,7 +226,16 @@ class RecursiveResearch:
             "references and dN references from delivered child findings. The host derives citations and renders the answer. "
             "Report uncertainty and conflicts. Abstain when evidence is insufficient. Search misses do not establish absence."
         )
-        if self.comparison_scan is not None:
+        if session.compact_comparative:
+            prompt += (" Capture each year-specific claim once and leave novelty to comparisons. "
+                       "Use an empty submission when evidence is insufficient. "
+                       "Finish with references only. A root can cite child references without repeating child comparisons. Separate support for the underlying risk, risk category, AI connection "
+                       "and disclosure relationship. Silence is nonmention. Only an opposing statement about the same risk "
+                       "can contradict it. AI dependencies, AI-enabled threats and unrelated AI risks are distinct categories.")
+            enable = getattr(model, "enable_compact_comparative_finish", None)
+            if callable(enable):
+                enable()
+        elif self.comparison_scan is not None:
             prompt += (" Reassess short references in synthesis.comparisons. In a legacy finish, use one-based "
                        "finding indices for comparisons.")
         if session.prior_findings:
@@ -240,6 +263,7 @@ class RecursiveSession:
         self.unassigned_groups = set(root_groups or ()) if self.delegation_first else set()
         self.direct_ids: set[str] = set()
         self.direct_spans: dict[str, set[str]] = {}
+        self.delivered_span_text: dict[tuple[str, str, str], tuple[str, str]] = {}
         self.delivered_findings: dict[str, Finding] = {}
         authorized = set(invocation.partitions or ())
         self.prior_findings = {
@@ -247,7 +271,10 @@ class RecursiveSession:
             if all(SectionTarget(item.source.document_id, item.source.section_id) in authorized for item in finding.evidence)
         }
         self.prior_refs: dict[str, str] = {}
-        self.reference_synthesis = runner.discovery_scan is not None or (
+        self.compact_comparative = runner.comparative_capture and runner.comparison_scan is not None
+        self.capture_reserved = self.compact_comparative and invocation.depth > 0 and budget.active_allocation is not None
+        self.capture_attempted = False
+        self.reference_synthesis = self.compact_comparative or runner.discovery_scan is not None or (
             invocation.depth == 0 and runner.comparison_scan is not None
         )
         self.acknowledged_references: dict[str, Finding] = {}
@@ -326,7 +353,7 @@ class RecursiveSession:
                            f"up to {MAX_FINDINGS} unique local findings per invocation. "
                            "Supply a claim, analysis status and acknowledged chunk/span IDs. "
                            "Use returned sN references in finish_research; citations and source details are derived.",
-            "input_schema": SubmitFindings.model_json_schema(),
+            "input_schema": (CaptureFindings if self.capture_reserved else SubmitFindings).model_json_schema(),
         }
 
     @staticmethod
@@ -377,11 +404,12 @@ class RecursiveSession:
     ) -> tuple[DispatchResult, tuple[str, ...], tuple[FindingValidationIssue, ...]]:
         cap = self.runner.local_limits.max_response_bytes
         drafts = arguments.get("findings")
+        minimum = 0 if self.capture_reserved else 1
         if (arguments.keys() != {"findings"} or not isinstance(drafts, list)
-                or not 1 <= len(drafts) <= MAX_FINDINGS_PER_SUBMISSION):
+                or not minimum <= len(drafts) <= MAX_FINDINGS_PER_SUBMISSION):
             issue = FindingValidationIssue("findings", "schema", "invalid_submission")
             content = error_observation("invalid_arguments",
-                                        f"Supply a findings list with 1 to {MAX_FINDINGS_PER_SUBMISSION} items.", cap)
+                                        f"Supply a findings list with {minimum} to {MAX_FINDINGS_PER_SUBMISSION} items.", cap)
             return DispatchResult(None, content), (), (issue,)
 
         receipts = []
@@ -411,6 +439,7 @@ class RecursiveSession:
             issues.append(issue)
             receipts.append({"index": index, "status": "rejected", "code": issue.code, "path": issue.path})
 
+        self.capture_attempted |= bool(accepted) or not drafts
         share = min(cap, batch_share) if batch_share is not None else cap
         for count in range(len(receipts), -1, -1):
             content = observation_json({"ok": True, "result": {
@@ -495,7 +524,10 @@ class RecursiveSession:
             },
         }
         if self.runner.comparison_scan is not None and successful:
-            body["result"]["comparisons"] = child.comparisons
+            body["result"]["comparisons"] = (
+                [self._comparison_summary(item, references) for item in child.comparisons]
+                if self.compact_comparative else child.comparisons
+            )
         if not body["ok"]:
             body["error"] = {"code": "child_not_finished", "message": "Inspect the child stop reason and coverage."}
         content = observation_json(body)
@@ -532,8 +564,12 @@ class RecursiveSession:
         return DispatchResult(validated, content, refs), delegation
 
     @staticmethod
+    def _comparison_summary(comparison: Comparison, references: dict[str, str]) -> dict:
+        return {"risk": comparison.risk, "outcome": comparison.outcome, "relationship": comparison.relationship,
+                "refs": [references[key] for key in comparison.finding_ids], "evidence_years": comparison.evidence_years}
+
     def _compact_child_result(
-        result: dict, child: ExecutionTrace, cap: int, finding_records: dict[str, dict],
+        self, result: dict, child: ExecutionTrace, cap: int, finding_records: dict[str, dict],
     ) -> tuple[str | None, tuple[Finding, ...], tuple[int, ...]]:
         """Keep whole validated findings and send a bounded summary when the full result cannot fit."""
         findings: list[Finding] = []
@@ -562,8 +598,13 @@ class RecursiveSession:
         for index, comparison in enumerate(child.comparisons):
             if not offered.issuperset(comparison.finding_ids):
                 continue
-            summaries.append({"risk": comparison.risk, "outcome": comparison.outcome,
-                              "finding_ids": comparison.finding_ids, "evidence_years": comparison.evidence_years})
+            if self.compact_comparative:
+                summaries.append(self._comparison_summary(
+                    comparison, {key: record["ref"] for key, record in finding_records.items()},
+                ))
+            else:
+                summaries.append({"risk": comparison.risk, "outcome": comparison.outcome,
+                                  "finding_ids": comparison.finding_ids, "evidence_years": comparison.evidence_years})
             candidate = encode()
             if len(candidate.encode("utf-8")) > cap:
                 summaries.pop()
@@ -589,6 +630,12 @@ class RecursiveSession:
                 self.direct_ids.update(ref.chunk_id for ref in step.evidence)
             for chunk_id, spans in (step.observation or {}).get("span_ids", {}).items():
                 self.direct_spans.setdefault(chunk_id, set()).update(spans)
+                if self.compact_comparative and spans:
+                    chunk = self.runner.corpus.get_chunk(chunk_id)
+                    offsets = passage_spans(chunk.text)
+                    for span in spans:
+                        key = (chunk.document_id, chunk.section_id, chunk.text[slice(*offsets[span])])
+                        self.delivered_span_text.setdefault(key, (chunk_id, span))
         elif step.delegation.child is not None:
             offered = set(step.delegation.offered_finding_ids)
             findings = [finding for finding in step.delegation.child.transferable_findings if finding.finding_id in offered]
@@ -640,7 +687,7 @@ class RecursiveSession:
         self.used_finding_ids = used
         self.analysis_status = (action.analysis_status or "incomplete") if referenced and not self.unassigned_groups else "incomplete"
 
-    def finish_references(self, action: _ReferenceSynthesis, coverage: CoverageReport) -> tuple[str, ...]:
+    def finish_references(self, action: _ReferenceSynthesis, coverage: CoverageReport, *, issues=None) -> tuple[str, ...]:
         scan = self.runner.comparison_scan
         if action.comparisons and scan is None:
             raise FindingValidationError("synthesis.comparisons", "mode", "comparative_required",
@@ -659,14 +706,23 @@ class RecursiveSession:
         if scan is not None:
             for index, draft in enumerate(action.comparisons):
                 path = f"synthesis.comparisons[{index}]"
-                for position, assessment in enumerate(draft.assessments):
-                    self._check_reference(assessment.ref, available, f"{path}.assessments[{position}].ref")
-                    if assessment.context_ref is not None:
-                        self._check_reference(assessment.context_ref, available, f"{path}.assessments[{position}].context_ref")
                 try:
+                    if issues is not None:
+                        draft = self._compact_comparison(draft, path, available, issues)
+                        if draft is None:
+                            continue
+                    for position, assessment in enumerate(draft.assessments):
+                        self._check_reference(assessment.ref, available, f"{path}.assessments[{position}].ref")
+                        if assessment.context_ref is not None:
+                            self._check_reference(assessment.context_ref, available, f"{path}.assessments[{position}].context_ref")
                     comparisons.append(resolve_reference_comparison(draft, available, scan.years))
-                except ValueError as exc:
-                    raise FindingValidationError(path, "comparison", "invalid_comparison", str(exc)) from exc
+                except (ValueError, FindingValidationError) as exc:
+                    issue = FindingValidationError(path, "comparison", "invalid_comparison", str(exc))
+                    if issues is None:
+                        if isinstance(exc, FindingValidationError):
+                            raise
+                        raise issue from exc
+                    issues.append(exc.issue if isinstance(exc, FindingValidationError) else issue.issue)
         selected.update(fid for item in comparisons for fid in item.finding_ids)
         inherited = tuple(dict.fromkeys(finding for ref, finding in self.acknowledged_references.items()
                                         if ref.startswith("d") and finding.finding_id in selected))
@@ -691,8 +747,48 @@ class RecursiveSession:
         self.selected_local_finding_ids = tuple(item.finding_id for item in local)
         self.selected_inherited_findings = inherited
         self.used_finding_ids = tuple(item.finding_id for item in inherited)
-        self.analysis_status = (action.analysis_status or "incomplete") if citations and not self.unassigned_groups else "incomplete"
+        self.analysis_status = (action.analysis_status or "incomplete") if (
+            citations and not self.unassigned_groups and not issues
+        ) else "incomplete"
         return citations
+
+    @staticmethod
+    def _compact_comparison(raw, path, available, issues) -> CompactComparisonDraft | None:
+        if not isinstance(raw, dict) or not isinstance(raw.get("assessments"), list) or not 1 <= len(raw["assessments"]) <= 8:
+            issues.append(FindingValidationIssue(path, "schema", "invalid_assessments"))
+            return None
+        accepted = []
+        used = set()
+        for index, item in enumerate(raw["assessments"]):
+            field = f"{path}.assessments[{index}]"
+            try:
+                assessment = CompactAssessment.model_validate(item)
+                if assessment.ref not in available or (assessment.context_ref and assessment.context_ref not in available):
+                    issues.append(FindingValidationIssue(field, "provenance", "unacknowledged_finding_reference"))
+                    continue
+                fid = available[assessment.ref].finding_id
+                if fid in used:
+                    issues.append(FindingValidationIssue(field, "comparison", "duplicate_finding_reference"))
+                    continue
+                if assessment.context_ref:
+                    finding = available[assessment.ref]
+                    context = available[assessment.context_ref]
+                    source = finding.evidence[0].source
+                    if (assessment.ai_specificity != "contextual"
+                            or not _has_ai_context(context, source.ticker, source.fiscal_year)):
+                        issues.append(FindingValidationIssue(field, "comparison", "invalid_ai_context"))
+                        continue
+                used.add(fid)
+                accepted.append(assessment)
+            except ValidationError as exc:
+                issues.extend(finding_schema_issues(exc, field))
+        if not accepted:
+            return None
+        try:
+            return CompactComparisonDraft.model_validate({**raw, "assessments": accepted})
+        except ValidationError as exc:
+            issues.extend(finding_schema_issues(exc, path))
+            return None
 
     @staticmethod
     def _check_reference(ref: str, available: dict[str, Finding], path: str) -> None:
@@ -717,6 +813,13 @@ class RecursiveSession:
                                              "Each finding must cite evidence from one document and section.")
             evidence.append(resolved)
         source = evidence[0].source
+        if self.compact_comparative:
+            other_years = set(self.runner.comparison_scan.years) - {source.fiscal_year}
+            if _CROSS_YEAR_CLAIM.search(draft.claim) or any(
+                re.search(rf"(?i)\b(?:FY[ -]?)?{year}\b", draft.claim) for year in other_years
+            ):
+                raise FindingValidationError(f"{path}.claim", "scope", "cross_year_claim",
+                                             "Keep the claim in its source year. Compare year-specific references in finish.")
         target = SectionTarget(source.document_id, source.section_id)
         key = (draft.claim, frozenset(evidence), draft.analysis_status, draft.uncertainty, draft.conflict)
         existing = self.retained_findings.get(key) or staged.get(key)

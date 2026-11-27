@@ -24,7 +24,7 @@ from evidenceroute.schemas import Chunk
 if TYPE_CHECKING:
     from evidenceroute.research.rlm.checkpoint import CheckpointRun, ResearchCheckpoint
 
-CHECKPOINT_VERSIONS = (1, 2)
+CHECKPOINT_VERSIONS = (1, 2, 3)
 
 
 class CheckpointError(ValueError):
@@ -353,7 +353,7 @@ def _validate_assignments(run: CheckpointRun, plan: ResearchPlan,
                  and outcome.result_acknowledged == bool(acknowledged)
                  and set(outcome.failed_invocation_ids) == failed,
                  "Checkpoint assignment status differs from its delivery records.")
-        if status == "failed" and not acknowledged:
+        if status == "failed" and (run.comparative_capture or not acknowledged):
             pending = "child_failed"
         elif not acknowledged:
             pending = outcome.assignment_pending_reason or "child_result_unacknowledged"
@@ -370,8 +370,10 @@ def _validate_assignments(run: CheckpointRun, plan: ResearchPlan,
 def validate_checkpoint(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironment) -> None:
     _require(type(checkpoint.version) is int and checkpoint.version in CHECKPOINT_VERSIONS,
              "Unsupported checkpoint schema version.")
-    _require((checkpoint.version == 2) == bool(checkpoint.verification_runs),
-             "Checkpoint version does not match its verification history.")
+    compact = any(run.comparative_capture for run in checkpoint.runs)
+    expected_version = 3 if compact else 2 if checkpoint.verification_runs else 1
+    _require(checkpoint.version == expected_version and (compact or checkpoint.discovery_cache is None),
+             "Checkpoint version does not match its research or verification history.")
     _require(checkpoint.corpus_identity == corpus.snapshot_identity, "Checkpoint corpus identity does not match the loaded snapshot.")
     plan = checkpoint.plan
     _require(plan == resolve_research_plan(plan.intent, corpus), "Checkpoint plan differs from its canonical original scope.")
@@ -379,6 +381,29 @@ def validate_checkpoint(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironmen
     if checkpoint.scan_terms or checkpoint.discovery and plan.intent.objective == "year_over_year":
         _require(plan.intent.objective == "year_over_year" and len(set(plan.intent.fiscal_years)) == 2,
                  "Checkpoint comparative discovery policy requires a two-year plan.")
+    scan = checkpoint.discovery_cache
+    if scan is not None:
+        _require(checkpoint.discovery is not None and scan.discovery == checkpoint.discovery and scan.stop_reason is None
+                 and not scan.unvisited_targets and scan.years == tuple(sorted(set(plan.intent.fiscal_years)))
+                 and tuple(row.pair for row in scan.sections) == plan.resolved_targets,
+                 "Checkpoint discovery cache differs from its original scope or policy.")
+        for row in scan.sections:
+            pair = row.pair
+            metadata = corpus.get_section(pair.document_id, pair.section_id, limit=1).metadata
+            _require(row.ticker == metadata.ticker and row.fiscal_year == metadata.fiscal_year
+                     and row.inventory_chunks == row.scanned_chunks == metadata.chunk_count
+                     and len({hit.chunk_id for hit in row.candidates}) == len(row.candidates)
+                     <= min(row.matched_chunks, scan.discovery.max_candidates_per_section)
+                     and row.matched_chunks <= row.inventory_chunks,
+                     "Checkpoint discovery cache has an invalid candidate inventory.")
+            for hit in row.candidates:
+                try:
+                    chunk = corpus.get_chunk(hit.chunk_id)
+                except KeyError:
+                    raise CheckpointError("Checkpoint candidate chunk does not exist.") from None
+                _require((chunk.document_id, chunk.section_id) == (pair.document_id, pair.section_id)
+                         and set(hit.matching_span_ids).issubset(passage_spans(chunk.text)),
+                         "Checkpoint candidate evidence lies outside its canonical section.")
     if checkpoint.interpretation is not None:
         usage = checkpoint.interpretation.usage
         _validate_usage(usage)
