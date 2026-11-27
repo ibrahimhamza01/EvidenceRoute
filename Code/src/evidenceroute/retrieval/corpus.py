@@ -1,3 +1,8 @@
+"""Validated, deterministically ordered collections of ``Chunk`` records.
+
+Retrieval consumes the agreed ``Chunk`` schema only. Loaders accept JSONL now and
+the processed Parquet export later, without depending on the HTML parser.
+"""
 from __future__ import annotations
 
 import hashlib

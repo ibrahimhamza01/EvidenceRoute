@@ -222,3 +222,6 @@ __marimo__/
 
 .DS_Store
 .Rhistory
+
+# JetBrains IDE settings
+.idea/
