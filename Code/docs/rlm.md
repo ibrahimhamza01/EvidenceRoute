@@ -89,7 +89,7 @@ For a fixed-scope experiment, resolve a caller-supplied `ResearchIntent` into a 
 | Completion and errors | Keep `execution_status`, `research_status`, `stop_reason` and errors. Execution is `finished` when at least one batch ran and no required group remains pending. Research may still be `incomplete`. `unverified` records that the pipeline found no tracked incompleteness and leaves semantic certainty unresolved. |
 | Usage and latency | Use `result.usage` for interpretation plus research, or `research.usage` for research alone. Record reported tokens, estimates, missing-counter counts, provider attempts and `elapsed_seconds`. The overall timer starts after the corpus is loaded. |
 
-Verification is optional. When a research result exists, call `create_checkpoint(corpus, result)`, then `verify_checkpoint(checkpoint, corpus, verifier, limits=verification_limits)` under a separate allowance. Attach the result with `record_verification` to obtain `verification_report` and combined usage. The original answer and coverage remain available. Use explicit continuation for a chosen evidence gap.
+Verification is optional. When a research result exists, call `create_checkpoint(corpus, result)`, then `verify_checkpoint(checkpoint, corpus, verifier, limits=verification_limits)` under a separate allowance. Attach the result with `record_verification` to obtain `verification_report` and combined usage. Preserve the original result separately if the interface needs its exact answer text. The checkpoint stores structured research state and coverage. Use explicit continuation for a chosen evidence gap.
 
 Map the result inside the existing benchmark by its question ID. Compare original citation IDs with supporting evidence groups and score answer quality and abstention separately. Citation IDs are sorted for reporting and carry no retrieval rank for MRR or ranked top-K metrics. Keep the question inputs, budget and verification policy fixed across comparable trials. The router can treat `corpus_wide` as a candidate for RLM and use the existing strategy dispatch. Routing confidence describes predicted scope. Use held-out answer, evidence, latency and usage results to assess the strategy choice. [Benchmark guide](evaluation.md) · [Routing guide](routing.md)
 
@@ -1113,7 +1113,7 @@ python Code/examples/demo_rlm_verification.py --live --outstanding \
 
 The first full-corpus pass can exit 1 after saving partial progress. Each additional verification pass requires a new invocation with the explicit limits file. For the Amazon–Alphabet run, compare Amazon's paired semiconductor supplier excerpts (`b79aa2561327a953e141e2aa` and `4d1474550060251037c5f981`) and Alphabet's paired third-party equipment disclosures (`15787429383b3e9839f69716` and `62bad042e2e9d8334c2e6267`). Amazon states substantially the same AI supply dependency in both years. Alphabet states the deployment dependency in both years and names more cost drivers in FY2024. `python rlm-quality-positive-control.py rlm-amzn-googl-quality-live.json` audits candidate ranking, acknowledged text and retained evidence for those controls. The controls do not establish novelty.
 
-Native offline regressions replayed the six AMD excerpts and exercised abstention, both-year capture, a missing earlier-year mechanism, and failed finalization after capture. The Amazon–Alphabet fixture retained four year-specific findings and independently reviewed six cases across two authorized stub passes. The second pass reused the first pass's two settled comparisons. The quality workflow retained the 25-company and 50-target denominator across restart. A separate failure simulation left 20 companies eligible after the first six attempts. Continuation investigated all 20 under the new allowance, reusing the initial scan and preserving the failed child's accepted findings. No paid requests were made. Live capture behavior, comparative quality and resource consumption under the revised profile remain unmeasured.
+Native offline regressions replayed the six AMD excerpts and exercised abstention, both-year capture, a missing earlier-year mechanism, and failed finalization after capture. The Amazon–Alphabet fixture retained four year-specific findings and independently reviewed six cases across two authorized stub passes. The second pass reused the first pass's two settled comparisons. The quality workflow retained the 25-company and 50-target denominator across restart. A separate failure simulation left 20 companies eligible after the first six attempts. Continuation investigated all 20 under the new allowance, reusing the initial scan and preserving the failed child's accepted findings. No paid requests were made. At this stage only the offline profile had been measured. The final experiment below records the subsequent live results.
 
 
 ## Final stabilization before corpus-wide evaluation
@@ -1132,7 +1132,7 @@ The stabilization keeps the quality ceilings unchanged.
 - **Recovery and verification** offer at most one lexically related pair per selected company, from up to twelve distinct retained excerpts or excerpt sets per year. A fresh review judges the relationship and the original year-specific claims. Proposals, results, diagnostics, and usage are recorded separately from investigator comparisons. Previously omitted findings retain their original access history. Unclear one-year reviews can provide no earlier evidence and request a gap. Invalid cases retain bounded field and code diagnostics while valid peer results survive. Narrow checks flag categorical dependency language and shortage claims unsupported by competitive-capacity wording. Finding reports can quote reviewed evidence even when a comparison fails. Historical review records are preserved.
 - **Evaluation** keeps investigator metrics in new checkpoints so continuation can report company-level capture, rejection, provider usage, and latency. Root and shared verification usage stay in overall totals. Historical invocation telemetry can be supplied with the original detailed report.
 
-Offline checkpoint-only recovery loaded the two actual checkpoints and selected AMD's water/power pair and Alphabet's deployment-cost pair, including its previously omitted FY2023 finding. The scripted verifier assessed both as more specific later wording with the underlying risk already present. Reload preserved the original findings, access ledgers and verification history. The canonical demonstration completed **25 companies, 50 targets and 13 batches**, including the singleton. An initial failure simulation resumed 20 assignments with zero additional scan and a separate verification pass. These are offline control results. Live capture rates, verifier judgment quality and corpus-wide expense still need measurement.
+Offline checkpoint-only recovery loaded the two actual checkpoints and selected AMD's water/power pair and Alphabet's deployment-cost pair, including its previously omitted FY2023 finding. The scripted verifier assessed both as more specific later wording with the underlying risk already present. Reload preserved the original findings, access ledgers and verification history. The canonical demonstration completed **25 companies, 50 targets and 13 batches**, including the singleton. An initial failure simulation resumed 20 assignments with zero additional scan and a separate verification pass. These are offline control results. The subsequent full-corpus experiment measures live capture and resource use. Independent verifier accuracy remains unmeasured.
 
 ### Final live commands
 
@@ -1163,35 +1163,104 @@ python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality -
 
 python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live \
   --resume rlm-final-corpus-live-checkpoint.json --limits-file rlm-quality-full-limits.json \
-  --save-checkpoint rlm-final-corpus-live-checkpoint.json > rlm-final-corpus-continued-live.json
-
-python Code/examples/demo_rlm_verification.py --live --outstanding \
-  --checkpoint rlm-final-corpus-live-checkpoint.json --limits-file rlm-quality-verification-limits.json \
-  --save-checkpoint rlm-final-corpus-live-checkpoint.json > rlm-final-corpus-reviewed-live.json
-
-python rlm-stabilization-evaluate.py rlm-final-corpus-live-checkpoint.json > rlm-final-corpus-evaluation.json
+  --save-checkpoint rlm-final-corpus-continued-checkpoint.json > rlm-final-corpus-continued-live.json
 ```
 
-The initial corpus pass can exit 1 after saving partial progress. Repeat outstanding review with a newly authorized allowance and a distinct report filename. Use `--recover` with selected companies for missing matched mechanisms. The evaluator records positive controls and distinguishes supported evidence from completed assignments without findings. A completed assignment and a reviewed two-year relationship both leave filing-wide novelty open.
+The historical verification chain used the following inputs and outputs. Each row represents a separate authorization of the same limits. The command template describes the recorded experiment.
 
+```bash
+python Code/examples/demo_rlm_verification.py --live --outstanding \
+  --checkpoint "$input" --limits-file rlm-quality-verification-limits.json \
+  --save-checkpoint "$output" > "$report"
+```
+
+| Input checkpoint | Output checkpoint | Report |
+| --- | --- | --- |
+| `rlm-final-corpus-continued-checkpoint.json` | `rlm-final-corpus-reviewed-checkpoint.json` | `rlm-final-corpus-reviewed-live.json` |
+| `rlm-final-corpus-reviewed-checkpoint.json` | `rlm-final-review-pass2-checkpoint.json` | `rlm-final-review-pass2.json` |
+| `rlm-final-review-pass2-checkpoint.json` | `rlm-final-review-pass3-checkpoint.json` | `rlm-final-review-pass3.json` |
+
+## Final full-corpus experiment
+
+At the audited revision `44d9eba50e4c6111aaed63cac908576b2d783133`, the Sonnet 4.5 experiment used the `full-corpus-quality` profile and the Bedrock model configuration above. The artifacts record the profile and limits. The checkpoint does not attest the Git revision or deployed model ID. The question asked which companies introduced a new AI-related infrastructure risk in FY2024 relative to FY2023. The demo supplied the intent, discovery phrases and Item 1A scope programmatically. There was no natural-language interpretation request. The denominator was all 25 companies and both years, or 50 filing sections. Other sections could also contain relevant disclosures.
+
+Each tree allowed two company investigators, depth one, four partitions, 22 provider attempts, 18 corpus attempts, 160,000 tokens and 180 seconds. The initial allowance admitted three batches. Five of six investigators completed. AMD retained three findings before its protected finish failed schema validation and reached `finalization_attempt_limit`. The initial checkpoint retained 11 findings overall. Continuation admitted ten two-company batches covering AMD and the 19 untouched companies. No completed assignment repeated. All **13 actual batches were pairs**, with 26 child invocations and 52 partition assignments against the original 25 companies and 50 targets. The singleton described in the offline demonstration belongs to a different execution.
+
+The complete discovery cache matched across continuation. The first research run was an unchanged prefix of the continued checkpoint, including stable finding IDs, evidence references, quotations and access history. All three review checkpoints preserved the entire continued research state, including original comparisons, citations and counters. The canonical loader checked the snapshot identity, source metadata, chunk text, span offsets and access provenance. The final state was `execution_status=finished`, `research_status=incomplete`.
+
+| Execution | Provider attempts | Reported tokens | Estimated tokens | Measured seconds | Newly settled reviews |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Initial research | 39 | 222,632 | 263,866 | 124.30 | — |
+| Continuation increment | 141 | 794,092 | 941,207 | 401.83 | — |
+| Research subtotal | 180 | 1,016,724 | 1,205,073 | 526.14 | — |
+| Initial review | 16 | 40,636 | 48,729 | 68.60 | 29 |
+| Review pass 2 | 16 | 37,217 | 46,542 | 48.11 | 29 |
+| Review pass 3 | 10 | 24,001 | 29,331 | 34.87 | 18 |
+| Review subtotal | 42 | 101,854 | 124,602 | 151.57 | 76 |
+| Combined | 222 | 1,118,578 | 1,329,675 | 677.71 | 76 |
+
+Provider attempts count requests. Reported tokens sum available input, output and any recorded cache-token counters. Estimates are separate request-budget estimates. No attempt lacked usage. The initial detailed trace records 211,303 input and 11,329 output tokens. Continuation and verification totals omit that split, so full-run monetary cost is unavailable. Seconds sum measured run intervals, excluding time between authorizations. Subtotals use unrounded times.
+
+Research charged 54 + 180 corpus tool attempts and 6 + 20 finding submission calls. Accepted finding references numbered 11 + 33, with 1 + 1 rejected record diagnostics. The lexical inventory scan charged 328 pages, 50 section metadata reads and 3,038 scanned chunks initially and zero on continuation. Scanning a chunk does not measure delivery or understanding.
+
+### Evidence yield and assessment inventory
+
+Eleven companies retained both years (AMD, AMZN, BAC, GOOGL, HD, JPM, META, MSFT, PFE, PG and V). COST retained FY2024 alone. The other 13 completed with zero retained findings. All 50 merged target access records remained partial and none recorded complete section text. All 25 novelty conclusions remain unresolved. No observed trace establishes the prevalence of risks among the zero-finding companies.
+
+| Cases | Supported | Partially supported | Insufficient evidence | Unverified | Total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Findings | 34 | 7 | 3 | 0 | 44 |
+| Comparisons | 27 | 5 | 0 | 1 | 33 |
+| Total | 61 | 12 | 3 | 1 | 77 |
+
+Assessment completion was 76/77 (98.7%). These are model judgments on selected evidence. No independent accuracy measurement or exhaustive coverage estimate follows. `findings_with_verifier_support` includes both full and partial support (41/44). Historical comparisons deduplicate identical serialized records. Current comparisons retain the latest run's set per ticker and normalized risk label. Both inventories contain 33 records here, across 29 ticker/label keys. Related labels and multiple assessments of the same passages preclude interpreting the count as unique semantic claims. Later passes selected only outstanding cases and preserved all settled reviews.
+
+Selected passages received `same_risk` for AMD power/water, AMZN semiconductor suppliers and META technical infrastructure, and `more_specific_wording` for AMD. HD, MSFT and PG each had a `different_risk` relationship between selected passages. That outcome cannot establish absence from an earlier filing. A separate HD assessment of AI implementation and integration remains unverified, ID `552b49c73bd1e1044a5c0c240c19178cfe4e87eb7ebe3dc58af0ba1df23ba687`. All three attempts recorded `invalid_assessment`, successively diagnosing `assessment/value_error`, `components.2.statement/string_too_long` and `comparison.earlier_year/inconsistent_support`.
+
+The local evaluator intersects configured control chunk IDs with direct-span or whole-chunk access for receipt, and with retained finding evidence chunk IDs for retention. Amazon accepts either overlapping chunk in each year. Citation membership is a separate test. Checking the offsets confirms that AMD's water/power sentence and Amazon's supplier disclosure were delivered and retained in both years. Alphabet's FY2023 control had neither receipt nor retention. Its FY2024 deployment sentence was delivered at `62bad042e2e9d8334c2e6267:634:926` without a retained finding on that chunk. A chunk hit alone would also match another sentence from the same chunk.
+
+The **separate earlier recoveries** gave AMD a supported shared water/power dependency with a more specific FY2024 potential revenue consequence. Alphabet's recovery supported the FY2023 component. Both FY2024 components were contradicted, with the same recorded gap, “e2 states 'may depend' not 'depends'”. The raw relationship was more specific wording, but the report withheld a verified relationship. These recoveries contribute zero to the full-corpus totals.
+
+For offline reproduction with the saved root artifacts, run the following from the repository root. It uses the canonical loader, merged coverage and report functions. The earlier `rlm-final-corpus-evaluation.json` describes the first review stage.
+
+```bash
+set -o pipefail
+PYTHONPATH=Code/src python rlm-stabilization-evaluate.py rlm-final-review-pass3-checkpoint.json | diff -u rlm-final-evaluation.json -
+```
+
+### Answer and integration decision
+
+The initial research answer reports batch progress and defers substantive conclusions. The continued output has `result=null`; its checkpoint report lists company yield and unverified risk labels. After three reviews the answer contains qualified excerpts and supported components, interleaved with 25 assignment summaries. For example, “Verifier-supported component. Reliance on a limited group of suppliers for semiconductor products related to AI infrastructure such as GPUs”. The structured relationship and evidence fields are more informative than the text for some comparisons.
+
+* **Verified publication.** The saved answer used one sentence for two relationships, omitted the different-risk judgment and collected ordinary comparison sources from components alone. Recoveries collected relationship sources without printing their IDs. The corrected renderer gives each eligible relationship distinct wording, preserves its evidence pointers in ordinary conclusions, and cites the original chunks inline for both ordinary and recovered relationships. Different-risk judgments leave filing-wide novelty unresolved. Existing verification and disagreement rules still govern publication.
+* **Integration blockers for general dispatch.** `interpretation.py:44–49` supports descriptive disclosure review and only an explicit two-fiscal-year AI-infrastructure comparison. The demo's scripted scope and `comparison.py:74` risk taxonomy cannot validate comparative financial or other arbitrary benchmark questions. `discovery.py:229–249` gates domain-specific context ranking on the topic. Scope-aware routing would need to recognize unsupported questions. `corpus_research.py:432–439` defers the quality-profile answer to optional paid verification. A caller expecting a substantive answer from research alone needs a qualified answer projection or an explicit result mode.
+* **Citation contract.** Original `citations` belong to research. `finding_citations` covers supported finding excerpts, including those available only in structured data. `conclusion_citations` covers published comparative components and relationships. The additive `answer_citations` contains exactly the sources printed in the verified answer, deduplicated by canonical chunk ID in first citation order. Exact quotes and spans remain available through finding evidence. The shared `ResearchResponse` expects canonical `Chunk` citations and one verification status, so an adapter still needs to resolve `EvidenceRef` and preserve interpretation outcome, failed/pending execution, evidence gaps and per-case support. `research_status` has no dedicated evidence-abstention value.
+* **Empirical limitations.** Sparse two-year capture, missed positive controls, overlapping claims, model judgments, 1.12 million reported tokens and 678 measured seconds make general routing and cost-effectiveness unproven. Comparative evaluation requires reviewed benchmark questions, including answerable and abstention cases. Presentation brevity is an optional optimization after the citation and result contracts are settled.
+
+The offline publication replay increased distinct printed IDs from 27 to 31 and conclusion citations from 17 to 21, including MSFT's earlier water-risk chunk `4815881d3fdefcf0a17e31d7`. AMD's supported recovery now cites both years inline. Alphabet's contradicted recovery remains unresolved. Every printed ID matched the answer citation collection and canonical evidence. The 44 findings, 33 historical comparisons, judgments, one outstanding comparison, incomplete research status, 25 unresolved novelty conclusions and resource totals matched the saved reports. The focused verification, comparison, checkpoint and corpus-reporting suites passed **146 tests** offline.
 
 ## Issue #16 acceptance review
 
-The branch provides the bounded RLM-inspired strategy, runnable examples and audit records requested by the issue. The branch diff from its mainline base contains only RLM modules, examples, tests and this guide. [Issue #16](https://github.com/ibrahimhamza01/EvidenceRoute/issues/16)
+The criteria below refer to the [issue checklist](https://github.com/ibrahimhamza01/EvidenceRoute/issues/16). Implementation evidence is relative to `Code/src/evidenceroute/research/rlm/` unless specified.
 
-| Criterion | Acceptance evidence |
-| --- | --- |
-| Documented architecture and read-only canonical corpus | Implemented. Canonical integrity checks cover all 75 filings. The environment exposes metadata, original sections and chunks, and scoped search. |
-| Recursive investigation and aggregation across companies and years | Implemented. The offline depth-two demo exercises root, child and grandchild. Live Sonnet 4.5 runs demonstrate delegation, acknowledged results and multi-company, multi-year synthesis on bounded subsets. |
-| Intermediate provenance, final citations and inspectable coverage | Implemented and exercised offline and live. Findings carry stable IDs, exact excerpts and original SEC metadata. Coverage reports measure acknowledged access against the original plan. Lexical scans, access and semantic assessment have separate counters. |
-| Uncertainty, conflict and follow-up | Implemented. Root follow-up and explicit targeted continuation operate within scope and budget. Offline tests exercise failed-child retention and same-company historical delivery. The live continuation demonstrates cross-process resume of a pending company. Live verification exercises qualified comparative outcomes and produces evidence-gap recommendations. |
-| Bounded execution and observability | Implemented. Shared and local limits cover depth, calls, partitions, tokens, time and retries. Traces record run and invocation IDs, evidence, stops, usage, latency and incomplete scope. USD cost estimates remain unreported. They require applicable model rates and sufficient usage counters. |
-| Incomplete result handling | Implemented and exercised offline and live. Execution can finish while research remains incomplete. The full-corpus offline demo scheduled every group with scripted investigators. Live investigations covered subsets, and exhaustive novelty or absence across all 25 companies remains unestablished. |
-| Tests and reproducible Sonnet 4.5 demonstration | Mocked and scripted suites run without paid calls. The course setup and opt-in live commands reproduce the documented paths. The closeout uses saved live results. |
+| Criterion | Verdict | Implementation and demonstration | Qualification |
+| --- | --- | --- | --- |
+| Document architecture and operational definition | Satisfied | Architecture and control flow above describes the external environment, root, children, aggregation and stopping. | Bounded RLM-inspired strategy. |
+| Read-only access to all 75 filings | Satisfied | `environment.py:71`; environment and canonical hash/provenance regressions. | The experiment selected 50 sections. |
+| Recursively analyze selected subsets | Satisfied | `recursive.py:88`; scripted grandchild aggregation in `test_rlm_recursive.py:365`, 26 live children. | Live profile depth one. |
+| Preserve original SEC provenance | Satisfied | `findings.py:108`, `checkpoint_validation.py:57`; reloaded all five research/review snapshots. | Source identity and quotation checks do not measure entailment. |
+| Aggregate companies and fiscal years | Satisfied | `execute_corpus_research`, `verification_report`; live multi-company cross-year records. | Only 11 companies yielded both years. |
+| Inspect corpus coverage | Satisfied | `ResearchCheckpoint.merged_coverage`; 50-target ledger with discovery, access and finding references. | Lexical and semantic coverage differ. |
+| Trigger additional investigation on uncertainty/conflict | Satisfied | `verification.py:487` derives scoped gaps, `checkpoint.py:232` selects follow-up, bounded reinvestigation tests and earlier live recoveries. | Final reviews selected saved evidence. No automatic commitment to close every gap. |
+| Track depth, tokens, calls and latency | Satisfied | Invocation tree, `CorpusUsage`, `VerificationUsage`; five run intervals and zero missing usage records. | No complete directional billing totals. |
+| Bound execution with configurable limits | Satisfied | `budget.py:78`, `CorpusLimits`, verification caps; live batch and finalization stops and mocked budget regressions. | Cooperative time checks and transport timeouts. |
+| Trace final claims to original passages | Satisfied | The offline publication replay resolved all 31 printed IDs, including relationship citations, to canonical evidence. Structured pointers preserve exact spans. | Traceability applies to the evidence cited by the renderer. Semantic judgment quality is a separate evaluation question. |
+| Qualify incomplete coverage | Satisfied | `checkpoint.py:146`, `verification.py:569`; saved final answer explicitly leaves novelty unresolved. | Completion applies to assignments or assessments only. |
+| Run automated tests without paid calls | Satisfied | Scripted clients, mock Converse transports and native regression tests, including continuation and verification. | No independent human validation. |
+| Document reproducible Sonnet 4.5 demonstration | Satisfied | Demo, profile, historical invocation chain, limit files/values and offline evaluation above. | Access and local artifacts are prerequisites; live judgments can vary. |
+| Preserve ingestion, retrieval and RAG regressions | Partially satisfied | Canonical regeneration, BM25, RAG, provenance and selected dense/hybrid tests passed. | The full dense/hybrid sweep was not certified in this audit. |
 
-Closeout passed 399 focused RLM tests, 53 retrieval, RAG provenance and canonical-integrity regressions, and 40 ingestion, benchmark and routing tests. The optional all-module sweep was stopped during local dense-model indexing. The offline question demo returned a cited answer with partial coverage, finished execution and incomplete research. Closeout made zero live provider calls.
-
-The supported natural-language scope, cooperative deadlines and selected-span granularity remain material limits for evaluation. Model verification can miss unsupported components or reject otherwise useful cases. Full-corpus semantic quality, repeatability, routing benefit and cost-effectiveness remain evaluation questions for the existing benchmark.
+The earlier closeout recorded 399 focused RLM, 53 retrieval/RAG/canonical and 40 ingestion/benchmark/routing passes. The final offline audit ran **572 distinct passing cases**, with 30 dense/hybrid cases deselected. No implementation changes or live requests were made for this audit.
 
 ## Ongoing engineering record
 

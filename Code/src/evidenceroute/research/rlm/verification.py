@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from time import monotonic
 from typing import Annotated, Callable
@@ -20,7 +21,7 @@ from evidenceroute.research.rlm.comparison import Comparison, ranked_cross_year_
 from evidenceroute.research.rlm.coverage import SectionTarget
 from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import Finding
-from evidenceroute.research.rlm.tools import StrictInput, observation_json
+from evidenceroute.research.rlm.tools import EvidenceRef, StrictInput, observation_json
 from evidenceroute.research.rlm.verification_records import (
     CaseKind, ComparisonReview, ComponentReview, ComponentStatus, EarlierYearEvidence, EvidencePointer,
     RecoveryCandidate, ReviewDiagnostic, ReviewEvidenceError, RiskRelationship, UnverifiedReason, VerificationItem, VerificationLimits, VerificationRun, VerificationUsage,
@@ -484,8 +485,19 @@ def _outstanding_reviews(checkpoint: ResearchCheckpoint, latest: dict, current: 
     return finding_ids, comparison_ids
 
 
+_RELATIONSHIP_TEXT = {
+    "same_risk": "The selected earlier and later disclosures describe the same underlying risk.",
+    "more_specific_wording": (
+        "The later disclosure provides more specific wording about an underlying risk described in both years."
+    ),
+    "different_risk": (
+        "The selected disclosures describe different underlying risks. Filing-wide novelty remains unresolved."
+    ),
+}
+
+
 def verification_report(checkpoint: ResearchCheckpoint) -> dict:
-    """Summarize latest usable reviews and suggest scoped work without launching it."""
+    """Summarize saved reviews, with answer_citations in order of first citation."""
     latest = _latest_reviews(checkpoint)
     cases = _cases(checkpoint)
     items = tuple(latest[case.key] if case.key in latest else case.unverified("not_requested") for case in cases)
@@ -548,6 +560,7 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
             "verified_relationship": verified_relationship,
             "status": review.status, "disagreement_unresolved": target_id in disputed,
             "novelty": "unresolved",
+            "relationship_evidence": review.comparison.relationship_evidence if verified_relationship else (),
             "supported_components": supported if review.status in {"supported", "partially_supported"} else (),
         })
     recovered = []
@@ -567,7 +580,20 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
         })
     comparative = checkpoint.plan.intent.objective == "year_over_year"
     answer = ["No filing-wide novelty conclusion is established." if comparative else "Selected-evidence review."]
-    final_sources = {}
+    conclusion_sources: dict[str, EvidenceRef] = {}
+    answer_sources: dict[str, EvidenceRef] = {}
+
+    def cite(sources: Iterable[EvidenceRef], *, conclusion: bool = False) -> str:
+        unique = {source.chunk_id: source for source in sources}
+        answer_sources.update(unique)
+        if conclusion:
+            conclusion_sources.update(unique)
+        return "[" + ", ".join(unique) + "]"
+
+    def cite_conclusion(pointers: tuple[EvidencePointer, ...]) -> str:
+        sources = (findings[pointer.finding_id].evidence[pointer.evidence_index].source for pointer in pointers)
+        return cite(sources, conclusion=True)
+
     finding_conclusions = tuple(item for item in items if item.kind == "finding")
     by_ticker = {}
     for conclusion in conclusions:
@@ -617,29 +643,31 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
             "comparisons": len(by_ticker.get(ticker, ())), "novelty_unresolved": comparative,
         })
         for recovery in recovered_by_ticker.get(ticker, ()):
-            relationship = recovery["verified_relationship"] or "unresolved"
-            answer.append(f'  Checkpoint recovery [{recovery["status"]}]. Relationship {relationship}.')
-            for pointer in recovery["relationship_evidence"] if recovery["verified_relationship"] else ():
-                source = findings[pointer.finding_id].evidence[pointer.evidence_index].source
-                final_sources[source.chunk_id] = source
+            relationship = recovery["verified_relationship"]
+            summary = "The relationship remains unresolved."
+            if relationship:
+                summary = f'{_RELATIONSHIP_TEXT[relationship]} {cite_conclusion(recovery["relationship_evidence"])}'
+            answer.append(f'  Checkpoint recovery [{recovery["status"]}]. {summary}')
         if not any(item["verified_relationship"] for item in (
             *by_ticker.get(ticker, ()), *recovered_by_ticker.get(ticker, ()),
         )):
             for entry in finding_excerpts.get(ticker, ())[:4]:
                 for evidence in entry["evidence"]:
-                    answer.append(f"  Reviewed FY{evidence.source.fiscal_year} excerpt [{evidence.source.chunk_id}]. {evidence.quote}")
+                    citation = cite((evidence.source,))
+                    answer.append(f"  Reviewed FY{evidence.source.fiscal_year} excerpt {citation}. {evidence.quote}")
         for conclusion in by_ticker.get(group.ticker, ()):
             disagreement = " Investigator disagreement remains unresolved." if conclusion["disagreement_unresolved"] else ""
             answer.append(f'  {conclusion["risk_label"]} [{conclusion["status"]}].{disagreement}')
-            if conclusion["verified_relationship"] in {"same_risk", "more_specific_wording"}:
-                answer.append("  The verifier found a shared underlying risk in the selected earlier and later excerpts.")
+            relationship = conclusion["verified_relationship"]
+            if relationship:
+                citation = cite_conclusion(conclusion["relationship_evidence"])
+                answer.append(f"  {_RELATIONSHIP_TEXT[relationship]} {citation}")
+            elif not disagreement:
+                answer.append("  The relationship remains unresolved.")
             if not disagreement:
                 for component in conclusion["supported_components"]:
-                    sources = tuple(dict.fromkeys(findings[pointer.finding_id].evidence[pointer.evidence_index].source
-                                                  for pointer in component.evidence))
-                    final_sources.update((source.chunk_id, source) for source in sources)
-                    chunks = ", ".join(source.chunk_id for source in sources)
-                    answer.append(f"  Verifier-supported component. {component.statement} [{chunks}]")
+                    citation = cite_conclusion(component.evidence)
+                    answer.append(f"  Verifier-supported component. {component.statement} {citation}")
     pending_findings, pending_comparisons = _outstanding_reviews(checkpoint, latest, current)
     outstanding = {"findings": len(pending_findings), "comparisons": len(pending_comparisons)}
     if recovered:
@@ -651,7 +679,8 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
         "assignment_evidence": tuple(assignments),
         "continuation_companies": tuple(group.ticker for group in plan_continuation(checkpoint).groups),
         "outstanding_verification": outstanding,
-        "citations": checkpoint.citations, "conclusion_citations": tuple(final_sources.values()),
+        "citations": checkpoint.citations, "conclusion_citations": tuple(conclusion_sources.values()),
+        "answer_citations": tuple(answer_sources.values()),
         "finding_conclusions": finding_conclusions, "original_findings": checkpoint.findings,
         "original_comparisons": checkpoint.comparisons,
         "items": items, "comparative_novelty": novelty, "evidence_gaps": tuple(recommendations),

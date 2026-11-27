@@ -21,7 +21,7 @@ from evidenceroute.research.rlm.tools import observation_json
 from evidenceroute.research.rlm.verification import (
     BedrockSemanticVerifier, VerificationLimits, record_verification, verification_report, verify_checkpoint,
 )
-from evidenceroute.research.rlm.verification_records import comparison_id
+from evidenceroute.research.rlm.verification_records import RecoveryCandidate, comparison_id
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 
@@ -117,6 +117,10 @@ def test_apple_reviews_compound_claims_from_selected_spans_and_preserves_incompl
     assert report["required_targets"] == 1 and len(report["evidence_gaps"]) == 2
     assert all(item.partitions == apple.plan.resolved_targets for item in report["evidence_gaps"])
     assert report["research_usage"].provider_attempts == 0 and report["combined_usage"].provider_attempts == 2
+    source = apple.findings[0].evidence[0].source
+    assert report["answer_citations"] == report["finding_citations"] == (source,)
+    assert report["conclusion_citations"] == ()
+    assert report["answer"].count(f"excerpt [{source.chunk_id}]") == 3
     assert "private provider content" not in observation_json(report)
 
 
@@ -138,7 +142,113 @@ def test_alphabet_distinguishes_more_specific_wording_from_explicit_contradictio
     assert "Investigator judgment" not in json.dumps(contexts)
     updated = record_verification(alphabet, corpus, run)
     assert updated.comparisons == alphabet.comparisons and updated.research_status == "incomplete"
-    assert verification_report(updated)["evidence_gaps"][0].partitions == alphabet.plan.resolved_targets[:1]
+    report = verification_report(updated)
+    assert report["evidence_gaps"][0].partitions == alphabet.plan.resolved_targets[:1]
+    assert all(c["disagreement_unresolved"] and c["verified_relationship"] is None for c in report["conclusions"])
+    assert all(not c["relationship_evidence"] for c in report["conclusions"])
+    assert report["conclusion_citations"] == report["answer_citations"] == ()
+    assert "Investigator disagreement remains unresolved." in report["answer"]
+
+
+@pytest.mark.parametrize(("relationship", "comparison_index", "statement"), [
+    ("same_risk", 1, "The selected earlier and later disclosures describe the same underlying risk."),
+    ("more_specific_wording", 1,
+     "The later disclosure provides more specific wording about an underlying risk described in both years."),
+    ("different_risk", 2,
+     "The selected disclosures describe different underlying risks. Filing-wide novelty remains unresolved."),
+    ("unclear", 2, None),
+])
+def test_report_cites_relationship_evidence_separately_from_components(
+    corpus, alphabet, demo, relationship, comparison_index, statement,
+):
+    comparison = alphabet.comparisons[comparison_index]
+    research_run, = alphabet.runs
+    checkpoint = alphabet.model_copy(update={"runs": (
+        research_run.model_copy(update={"root_comparisons": (comparison,)}),
+    )})
+    unverified = verification_report(checkpoint)
+    assert unverified["conclusions"][0]["verified_relationship"] is None
+    assert unverified["answer_citations"] == ()
+
+    def response(payload):
+        reviews = []
+        for case in _cases(payload):
+            review = demo["_fixture_review"](case)
+            if case["kind"] == "comparison":
+                review["comparison"]["relationship"] = relationship
+                review["components"][0]["evidence"] = ["e2"]
+            reviews.append(review)
+        return _native(reviews)
+
+    run = verify_checkpoint(checkpoint, corpus, _client(Transport(response)), limits=VerificationLimits(),
+                            finding_ids=() if relationship == "unclear" else None)
+    updated = record_verification(checkpoint, corpus, run)
+    report = verification_report(updated)
+    conclusion, = report["conclusions"]
+    review = next(item for item in run.items if item.kind == "comparison")
+    assert conclusion["novelty"] == "unresolved"
+
+    earlier, later = (
+        next(f.evidence[0].source for f in alphabet.findings if f.finding_id == fid)
+        for fid in comparison.finding_ids
+    )
+    if statement is None:
+        assert conclusion["verified_relationship"] is None and not conclusion["relationship_evidence"]
+        assert review.comparison.relationship_evidence
+        assert "The relationship remains unresolved." in report["answer"]
+        assert f"Verifier-supported component. {review.components[0].statement} [{later.chunk_id}]" in report["answer"]
+        assert report["answer_citations"] == report["conclusion_citations"] == (later,)
+    else:
+        assert conclusion["verified_relationship"] == relationship
+        assert conclusion["relationship_evidence"] == review.comparison.relationship_evidence
+        assert f"{statement} [{earlier.chunk_id}, {later.chunk_id}]" in report["answer"]
+        assert report["answer_citations"] == report["conclusion_citations"] == (earlier, later)
+        assert set(report["finding_citations"]) > {earlier, later}
+    assert "Reviewed FY" not in report["answer"]
+    assert report["citations"] == alphabet.citations
+    assert report["original_findings"] == alphabet.findings
+    assert report["original_comparisons"] == (comparison,)
+    assert tuple(item for item in report["items"] if item.status != "unverified") == run.items
+    assert report["research_usage"] == alphabet.cumulative_usage
+    assert report["verification_usage"] == run.usage
+
+
+@pytest.mark.parametrize("status", ["supported", "partially_supported", "contradicted"])
+def test_report_cites_only_publishable_recovery_relationships(corpus, alphabet, status):
+    earlier, later, _ = alphabet.findings
+    proposal = RecoveryCandidate(ticker="GOOGL", years=(2023, 2024), finding_ids=(earlier.finding_id, later.finding_id))
+
+    def response(payload):
+        case, = _cases(payload)
+        components = [{"statement": "Supply interruptions can delay expansion.", "status": "supported", "evidence": ["e1"]}]
+        if status == "partially_supported":
+            components.append({"statement": "The delay is certain.", "status": "insufficient_evidence",
+                               "evidence": [], "gap": "The disclosure describes a possibility."})
+        elif status == "contradicted":
+            components[0]["status"] = "contradicted"
+        return _native([{
+            "ref": case["ref"], "components": components,
+            "comparison": {"relationship": "more_specific_wording", "relationship_evidence": ["e1", "e2", "e3"],
+                           "earlier_year": "supports_risk", "earlier_evidence": ["e1"]},
+        }])
+
+    run = verify_checkpoint(alphabet, corpus, _client(Transport(response)), limits=VerificationLimits(),
+                            finding_ids=(), comparison_ids=(), recovery_ids=(proposal.target_id,), proposals=(proposal,))
+    report = verification_report(record_verification(alphabet, corpus, run))
+    recovery, = report["recovered_comparisons"]
+    assert recovery["status"] == status
+    assert recovery["relationship_evidence"] == run.items[0].comparison.relationship_evidence
+    assert recovery["novelty"] == "unresolved"
+    if status == "contradicted":
+        assert recovery["verified_relationship"] is None
+        assert report["answer_citations"] == report["conclusion_citations"] == ()
+        assert "Checkpoint recovery [contradicted]. The relationship remains unresolved." in report["answer"]
+    else:
+        assert recovery["verified_relationship"] == "more_specific_wording"
+        sources = (earlier.evidence[0].source, later.evidence[0].source)
+        assert report["answer_citations"] == report["conclusion_citations"] == sources
+        assert (f"Checkpoint recovery [{status}]. The later disclosure provides more specific wording about an "
+                f"underlying risk described in both years. [{sources[0].chunk_id}, {sources[1].chunk_id}]") in report["answer"]
 
 
 @pytest.mark.parametrize("problem", ["nonmention_contradiction", "wrong_year", "missing_year", "different_risk"])
