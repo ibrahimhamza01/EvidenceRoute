@@ -1300,7 +1300,75 @@ Structured callers can set up to eight `ResearchIntent.required_operands` using 
 
 Checkpoint v4 stores structured requirements and conclusion state in the plan and invocation ledger, including the local receipt IDs needed to check bindings. Loading rechecks root ownership, selection, acknowledgement, canonical evidence and operands. Continuations retain earlier records and may bind historical findings after scoped delivery. Versions 1–3 retain their original meaning and receive no inferred selections or conclusions. Finding-level reviews leave generic conclusions semantically unverified. Entailment, numerical accuracy, sufficiency and filing-wide absence remain outside the structural checks.
 
-From the repository root, run `PYTHONPATH=Code/src python -m pytest -q Code/tests/test_rlm_synthesis.py` for the scripted cases, or use `Code/tests/test_rlm*.py` for the full RLM regression. The tests exercise companies, source years, sections, reporting-period anchors, conflicts, rejected bindings, split batches, citation order, checkpoint tampering and continuation. These offline cases measure contract behavior. Model accuracy and natural-language operand extraction remain open.
+From the repository root, run `PYTHONPATH=Code/src python -m pytest -q Code/tests/test_rlm_synthesis.py` for the scripted cases, or use `Code/tests/test_rlm*.py` for the full RLM regression. The tests exercise companies, source years, sections, reporting-period anchors, conflicts, rejected bindings, split batches, citation order, checkpoint tampering and continuation. These offline cases measure contract behavior. Live model accuracy remains open. Natural-language operand extraction is specified in the next milestone and is still scripted, not live.
+
+## Milestone 3 — generalized natural-language interpretation
+
+### Problem and baseline
+
+Milestone 2 can bind a generic conclusion to canonical ticker, filing year, and section operands, but the natural-language interpreter only admitted a descriptive review or a two-fiscal-year AI-infrastructure comparison. An ordinary cross-company, cross-year, or cross-section filing question was rejected or would have been forced onto the specialized comparison executor. At `08324d70` that executor still owns novelty judgments, literal two-year scans, and the historical ranking path.
+
+### Hypothesis
+
+A separate interpretation mode can preserve a comparison through validation and correction while the stored research objective remains `review`. The existing generic discovery, research, synthesis, and publication path can then answer filing-grounded comparisons without a new executor.
+
+### Solution and alternatives
+
+`generic_synthesis` is an interpretation mode, not an execution mode. Its `ResearchIntent.objective` stays `review`, so discovery remains the ordinary phrase scan and the root stays a generic root. The specialized `ai_infrastructure_comparison` mode still requires objective `year_over_year`, exactly two fiscal years, and comprehensive review. Adding a third research objective was rejected because `year_over_year` already selects comparative execution whenever discovery is present.
+
+The interpreter may now use `section_selection: inferred` for inventory section IDs when the question names none. The host records `section_ids` as inferred and appends the inventory explanation. Unnamed risk-factor questions still use the Item 1A default. Named sections, including unavailable ones, stay explicit. Inferred IDs that are not in the inventory are rejected rather than replaced.
+
+For cross-source questions the interpreter fills `required_operands` with two to eight `SourceOperand` bindings. The host canonicalizes an unambiguous company alias to its ticker, checks each operand against the requested companies, filing years, and sections, and keeps unavailable operands on the intent. It does not invent `period_text`. A bare year or any anchor that is not a literal substring of the question is rejected. One filing that already discloses several periods stays a review of that filing year, with no required operands and no second finding. More than eight companies, filing years, explicit sections, or operands — including a corpus-wide comparison on this 25-company snapshot — returns `unsupported_operand_capacity` instead of a shorter operand list.
+
+A correction cannot change `generic_synthesis` into a review, drop a preserved company, year, section, or operand, or replace an inferred section. Ranking, forecasting, external data, and arbitrary calculation stay unsupported when the interpreter says so. The host does not rewrite those judgments into a descriptive review.
+
+Root guidance and the existing generic-root prompt both receive the original question and the required operands. Generic discovery does not add AI-infrastructure context anchors unless the topic itself contains both signals. That boost and the compact comparative prompt remain on the specialized path.
+
+### Supported question contract
+
+| Question | Mode | Execution |
+| --- | --- | --- |
+| Descriptive disclosure, including a corpus-wide description | `review` | Generic research. No required operands. |
+| Risk factors with no named section | `review` or `generic_synthesis` | Item 1A is supplied and marked inferred. |
+| Named section, available or not | either ready mode | Explicit IDs are preserved. Unavailable targets stay missing. |
+| Section implied by the inventory but not named | either ready mode | `inferred`, limited to inventory IDs, with an explanation. |
+| Cross-company, cross-year, or cross-section comparison within eight operands | `generic_synthesis` | Generic research. Objective remains `review`. |
+| Comparative figures stated inside one filing | `review` | That filing year only. One atomic finding can answer. |
+| Two-year AI-infrastructure novelty | `ai_infrastructure_comparison` | Existing comparative executor. |
+| Ranking, forecast, external data, arbitrary calculation, or more than eight required sources | `unsupported` | No plan. |
+| Missing company, year, or section identity | `ambiguous` | No plan. |
+
+### Interpretation assumptions
+
+Named comparison years are filing fiscal years. A year discussed inside a filing is not a second filing year. Relative periods are ambiguous. The latest snapshot year is still the default only for a review that names no year. Company aliases map to one inventory ticker or stay verbatim. Corpus-wide scope is still `company_selection: all` and does not silently drop a named company. Comprehensive review is required for a generic synthesis and for the AI comparison, and it does not add companies, years, or sections. An operand is required only for a source the conclusion must bind, not for every partition in the scan. `period_text` is empty until a quoted excerpt can contain a literal anchor, and the interpreter may supply one only when that non-year phrase already appears in the question. Conclusions remain `semantic_status: unverified`. A missing operand or a lexical miss does not establish filing-wide absence.
+
+### Verification
+
+Verification used the local full-v1 snapshot (25 companies, fiscal years through 2024, sections `item_1`, `item_1a`, `item_1c`, `item_7`, `item_8`, and `item_15`). The interpreter was a mocked Converse client. Research was a scripted recursive client. No paid provider call and no live model trial were run. Development questions `q045`, `q029`, `q042`, and `q024` are not in this checkout, so they were not executed and no gold evidence was loaded. Each scripted case is one trial. Live token, latency, and accuracy metrics are unavailable.
+
+The scripted cases cover an inferred business-section review, a non-AI FY2023–FY2024 foreign-exchange comparison, a three-year business comparison, an Apple–Amazon comparison, a business-versus-MD&A comparison, comparative periods disclosed inside one FY2024 filing, unavailable operands, ambiguous and unsupported objectives, operand-capacity refusal, a correction that drops a year or operand or the synthesis mode, generic discovery without AI anchors, the legacy AI comparison, a token-budget stop, and an unbound conclusion. The Apple–Amazon result reloaded from checkpoint v4 with the same operands, unverified conclusion, and absence qualification.
+
+From the repository root:
+
+```bash
+PYTHONPATH=Code/src PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
+  Code/tests/test_rlm_natural_language.py \
+  Code/tests/test_rlm_planning.py \
+  Code/tests/test_rlm_discovery.py \
+  Code/tests/test_rlm_synthesis.py \
+  Code/tests/test_rlm_corpus_research.py \
+  Code/tests/test_rlm_checkpoint.py
+```
+
+That focused set passed **177** tests. `test_rlm_comparison.py` and `test_rlm_recursive.py` passed **152** more. `rlm-publication-replay.py` and `rlm-stabilization-evaluate.py rlm-final-review-pass3-checkpoint.json` reproduced the saved historical publication: 44 findings, 33 comparisons, 31 answer chunks, 21 conclusion chunks, 10 relationships, one outstanding comparison, incomplete research, 25 unresolved novelty conclusions, and unchanged judgments and usage. `git diff --check` reported no whitespace errors.
+
+### Before and after
+
+Before, a comparison of Apple's FY2023 and FY2024 foreign-exchange risk was unsupported unless it was restated as the AI-infrastructure task. After, a scripted interpretation plans a generic review of AAPL Item 1A for 2023 and 2024, requires those two operands, and publishes one unverified conclusion. A three-year plan keeps three operands. A nine-company comparison is refused with the eight-operand limit instead of keeping eight companies. The historical AI checkpoint is unchanged.
+
+### Trade-offs and limitations
+
+The host trusts the interpreter’s mode. It will not convert an explicit unsupported or ambiguous judgment into a review, and it will not parse the question itself to decide that one filing already contains the comparison. Live prompt compliance is unmeasured. Generic conclusions are structurally bound and semantically unverified. A comprehensive scripted comparison can still publish as `partial` because the script does not read every chunk in the section. Relationships split across roots, full-filing requests, and comparisons above eight operands remain out of scope. Ranking, forecasting, external data, and arbitrary calculation are still refused. Live validation is blocked until a provider run is separately authorized; this milestone did not start one.
 
 ## Ongoing engineering record
 

@@ -1,8 +1,10 @@
 """Verify the question entry point through mocked Bedrock Converse responses."""
 
 import json
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import asdict
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -103,12 +105,12 @@ CONFIG = BedrockConfig(model="offline", max_retries=1)
 
 
 def _run(corpus, transport, *, question=QUESTION, research_factory=None, clock=None, interpretation_limits=None,
-         interpreter_factory=None, **limits):
+         interpreter_factory=None, shared_limits=None, **limits):
     def unexpected(_):
         pytest.fail("Research must be blocked by scope, status, or overall limits.")
 
     clock = clock if clock is not None else Clock()
-    runner = RecursiveResearch(corpus, research_factory or unexpected, shared_limits=SHARED, clock=clock)
+    runner = RecursiveResearch(corpus, research_factory or unexpected, shared_limits=shared_limits or SHARED, clock=clock)
     return research_question(
         question, runner, limits=_limits(**limits), interpretation_limits=interpretation_limits,
         interpreter_factory=interpreter_factory or (
@@ -137,7 +139,10 @@ def test_inventory_and_original_question_reach_one_forced_structured_request(cor
     schema = payload["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]
     requirements = schema["$defs"]["_Requirements"]
     assert "section_selection" in requirements["required"]
-    assert requirements["properties"]["section_selection"]["enum"] == ["explicit", "risk_factors_default"]
+    assert requirements["properties"]["section_selection"]["enum"] == ["explicit", "risk_factors_default", "inferred"]
+    assert schema["properties"]["mode"]["enum"] == [
+        "review", "generic_synthesis", "ai_infrastructure_comparison", "ambiguous", "unsupported",
+    ]
     assert "section_ids" not in requirements["properties"]["inferred_fields"]["items"]["enum"]
     submitted = json.loads(payload["messages"][0]["content"][0]["text"])
     assert submitted["question"] == result.question == result.plan.intent.question
@@ -701,3 +706,401 @@ def test_apple_review_saves_partial_findings_and_sanitized_validation_diagnostic
         {"path": "synthesis.cite_refs[0]", "category": "schema", "code": "string_pattern_mismatch"},
     ]
     assert secret not in observation_json(result)
+
+
+def _operand(ticker, year, section):
+    return {"ticker": ticker, "filing_year": year, "section_id": section, "period_text": None}
+
+
+def _comparison(**overrides):
+    return _structured(
+        mode="generic_synthesis", comprehensive=True, inferred_fields=["comprehensive"],
+        scope_notes="Review every named filing source.", **overrides,
+    )
+
+
+class RecordingClient(ScriptedModelClient):
+    def __init__(self, decisions):
+        super().__init__(decisions)
+        self.prompts = []
+
+    def next_action(self, question, tools, observation, *, remaining_seconds):
+        self.prompts.append(question)
+        return super().next_action(question, tools, observation, remaining_seconds=remaining_seconds)
+
+
+def _tool(name, **arguments):
+    return {"type": "tool", "name": name, "arguments": arguments}
+
+
+def _scripted_factory(corpus, prompts, *, conclude=True, statement="Scripted cross-source relationship."):
+    from evidenceroute.research.rlm.spans import passage_spans
+
+    def factory(invocation):
+        if invocation.depth:
+            actions = []
+            drafts = []
+            for pair in invocation.partitions:
+                source = corpus.read_chunks(pair.document_id, pair.section_id, limit=1).items[0]
+                span = next(iter(passage_spans(source.text)))
+                actions.append(_tool("get_spans", chunk_id=source.chunk_id, span_ids=[span]))
+                drafts.append({
+                    "claim": f"Scripted disclosure in {pair.section_id}.", "analysis_status": "analyzed",
+                    "evidence": [{"chunk_id": source.chunk_id, "span_id": span}],
+                })
+            actions.append({"type": "finish", "answer": "Child evidence.", "findings": drafts})
+        else:
+            grouped = defaultdict(list)
+            order = []
+            for pair in invocation.partitions:
+                filing = corpus.get_filing(pair.document_id)
+                if filing.ticker not in grouped:
+                    order.append(filing.ticker)
+                grouped[filing.ticker].append((filing, pair))
+            actions = []
+            bindings = []
+            for ticker in order:
+                actions.append(_tool(
+                    "delegate_research", question="Inspect the assigned filing.", goal="Record evidence.",
+                    partitions=[asdict(pair) for _, pair in grouped[ticker]],
+                ))
+            ref = 1
+            for ticker in order:
+                for filing, pair in grouped[ticker]:
+                    bindings.append({
+                        "ref": f"d{ref}", "ticker": filing.ticker, "filing_year": filing.fiscal_year,
+                        "section_id": pair.section_id,
+                    })
+                    ref += 1
+            synthesis = {"cite_refs": [item["ref"] for item in bindings], "analysis_status": "analyzed"}
+            if conclude:
+                synthesis["conclusions"] = [{
+                    "statement": statement, "disposition": "answered",
+                    "qualification": "The relationship is limited to the cited passages.", "bindings": bindings,
+                }]
+            else:
+                synthesis["conclusions"] = []
+            actions.append({"type": "synthesis", "synthesis": synthesis})
+        client = RecordingClient(actions)
+        prompts.append(client)
+        return client
+
+    return factory
+
+
+def _assert_generic_publication(result, statement):
+    research = result.research
+    assert research.comparative_capture is False and research.root_comparisons == ()
+    assert research.scan is not None and research.scan.discovery is not None
+    assert "Batch-root comparisons" not in research.answer
+    assert "No filing-wide novelty conclusion is established" not in research.answer
+    assert "Captured findings and lexical scan results cannot establish absence" in research.answer
+    assert "unverified" in research.answer and statement in research.answer
+    assert research.published_conclusions
+    assert all(item.conclusion.semantic_status == "unverified" for item in research.published_conclusions)
+    return research
+
+
+WIDER = SharedLimits(max_provider_attempts=8, max_reported_tokens=10_000, max_corpus_attempts=8,
+                     max_delegations=2, max_partitions=4, max_depth=1)
+
+
+def test_descriptive_research_infers_a_processed_section(corpus):
+    data = _structured(
+        section_selection="inferred", section_ids=["item_1"], companies=["Apple Inc."],
+        topic="Apple business description", phrases=["products", "services"],
+        scope_notes="The question asks for the business description and does not name a section.",
+    )
+    prompts = []
+    result = _run(
+        corpus, MockTransport([_interpretation(data)]), research_factory=_scripted_factory(corpus, prompts, conclude=False),
+        question="What business does Apple describe in its FY2024 annual report?",
+        max_batches=1, max_provider_attempts=10,
+    )
+    intent = result.plan.intent
+    assert intent.objective == "review" and intent.required_operands == ()
+    assert intent.section_ids == ("item_1",) and "section_ids" in intent.inferred_fields
+    assert "Inferred filing sections from the corpus inventory: item_1." in intent.scope_notes
+    assert intent.scope_notes.startswith("The question asks for the business description")
+    assert {target.section_id for target in result.plan.resolved_targets} == {"item_1"}
+    assert "Scripted disclosure in item_1." in result.research.answer
+    assert result.research.root_comparisons == () and result.research.answer_disposition is None
+    assert "cannot establish absence" in result.research.answer
+    assert "AI infrastructure" not in prompts[1].prompts[0]
+
+
+def test_non_ai_cross_year_comparison_uses_the_generic_executor(corpus):
+    question = "Compare Apple's foreign-exchange risk in FY2023 and FY2024."
+    data = _comparison(
+        companies=["Apple Inc."], fiscal_years=[2023, 2024], topic="Foreign exchange exposure",
+        phrases=["foreign currency", "exchange rates"],
+        required_operands=[_operand("AAPL", 2023, "item_1a"), _operand("Apple Inc.", 2024, "item_1a")],
+    )
+    prompts = []
+    statement = "Apple's FY2023 and FY2024 risk factors both discuss foreign currency."
+    result = _run(
+        corpus, MockTransport([_interpretation(data)]),
+        research_factory=_scripted_factory(corpus, prompts, statement=statement),
+        question=question, max_provider_attempts=10, max_corpus_attempts=16,
+        shared_limits=SharedLimits(max_provider_attempts=8, max_reported_tokens=10_000, max_corpus_attempts=16,
+                                   max_delegations=1, max_partitions=4, max_depth=1),
+    )
+    intent = result.plan.intent
+    assert intent.objective == "review" and intent.fiscal_years == (2023, 2024)
+    assert [operand.model_dump() for operand in intent.required_operands] == [
+        {"ticker": "AAPL", "filing_year": 2023, "section_id": "item_1a", "period_text": None},
+        {"ticker": "AAPL", "filing_year": 2024, "section_id": "item_1a", "period_text": None},
+    ]
+    assert intent.section_ids == ("item_1a",) and "section_ids" in intent.inferred_fields
+    _assert_generic_publication(result, statement)
+    assert result.research.answer_disposition == "partial"
+    root, child = prompts
+    assert question in root.prompts[0] and "AAPL" in root.prompts[0] and "Each conclusion requires these source operands" in root.prompts[0]
+    assert "Required source operands" in root.prompts[0]
+    assert "Accelerator demand" not in root.prompts[0] and "synthesis.comparisons" not in root.prompts[0]
+    assert "No lexical miss proves absence" in child.prompts[0]
+    assert "infrastructure_mechanism_hint" not in child.prompts[0] and "Accelerator demand" not in child.prompts[0]
+    for row in result.research.scan.sections:
+        for hit in row.candidates:
+            assert "artificial intelligence" not in hit.terms and "data center" not in hit.terms
+
+
+def test_three_fiscal_year_comparison(corpus):
+    question = "Compare Apple's business description across FY2022, FY2023, and FY2024."
+    data = _comparison(
+        companies=["AAPL"], fiscal_years=[2022, 2023, 2024], section_selection="explicit", section_ids=["item_1"],
+        topic="Business description", phrases=["products", "services"],
+        required_operands=[_operand("AAPL", year, "item_1") for year in (2022, 2023, 2024)],
+    )
+    # The named years make the comparison explicit, so no other requirement is inferred.
+    data["requirements"]["inferred_fields"] = []
+    data["requirements"]["scope_notes"] = None
+    prompts = []
+    statement = "Apple describes its business in each of the three filings."
+    result = _run(
+        corpus, MockTransport([_interpretation(data)]),
+        research_factory=_scripted_factory(corpus, prompts, statement=statement),
+        question=question, max_provider_attempts=10,
+    )
+    assert result.plan.intent.fiscal_years == (2022, 2023, 2024)
+    assert len(result.plan.intent.required_operands) == 3
+    assert len(result.plan.resolved_targets) == 3 and result.plan.missing_requirements == ()
+    _assert_generic_publication(result, statement)
+    assert {binding.filing_year for binding in result.research.published_conclusions[0].conclusion.bindings} == {2022, 2023, 2024}
+
+
+def test_cross_company_synthesis_round_trips_through_a_checkpoint(corpus):
+    question = "Compare the FY2024 business descriptions of Apple and Amazon."
+    data = _comparison(
+        companies=["AAPL", "AMZN"], fiscal_years=[2024], section_selection="explicit",
+        section_ids=["item_1"], topic="Business description", phrases=["products", "services"],
+        required_operands=[_operand("AAPL", 2024, "item_1"), _operand("AMZN", 2024, "item_1")],
+    )
+    prompts = []
+    statement = "Apple and Amazon describe different businesses in their FY2024 filings."
+    result = _run(
+        corpus, MockTransport([_interpretation(data)]),
+        research_factory=_scripted_factory(corpus, prompts, statement=statement),
+        question=question, shared_limits=WIDER, max_delegations=2, max_provider_attempts=10,
+    )
+    assert result.plan.requested_companies == ("AAPL", "AMZN")
+    assert {operand.ticker for operand in result.plan.intent.required_operands} == {"AAPL", "AMZN"}
+    assert len(result.plan.resolved_targets) == 2
+    _assert_generic_publication(result, statement)
+    assert question in prompts[0].prompts[0]
+
+    from evidenceroute.research.rlm.checkpoint import create_checkpoint, load_checkpoint, save_checkpoint
+
+    path = Path(__file__).resolve().parents[2] / f"rlm-m3-generic-{uuid4().hex}.json"
+    try:
+        checkpoint = create_checkpoint(corpus, result)
+        save_checkpoint(path, checkpoint)
+        loaded = load_checkpoint(path, corpus)
+        assert loaded.version == 4
+        assert loaded.plan.intent.required_operands == result.plan.intent.required_operands
+        assert loaded.plan.intent.question == question
+        published, = loaded.publication.published_conclusions
+        assert published.conclusion.semantic_status == "unverified" and statement in loaded.publication.answer
+        assert loaded.findings and loaded.publication.answer_citations
+        assert "cannot establish absence" in loaded.publication.answer
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_cross_section_synthesis_does_not_add_an_operand_per_partition(corpus):
+    question = "Compare Apple's FY2024 business description with its MD&A."
+    data = _comparison(
+        companies=["AAPL"], fiscal_years=[2024], section_selection="explicit", section_ids=["item_1", "item_7"],
+        topic="Business description and MD&A", phrases=["products", "net sales"],
+        required_operands=[_operand("AAPL", 2024, "item_1"), _operand("AAPL", 2024, "item_7")],
+    )
+    prompts = []
+    statement = "The business description and MD&A discuss Apple's products from different perspectives."
+    result = _run(
+        corpus, MockTransport([_interpretation(data)]),
+        research_factory=_scripted_factory(corpus, prompts, statement=statement),
+        question=question, max_provider_attempts=10,
+    )
+    assert {target.section_id for target in result.plan.resolved_targets} == {"item_1", "item_7"}
+    assert [(item.section_id, item.filing_year) for item in result.plan.intent.required_operands] == [
+        ("item_1", 2024), ("item_7", 2024),
+    ]
+    _assert_generic_publication(result, statement)
+    assert {binding.section_id for binding in result.research.published_conclusions[0].conclusion.bindings} == {"item_1", "item_7"}
+
+
+def test_comparative_figures_inside_one_filing_stay_a_single_review(corpus):
+    question = "What does Apple's FY2024 MD&A disclose about its 2022 and 2023 net sales?"
+    data = _structured(
+        section_selection="explicit", section_ids=["item_7"], companies=["AAPL"], topic="Net sales",
+        phrases=["net sales"],
+    )
+    prompts = []
+    result = _run(
+        corpus, MockTransport([_interpretation(data)]),
+        research_factory=_scripted_factory(corpus, prompts, conclude=False),
+        question=question, max_provider_attempts=10,
+    )
+    assert result.plan.intent.objective == "review"
+    assert result.plan.intent.fiscal_years == (2024,) and result.plan.intent.required_operands == ()
+    assert len(result.plan.resolved_targets) == 1
+    assert result.research.root_comparisons == () and result.research.published_conclusions == ()
+    assert result.research.answer.count("Scripted disclosure in item_7.") == 1
+    assert "Each conclusion requires these source operands" not in prompts[0].prompts[0]
+    assert "cannot establish absence" in result.research.answer
+
+
+def test_unavailable_required_operands_remain_in_scope(corpus):
+    question = "Compare Apple and Unlisted Corp. Item 9A disclosures for FY2024 and FY2025."
+    data = _comparison(
+        companies=["Apple Inc.", "Unlisted Corp."], fiscal_years=[2024, 2025], section_selection="explicit",
+        section_ids=["item_9a"], topic="Item 9A controls", phrases=["disclosure controls"],
+        required_operands=[
+            _operand("AAPL", 2024, "item_9a"), _operand("AAPL", 2025, "item_9a"),
+            _operand("Unlisted Corp.", 2024, "item_9a"),
+        ],
+    )
+    result = _run(corpus, MockTransport([_interpretation(data)]), question=question, max_batches=0)
+    plan = result.plan
+    assert [(item.ticker, item.filing_year, item.section_id) for item in plan.intent.required_operands] == [
+        ("AAPL", 2024, "item_9a"), ("AAPL", 2025, "item_9a"), ("Unlisted Corp.", 2024, "item_9a"),
+    ]
+    assert plan.resolved_targets == ()
+    assert {entry.reason for entry in plan.missing_requirements} == {"missing_section", "missing_filing", "unknown_company"}
+    assert plan.intent.question == question
+    assert result.research.answer_disposition == "insufficient_evidence"
+    assert "AAPL FY2025 item_9a" in result.research.answer and "Unlisted Corp. FY2024 item_9a" in result.research.answer
+    assert "cannot establish absence" in result.research.answer
+
+
+@pytest.mark.parametrize(("data", "question", "reason"), [
+    (_blocked("unsupported", "Ranking issuers requires an ordering the filings do not supply."),
+     "Rank the companies by foreign-exchange exposure.", "unsupported"),
+    (_blocked("unsupported", "The question asks for a forecast beyond the filed text."),
+     "What will Apple's foreign-exchange risk be next year?", "unsupported"),
+    (_blocked("unsupported", "The question needs market data from outside these filings."),
+     "How does Apple's FY2024 revenue compare with its stock price?", "unsupported"),
+    (_blocked("unsupported", "The question asks for a calculation the filings do not state."),
+     "Calculate Apple's FY2024 free cash flow from its filings.", "unsupported"),
+    (_blocked("ambiguous", "Which company and filing years should be compared?"),
+     "How did the risk change recently?", "ambiguous"),
+])
+def test_ambiguous_and_unsupported_objectives_stay_explicit(corpus, data, question, reason):
+    result = _run(corpus, MockTransport([_interpretation(data)]), question=question)
+    assert result.interpretation.outcome.status == reason
+    assert result.interpretation.outcome.explanation == data["explanation"]
+    assert result.plan is result.research is None
+
+
+def test_over_capacity_comparison_is_qualified_instead_of_truncated(corpus):
+    data = _comparison(
+        companies=[f"Company {index}" for index in range(9)], fiscal_years=[2024],
+        required_operands=[_operand(f"Company {index}", 2024, "item_1a") for index in range(8)],
+    )
+    result = _run(corpus, MockTransport([_interpretation(data)]), question="Compare all nine companies' FY2024 risk factors.")
+    outcome = result.interpretation.outcome
+    assert outcome.status == "unsupported" and outcome.stop_reason == "unsupported_operand_capacity"
+    assert "eight" in outcome.explanation and "not truncated" in outcome.explanation
+    assert result.plan is None and len(result.interpretation.attempts) == 1
+
+
+def test_correction_cannot_drop_explicit_comparative_requirements(corpus):
+    question = "Compare Apple's FY2023 and FY2024 business descriptions."
+    scope = dict(
+        companies=["AAPL"], fiscal_years=[2023, 2024], section_selection="explicit", section_ids=["item_1"],
+        topic="Business description", required_operands=[_operand("AAPL", 2023, "item_1"), _operand("AAPL", 2024, "item_1")],
+    )
+    first = _comparison(phrases=["..."], **scope)
+    narrowed = _comparison(phrases=["products"], **(scope | {"fiscal_years": [2024]}))
+    result = _run(corpus, MockTransport([_interpretation(first), _interpretation(narrowed)]), question=question)
+    assert result.plan is result.research is None
+    assert result.interpretation.validation_failures[1].issues == (
+        ValidationIssue("requirements.fiscal_years", "inconsistent_requirements", "correction_changed_scope"),
+    )
+    dropped = _comparison(phrases=["products"], **(scope | {
+        "required_operands": [_operand("AAPL", 2024, "item_1"), _operand("AAPL", 2023, "item_7")],
+    }))
+    result = _run(corpus, MockTransport([_interpretation(first), _interpretation(dropped)]), question=question)
+    assert result.interpretation.validation_failures[1].issues == (
+        ValidationIssue("requirements.required_operands", "inconsistent_requirements", "correction_changed_scope"),
+    )
+    review = _structured(companies=["AAPL"], fiscal_years=[2023, 2024], section_selection="explicit", section_ids=["item_1"])
+    result = _run(corpus, MockTransport([_interpretation(first), _interpretation(review)]), question=question)
+    assert result.interpretation.validation_failures[1].issues == (
+        ValidationIssue("mode", "inconsistent_requirements", "correction_changed_scope"),
+    )
+
+
+def test_correction_cannot_replace_an_inferred_section(corpus):
+    first = _structured(
+        section_selection="inferred", section_ids=["item_1"], scope_notes="The business section matches the question.",
+        phrases=["..."],
+    )
+    replacement = _structured(section_selection="inferred", section_ids=["item_7"],
+                              scope_notes="The MD&A matches the question.")
+    result = _run(corpus, MockTransport([_interpretation(first), _interpretation(replacement)]),
+                  question="What business does Apple describe in its FY2024 annual report?")
+    assert result.plan is None
+    assert result.interpretation.validation_failures[1].issues[0].code == "correction_changed_scope"
+
+
+def test_budget_limit_and_insufficient_evidence(corpus):
+    question = "Compare Apple's FY2023 and FY2024 business descriptions."
+    data = _comparison(
+        companies=["AAPL"], fiscal_years=[2023, 2024], section_selection="explicit", section_ids=["item_1"],
+        topic="Business description", phrases=["products"],
+        required_operands=[_operand("AAPL", 2023, "item_1"), _operand("AAPL", 2024, "item_1")],
+    )
+    limited = _run(
+        corpus, MockTransport([_interpretation(data)]), question=question, max_reported_tokens=12_000,
+        shared_limits=SharedLimits(max_provider_attempts=8, max_reported_tokens=12_000, max_corpus_attempts=8,
+                                   max_delegations=1, max_partitions=4, max_depth=1),
+    )
+    assert limited.plan.intent.required_operands and limited.research.stop_reason == "insufficient_reported_tokens"
+    assert limited.research.batches == () and limited.research.published_conclusions == ()
+    prompts = []
+    withheld = _run(
+        corpus, MockTransport([_interpretation(data)]),
+        research_factory=_scripted_factory(corpus, prompts, conclude=False),
+        question=question, max_provider_attempts=10,
+    )
+    assert withheld.research.answer_disposition == "insufficient_evidence"
+    assert "Evidence bindings are missing or invalid" in withheld.research.answer
+    assert "AAPL FY2023 item_1" in withheld.research.answer and "AAPL FY2024 item_1" in withheld.research.answer
+    assert withheld.research.published_conclusions == ()
+    assert "No filing-wide novelty conclusion is established" not in withheld.research.answer
+    assert "cannot establish absence" in withheld.research.answer
+
+
+def test_fabricated_period_anchor_is_rejected(corpus):
+    data = _comparison(
+        companies=["AAPL"], fiscal_years=[2024], section_selection="explicit", section_ids=["item_1", "item_7"],
+        required_operands=[
+            {**_operand("AAPL", 2024, "item_1"), "period_text": "FY2022"},
+            _operand("AAPL", 2024, "item_7"),
+        ],
+    )
+    result = _run(corpus, MockTransport([_interpretation(data)]), max_provider_attempts=1,
+                  question="Compare Apple's FY2024 business description with its MD&A.")
+    assert result.interpretation.validation_failures[0].issues[0].code == "fabricated_period_text"
+    assert result.plan is None

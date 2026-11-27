@@ -18,6 +18,7 @@ from evidenceroute.research.rlm.interpretation import (
 )
 from evidenceroute.research.rlm.planning import ResearchPlan, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
+from evidenceroute.research.rlm.tools import observation_json
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,12 @@ def research_question(
             + ("The question requires comprehensive review of the requested scope."
                if plan.intent.comprehensive else "The question requests a bounded, evidence-based answer.")
         )
+        if plan.intent.required_operands:
+            root_guidance += (
+                " Compare these required source operands and bind each one. A missing operand is insufficient "
+                "evidence and does not establish filing-wide absence. Required source operands "
+                + observation_json(plan.intent.required_operands) + "."
+            )
         remaining = limits.model_copy(update={
             "max_provider_attempts": limits.max_provider_attempts - budget.provider_attempts,
             "max_reported_tokens": limits.max_reported_tokens - budget.charged_tokens,

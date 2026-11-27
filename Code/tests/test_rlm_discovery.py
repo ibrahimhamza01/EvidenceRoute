@@ -97,6 +97,23 @@ def test_budgets_interleave_sections_and_record_unscanned_work(limits, seconds, 
     assert [pair for pair, _, _ in corpus.pages] == list(pairs[:scan.pages_read])
 
 
+def test_generic_topic_does_not_use_ai_infrastructure_anchors():
+    pair = SectionTarget("ABC-2024", "item_1a")
+    corpus = SectionFixture({pair: [
+        ("fx", "Foreign currency exchange rates changed."),
+        ("ai", "Artificial intelligence workloads depend on data center power supply shortages."),
+    ]})
+    plan = _plan((pair,))
+    generic = discover_research_plan(corpus, plan, DiscoverySpec(topic="Foreign exchange exposure", phrases=("foreign currency",)))
+    specialized = discover_research_plan(
+        corpus, plan, DiscoverySpec(topic="AI infrastructure risk", phrases=("foreign currency",)),
+    )
+    assert [hit.chunk_id for hit in generic.sections[0].candidates] == ["fx"]
+    assert all("artificial intelligence" not in " ".join(hit.terms) for hit in generic.sections[0].candidates)
+    assert {hit.chunk_id for hit in specialized.sections[0].candidates} == {"fx", "ai"}
+    assert generic.shortlist((pair,))[0].get("infrastructure_mechanism_hint") is None
+
+
 def test_canonical_targets_and_exact_span_provenance(monkeypatch, capsys):
     examples = Path(__file__).resolve().parents[1] / "examples"
     monkeypatch.syspath_prepend(str(examples))
