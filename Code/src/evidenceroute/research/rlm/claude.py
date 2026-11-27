@@ -216,10 +216,14 @@ class ClaudeRootClient:
         self._replay_request = False
         self._comparative = False
         self._reference_finish = False
+        self._generic_root = False
         self._finish_allowed = True
 
     def enable_comparative_finish(self) -> None:
         self._comparative = True
+
+    def enable_generic_root(self) -> None:
+        self._generic_root = True
 
     def enable_reference_finish(self) -> None:
         self._reference_finish = True
@@ -315,7 +319,7 @@ class ClaudeRootClient:
                 "description": description,
                 "input_schema": finish_input_schema(recursive=self._budget is not None, comparative=self._comparative,
                                                     reference_based=self._reference_finish,
-                                                    compact=self._compact_comparative_finish),
+                                                    compact=self._compact_comparative_finish, generic_root=self._generic_root),
             }]
         response = self._request(self._payload(tools), deadline)
         reason = self._record_stop_reason(response)

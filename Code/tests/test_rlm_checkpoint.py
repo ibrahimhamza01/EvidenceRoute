@@ -273,7 +273,7 @@ def test_fingerprint_compares_canonical_content(corpus, initial, checkpoint_path
 
 
 @pytest.mark.parametrize(("payload", "message"), [
-    (b'{"version": 4}', "Unsupported"),
+    (b'{"version": 5}', "Unsupported"),
     (b'{"version": true}', "missing or invalid"),
     (b'{"version": 1, "version": 1}', "duplicate keys"),
     (b'{"version": 1,', "Malformed"),

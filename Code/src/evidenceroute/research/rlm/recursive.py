@@ -28,6 +28,7 @@ from evidenceroute.research.rlm.findings import (
     FindingValidationError, FindingValidationIssue, PartitionCoverage, SpanEvidenceDraft, SpanFindingDraft,
     CaptureFindings, SubmitFindings, finding_schema_issues, partition_status, render_findings,
 )
+from evidenceroute.research.rlm.synthesis import Conclusion, SourceOperand, render_conclusion, resolve_conclusions
 from evidenceroute.research.rlm.scoped import ScopedCorpus
 from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import (
@@ -69,6 +70,7 @@ class Invocation:
     question: str
     goal: str | None
     partitions: tuple[SectionTarget, ...] | None
+    required_operands: tuple[SourceOperand, ...] = ()
 
 
 @dataclass
@@ -125,9 +127,13 @@ class RecursiveResearch:
         delegation_first: bool = False,
         _budget: SharedBudget | None = None,
         _id_prefix: str = "",
+        required_operands: tuple[SourceOperand, ...] = (),
     ) -> ExecutionTrace:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Research question must be a non-blank string.")
+        if len(required_operands) > 8:
+            raise ValueError("A generic conclusion supports at most eight required operands.")
+        required_operands = tuple(SourceOperand.model_validate(operand) for operand in required_operands)
         budget = _budget if _budget is not None else SharedBudget(self.shared_limits, self.clock, finalization=self.finalization)
         if partitions is not None:
             partitions = tuple(partitions)
@@ -148,7 +154,7 @@ class RecursiveResearch:
                 raise ValueError("Initial groups must fit the shared delegation and depth limits.")
             budget.initial_delegations_left = len(groups)
             budget.initial_partitions_left = len(partitions)
-        invocation = Invocation(run_id or uuid4().hex, f"{_id_prefix}root", None, 0, question, None, partitions)
+        invocation = Invocation(run_id or uuid4().hex, f"{_id_prefix}root", None, 0, question, None, partitions, required_operands)
         return self._invoke(invocation, budget, [], budget.deadline, groups)
 
     def _validate_partitions(self, partitions: tuple[SectionTarget, ...]) -> None:
@@ -188,6 +194,15 @@ class RecursiveResearch:
             tuple(sorted({pair.document_id for pair in partitions})), partitions,
         )
         prompt = invocation.question
+        if session.generic_root:
+            enable = getattr(model, "enable_generic_root", None)
+            if callable(enable):
+                enable()
+            prompt += (" For a supported synthesis, bind each operand to an acknowledged sN or dN finding. "
+                       "Preserve reporting periods, units, conditions and conflicting evidence. Use cite_refs alone "
+                       "for descriptive findings or when a relationship lacks support.")
+            if invocation.required_operands:
+                prompt += "\nEach conclusion requires these source operands: " + observation_json(invocation.required_operands)
         if invocation.goal is not None:
             prompt += f"\nAnalysis goal: {invocation.goal}"
         if invocation.depth > 0 and self.child_guidance:
@@ -287,9 +302,12 @@ class RecursiveSession:
         } if self.capture_reserved else {}
         years = set(self._year_by_document.values())
         self.pending_year_reads = years if len(years) > 1 else set()
-        self.reference_synthesis = self.compact_comparative or runner.discovery_scan is not None or (
+        self.reference_synthesis = bool(invocation.required_operands) or self.compact_comparative or runner.discovery_scan is not None or (
             invocation.depth == 0 and runner.comparison_scan is not None
         )
+        self.generic_root = invocation.depth == 0 and runner.comparison_scan is None
+        self.conclusions: tuple[Conclusion, ...] = ()
+        self.withheld_conclusions = False
         self.acknowledged_references: dict[str, Finding] = {}
         self.submitted_findings: dict[str, Finding] = {}
         self.retained_findings: dict[FindingKey, Finding] = {}
@@ -766,7 +784,8 @@ class RecursiveSession:
         self.used_finding_ids = used
         self.analysis_status = (action.analysis_status or "incomplete") if referenced and not self.unassigned_groups else "incomplete"
 
-    def finish_references(self, action: _ReferenceSynthesis, coverage: CoverageReport, *, issues=None) -> tuple[str, ...]:
+    def finish_references(self, action: _ReferenceSynthesis, coverage: CoverageReport, *,
+                          proposals: object, issues=None) -> tuple[str, ...]:
         scan = self.runner.comparison_scan
         if action.comparisons and scan is None:
             raise FindingValidationError("synthesis.comparisons", "mode", "comparative_required",
@@ -802,6 +821,11 @@ class RecursiveSession:
                             raise
                         raise issue from exc
                     issues.append(exc.issue if isinstance(exc, FindingValidationError) else issue.issue)
+        conclusions, withheld = resolve_conclusions(
+            proposals, self.acknowledged_references, self.invocation.required_operands, self.invocation.partitions,
+            [f for f in available.values() if f.finding_id in selected], coverage,
+        )
+        selected.update(b.finding_id for record in conclusions for b in record.bindings)
         selected.update(fid for item in comparisons for fid in item.finding_ids)
         inherited = tuple(dict.fromkeys(finding for ref, finding in self.acknowledged_references.items()
                                         if ref.startswith("d") and finding.finding_id in selected))
@@ -821,6 +845,8 @@ class RecursiveSession:
         if not set(citations).issubset(ref.chunk_id for ref in coverage.visible_chunks):
             raise FindingValidationError("synthesis", "provenance", "unacknowledged_evidence",
                                          "Citations require acknowledged evidence.")
+        self.conclusions = conclusions
+        self.withheld_conclusions = withheld
         self.retained_findings.update(staged)
         self.comparisons = tuple(comparisons)
         self.selected_local_finding_ids = tuple(item.finding_id for item in local)
@@ -967,11 +993,18 @@ class RecursiveSession:
     def render_answer(self, draft: str) -> str:
         if self.runner.comparison_scan is not None:
             return render_comparisons(self.comparisons)
-        if draft:
+        if draft and not self.invocation.required_operands:
             return draft
         local = (finding for finding in self.retained_findings.values()
                  if finding.finding_id in self.selected_local_finding_ids)
-        return render_findings((*local, *self.selected_inherited_findings)) or "No findings were selected. Research remains incomplete."
+        known = {f.finding_id: f for f in local}
+        known.update((fid, self.delivered_findings[fid]) for fid in self.used_finding_ids)
+        lines = [render_conclusion(c, known) for c in self.conclusions]
+        if self.withheld_conclusions or (self.invocation.required_operands and not self.conclusions):
+            lines.append("Insufficient bound evidence for the requested conclusion.")
+        if known:
+            lines.append(render_findings(known.values()))
+        return "\n".join(lines) or "No findings were selected. Research remains incomplete."
 
     def trace_fields(self, coverage: CoverageReport) -> dict:
         partitions = tuple(PartitionCoverage(pair, partition_status(coverage, pair))
@@ -990,6 +1023,8 @@ class RecursiveSession:
             "shared_budget": self.budget.snapshot(),
             "findings": tuple(self.retained_findings.values()),
             "comparisons": self.comparisons,
+            "conclusions": self.conclusions,
+            "withheld_conclusions": self.withheld_conclusions,
             "used_finding_ids": self.used_finding_ids,
             "selected_inherited_findings": self.selected_inherited_findings,
             "selected_local_finding_ids": self.selected_local_finding_ids,

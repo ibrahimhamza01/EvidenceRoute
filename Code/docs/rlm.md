@@ -1274,6 +1274,34 @@ The criteria below refer to the [issue checklist](https://github.com/ibrahimhamz
 
 The earlier closeout recorded 399 focused RLM, 53 retrieval/RAG/canonical and 40 ingestion/benchmark/routing passes. The final offline audit ran **572 distinct passing cases**, with 30 dense/hybrid cases deselected. No implementation changes or live requests were made for this audit.
 
+## Milestone 2 — evidence-bound generic synthesis
+
+A generic recursive root can use its existing reference finish to answer a question about several disclosures. For example, the offline Apple–Amazon fixture distinguishes conditional exchange-rate exposure in component costs from reliance on a limited group of semiconductor suppliers. The finish contains this optional array inside `synthesis`:
+
+```json
+{
+  "conclusions": [{
+    "statement": "Apple describes exchange-rate exposure in component costs, while Amazon describes reliance on a limited group of chip suppliers.",
+    "disposition": "answered",
+    "qualification": "The passages describe exposures rather than realized losses.",
+    "bindings": [
+      {"ref": "d2", "ticker": "AMZN", "filing_year": 2024, "section_id": "item_1a"},
+      {"ref": "d1", "ticker": "AAPL", "filing_year": 2024, "section_id": "item_1a"}
+    ]
+  }]
+}
+```
+
+A finish accepts up to three conclusions. Each binds two to eight operands covering at least two distinct acknowledged findings. An `sN` alias requires an acknowledged submission receipt. A `dN` alias requires delivery from a child or a scoped prior-finding read. A binding selects all original evidence for its finding. `filing_year` identifies the source filing. Optional `period_text` anchors a reporting period literally in a quoted excerpt, including a historical period discussed in a later filing. Preserve units, conditions and conflicts in the statement and qualification. Descriptive answers can continue using `cite_refs` alone.
+
+Structured callers can set up to eight `ResearchIntent.required_operands` using the binding source fields. Each conclusion must cover them all. A generic review plan can span several filing years and use ordinary discovery. The existing specialized year-over-year discovery path retains its own comparison schema. The host checks source identity, authorized partitions, delivery, required bindings and existing citation limits. A failed proposal is withheld within the same finish. Valid sibling conclusions, separately selected findings and the retained evidence ledger survive.
+
+`published_conclusions` attributes each record to its finished root. Bindings contain stable finding IDs linked to the original quotes and spans. `answer_citations` follows first mention in the answer, beginning with conclusion citations. `answer_disposition` is an **unverified** assessment of the requested answer. A single root may report `answered` within the full authorized scope. A comprehensive request also needs complete research. Conditional or conflicting findings can reduce the disposition to `partial`. Missing required bindings can yield `insufficient_evidence` alongside eligible atomic findings. A descriptive answer without an assessment retains a null disposition. Separate roots publish their own conclusions in ledger order. Relationships requiring evidence split across roots remain unresolved.
+
+Checkpoint v4 stores structured requirements and conclusion state in the plan and invocation ledger, including the local receipt IDs needed to check bindings. Loading rechecks root ownership, selection, acknowledgement, canonical evidence and operands. Continuations retain earlier records and may bind historical findings after scoped delivery. Versions 1–3 retain their original meaning and receive no inferred selections or conclusions. Finding-level reviews leave generic conclusions semantically unverified. Entailment, numerical accuracy, sufficiency and filing-wide absence remain outside the structural checks.
+
+From the repository root, run `PYTHONPATH=Code/src python -m pytest -q Code/tests/test_rlm_synthesis.py` for the scripted cases, or use `Code/tests/test_rlm*.py` for the full RLM regression. The tests exercise companies, source years, sections, reporting-period anchors, conflicts, rejected bindings, split batches, citation order, checkpoint tampering and continuation. These offline cases measure contract behavior. Model accuracy and natural-language operand extraction remain open.
+
 ## Ongoing engineering record
 
 For each future milestone, add a short entry to this guide with the **problem and baseline**, **hypothesis**, **solution and alternatives**, **verification method**, **before-and-after results**, and **trade-offs and limitations**. Include a reproduction command and, where applicable, the model and provider, corpus scope, execution limits, commit reference, and whether verification was scripted, offline, or live. Identify which variables changed, how many trials ran, and which metrics were unavailable. Link to the relevant design decision when it already explains the architecture.

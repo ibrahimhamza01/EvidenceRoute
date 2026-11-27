@@ -16,6 +16,7 @@ from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import MAX_FINDINGS, Finding, FindingEvidence
 from evidenceroute.research.rlm.planning import ResearchPlan, resolve_research_plan
 from evidenceroute.research.rlm.research_coverage import InvocationOutcome, _Access, _target_coverage
+from evidenceroute.research.rlm.synthesis import validate_conclusion
 from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import EvidenceRef
 from evidenceroute.research.rlm.verification_records import comparison_id, validate_review_evidence
@@ -24,7 +25,15 @@ from evidenceroute.schemas import Chunk
 if TYPE_CHECKING:
     from evidenceroute.research.rlm.checkpoint import CheckpointRun, ResearchCheckpoint
 
-CHECKPOINT_VERSIONS = (1, 2, 3)
+CHECKPOINT_VERSIONS = (1, 2, 3, 4)
+
+
+def checkpoint_version(plan: ResearchPlan, runs: tuple[CheckpointRun, ...], verified: bool = False) -> int:
+    if plan.intent.required_operands or any(
+        node.conclusions or node.withheld_conclusions for run in runs for node in run.coverage.invocations
+    ):
+        return 4
+    return 3 if any(run.comparative_capture for run in runs) else 2 if verified else 1
 
 
 class CheckpointError(ValueError):
@@ -234,6 +243,21 @@ def _validate_coverage(
                  and (node.stop_reason == "finished" or not (
                      inherited or node.selected_local_finding_ids or node.used_finding_ids or node.cited_chunk_ids)),
                  "Checkpoint terminal selection is inconsistent with its invocation.")
+        _require(inv.required_operands == (plan.intent.required_operands if inv.parent_id is None else ()),
+                 "Checkpoint required operands differ from the original plan.")
+        receipts = set(node.acknowledged_local_finding_ids)
+        _require(receipts.issubset(own) and (not receipts or node.conclusions), "Invalid local conclusion receipts.")
+        if node.conclusions or node.withheld_conclusions:
+            _require(inv.parent_id is None and node.stop_reason == "finished" and not run.comparative_capture
+                     and len(node.conclusions) <= 3, "Checkpoint conclusion has no eligible finished root.")
+            selected = {fid: known[fid] for fid in inherited | (set(node.selected_local_finding_ids) & receipts)}
+            for record in node.conclusions:
+                try:
+                    validate_conclusion(record, selected, inv.required_operands, inv.partitions)
+                except ValueError as exc:
+                    raise CheckpointError(f"Invalid checkpoint conclusion: {exc}") from exc
+                _require(all(item.source.chunk_id in node.cited_chunk_ids for binding in record.bindings
+                             for item in selected[binding.finding_id].evidence), "Missing conclusion citation.")
         expected_forwarded = inherited if inv.parent_id is not None else set()
         _require(len(node.forwarded_findings) == len(expected_forwarded)
                  and {item.finding_id for item in node.forwarded_findings} == expected_forwarded
@@ -371,7 +395,7 @@ def validate_checkpoint(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironmen
     _require(type(checkpoint.version) is int and checkpoint.version in CHECKPOINT_VERSIONS,
              "Unsupported checkpoint schema version.")
     compact = any(run.comparative_capture for run in checkpoint.runs)
-    expected_version = 3 if compact else 2 if checkpoint.verification_runs else 1
+    expected_version = checkpoint_version(checkpoint.plan, checkpoint.runs, bool(checkpoint.verification_runs))
     _require(checkpoint.version == expected_version and (compact or checkpoint.discovery_cache is None),
              "Checkpoint version does not match its research or verification history.")
     _require(checkpoint.corpus_identity == corpus.snapshot_identity, "Checkpoint corpus identity does not match the loaded snapshot.")
@@ -430,6 +454,9 @@ def validate_checkpoint(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironmen
                  "Checkpoint batch scope exceeds the selected assignments.")
         _validate_budget(run)
         nodes, new = _validate_coverage(run, plan, canonical, findings)
+        if checkpoint.scan_terms or (checkpoint.discovery and plan.intent.objective == "year_over_year"):
+            _require(not any(n.conclusions or n.withheld_conclusions for n in nodes.values()),
+                     "Generic conclusions require a generic research run.")
         metrics_ids = {item.invocation_id for item in run.invocation_metrics}
         _require(not metrics_ids or metrics_ids == set(nodes) and len(metrics_ids) == len(run.invocation_metrics),
                  "Checkpoint invocation metrics differ from its invocation inventory.")

@@ -19,6 +19,7 @@ from evidenceroute.research.rlm.findings import (
     MAX_FINDINGS, AnalysisStatus, Finding, FindingDraft, FindingValidationError, FindingValidationIssue,
     PartitionCoverage, SpanFindingDraft, finding_schema_issues,
 )
+from evidenceroute.research.rlm.synthesis import Conclusion, ConclusionDraft
 from evidenceroute.research.rlm.tools import (
     MIN_RESPONSE_BYTES,
     MAX_PROTOCOL_TOOL_BATCH,
@@ -87,6 +88,14 @@ class _ReferenceFinishAction(StrictInput):
     synthesis: _ReferenceSynthesis
 
 
+class _GenericSynthesis(_ReferenceSynthesis):
+    conclusions: list[ConclusionDraft] = Field(default_factory=list, max_length=3)
+
+
+class _GenericFinish(_ReferenceFinishAction):
+    synthesis: _GenericSynthesis
+
+
 class _CapturedSynthesis(StrictInput):
     comparisons: list[CompactComparisonDraft] = Field(default_factory=list, max_length=3)
     cite_refs: list[FindingReference] = Field(default_factory=list, max_length=MAX_FINDINGS)
@@ -114,9 +123,14 @@ def action_schema() -> dict:
     return _ACTION.json_schema()
 
 
-def finish_input_schema(*, recursive: bool = False, comparative: bool = False, reference_based: bool = False, compact: bool = False) -> dict:
+def finish_input_schema(
+    *, recursive: bool = False, comparative: bool = False, reference_based: bool = False,
+    compact: bool = False, generic_root: bool = False,
+) -> dict:
     """Describe a finish payload whose action type is supplied by the adapter."""
     model = _CapturedFinishAction if compact else _ReferenceFinishAction if reference_based else _FinishAction
+    if generic_root and reference_based and not comparative and not compact:
+        model = _GenericFinish
     schema = model.model_json_schema()
     del schema["properties"]["type"]
     schema["required"].remove("type")
@@ -124,7 +138,7 @@ def finish_input_schema(*, recursive: bool = False, comparative: bool = False, r
         return schema
     if reference_based:
         if not comparative:
-            del schema["$defs"]["_ReferenceSynthesis"]["properties"]["comparisons"]
+            del schema["$defs"][model.model_fields["synthesis"].annotation.__name__]["properties"]["comparisons"]
             for name in ("ReferenceComparisonDraft", "ReferenceAssessment"):
                 schema["$defs"].pop(name, None)
         return schema
@@ -283,6 +297,8 @@ class ExecutionTrace:
     selected_inherited_findings: tuple[Finding, ...] = ()
     selected_local_finding_ids: tuple[str, ...] = ()
     unused_capture_reservation: bool = False
+    conclusions: tuple[Conclusion, ...] = ()
+    withheld_conclusions: bool = False
 
     @property
     def model_attempts(self) -> tuple[ModelAttempt, ...]:
@@ -561,6 +577,7 @@ class RootController:
             replayed_observation = None
             replay_reason = None
 
+            proposals: object = []
             try:
                 candidate = json.loads(json.dumps(raw, allow_nan=False))
                 step.requested_action = trace_research_action(candidate) if _recursive is not None else trace_data(candidate)
@@ -569,6 +586,11 @@ class RootController:
                     break
                 if _recursive is not None and _recursive.compact_comparative and isinstance(candidate, dict) and candidate.get("type") == "synthesis":
                     action = _CapturedFinishEnvelope.model_validate(candidate)
+                elif (_recursive is not None and _recursive.generic_root and isinstance(candidate, dict)
+                      and candidate.get("type") == "synthesis" and isinstance(candidate.get("synthesis"), dict)):
+                    # Parse conclusion records separately so a malformed proposal cannot discard atomic selections.
+                    proposals = candidate["synthesis"].pop("conclusions", [])
+                    action = _ReferenceFinishAction.model_validate(candidate)
                 else:
                     action = _ACTION.validate_python(candidate)
             except (TypeError, ValueError, RecursionError) as exc:
@@ -608,7 +630,11 @@ class RootController:
                         continue
                     try:
                         issues = [] if _recursive.compact_comparative else None
-                        citations = _recursive.finish_references(action.synthesis, coverage.report(), issues=issues)
+                        citations = _recursive.finish_references(
+                            action.synthesis, coverage.report(), issues=issues, proposals=proposals,
+                        )
+                        if _recursive.withheld_conclusions:
+                            step.finding_validation = (FindingValidationIssue("synthesis.conclusions", "validation", "withheld_conclusion"),)
                         if issues:
                             step.finding_validation = tuple(issues)
                     except FindingValidationError as exc:

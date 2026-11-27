@@ -16,6 +16,7 @@ from pydantic_core import PydanticCustomError
 from evidenceroute.research.rlm.budget import SharedLimits
 from evidenceroute.research.rlm.coverage import SectionTarget
 from evidenceroute.research.rlm.environment import MAX_METADATA_ROWS, CorpusEnvironment, Page
+from evidenceroute.research.rlm.synthesis import SourceOperand
 from evidenceroute.research.rlm.tools import validation_message
 from evidenceroute.schemas import Filing
 
@@ -54,6 +55,7 @@ class IntentRequirements(BaseModel):
 
 
 class ResearchIntent(IntentRequirements):
+    required_operands: tuple[SourceOperand, ...] = Field(default=(), max_length=8)
     question: Annotated[str, StringConstraints(strip_whitespace=False)]
 
     @field_validator("question")

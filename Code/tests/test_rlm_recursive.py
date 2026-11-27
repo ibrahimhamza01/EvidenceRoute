@@ -2314,7 +2314,8 @@ def test_failed_bedrock_child_delivers_retained_span_for_compact_parent_finish(s
     schema = next(spec["toolSpec"]["inputSchema"]["json"]
                   for spec in config["tools"] if spec["toolSpec"]["name"] == "finish_research")
     assert "synthesis" in schema["properties"]
-    assert "comparisons" not in schema["$defs"]["_ReferenceSynthesis"]["properties"]
+    props = schema["$defs"]["_GenericSynthesis"]["properties"]
+    assert "comparisons" not in props and "conclusions" in props
     assert "quote" not in json.dumps(schema)
 
 

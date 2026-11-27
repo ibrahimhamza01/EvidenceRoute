@@ -12,6 +12,7 @@ from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import AnalysisStatus, Finding
 from evidenceroute.research.rlm.planning import MissingRequirement, ResearchPlan
 from evidenceroute.research.rlm.recursive import DelegationTrace, Invocation
+from evidenceroute.research.rlm.synthesis import Conclusion
 from evidenceroute.research.rlm.tools import READ_PRIOR_FINDINGS
 
 AccessStatus = Literal["none", "partial", "complete"]
@@ -44,6 +45,9 @@ class InvocationOutcome:
     forwarded_findings: tuple[Finding, ...] = ()
     direct_span_ids: tuple[tuple[str, str], ...] = ()
     acknowledged_prior_finding_ids: tuple[str, ...] = ()
+    acknowledged_local_finding_ids: tuple[str, ...] = ()
+    conclusions: tuple[Conclusion, ...] = ()
+    withheld_conclusions: bool = False
 
     @property
     def acknowledged_findings(self) -> tuple[Finding, ...]:
@@ -218,6 +222,10 @@ def aggregate_research_trees(
             run.selected_local_finding_ids if run else (),
             run.selected_inherited_findings if run and invocation.parent_id is not None else (),
             tuple(sorted(spans)), tuple(sorted(prior_ids)),
+            tuple(dict.fromkeys(f"{invocation.invocation_id}:finding-{ref[1:]}"
+                                for step in run.steps for op in step.operations for ref in op.acknowledged_finding_refs))
+            if run and run.conclusions else (),
+            run.conclusions if run else (), run.withheld_conclusions if run else False,
         ))
         for child, child_acknowledged in children:
             assert child.invocation is not None

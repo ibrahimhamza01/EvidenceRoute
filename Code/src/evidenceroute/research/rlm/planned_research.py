@@ -162,7 +162,7 @@ def execute_research_plan(
             question += f"\nSynthesis guidance: {root_guidance}"
         trace = runner.run(question, partitions=tuple(pair for group in admitted for pair in group.targets),
                            root_delegation_groups=tuple(group.targets for group in admitted),
-                           delegation_first=delegation_first, _budget=_budget, _id_prefix=_id_prefix)
+                           required_operands=plan.intent.required_operands, delegation_first=delegation_first, _budget=_budget, _id_prefix=_id_prefix)
 
     coverage = aggregate_research_coverage(runner.corpus, plan, trace)
     by_pair = {target.pair: target for target in coverage.targets}

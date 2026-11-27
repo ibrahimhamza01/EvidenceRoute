@@ -17,7 +17,8 @@ from evidenceroute.research.rlm.controller import ExecutionTrace
 from evidenceroute.research.rlm.findings import Finding, FindingEvidence
 from evidenceroute.research.rlm.planned_research import GroupOutcome, admit_company_groups, execute_research_plan
 from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan
-from evidenceroute.research.rlm.publication import PublicationState, publish_research_findings
+from evidenceroute.research.rlm.synthesis import AnswerDisposition
+from evidenceroute.research.rlm.publication import PublicationState, PublishedConclusion, publish_research_findings
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.research_coverage import ResearchCoverage, aggregate_research_trees
 from evidenceroute.research.rlm.tools import EvidenceRef
@@ -106,6 +107,9 @@ class CorpusResearchResult:
     comparative_capture: bool = False
     answer_citations: tuple[EvidenceRef, ...] = ()
     publication_state: PublicationState = "insufficient_evidence"
+
+    answer_disposition: AnswerDisposition | None = None
+    published_conclusions: tuple[PublishedConclusion, ...] = ()
 
     @property
     def group_counts(self) -> dict[str, int]:
@@ -435,6 +439,8 @@ def execute_corpus_research(
     if retained:
         answer += f"\nRetained child findings without parent acknowledgement. {len(retained)}."
     compact_comparative = comparative and runner.comparative_capture
+    published = ()
+    disposition = None
     if comparative and not compact_comparative:
         assessment = "Batch-root comparisons.\n" + render_comparisons(root_comparisons)
         if child_comparisons:
@@ -451,14 +457,16 @@ def execute_corpus_research(
     else:
         publication = publish_research_findings(
             coverage.invocations, incomplete=incomplete, compact_comparative=compact_comparative,
-            prior_findings=runner._prior_findings,
+            prior_findings=runner._prior_findings, generic_plan=None if comparative else plan,
         )
         answer += "\n\n" + publication.answer
         answer_citations = publication.answer_citations
         publication_state = publication.publication_state
+        disposition = publication.answer_disposition
+        published = publication.published_conclusions
     return CorpusResearchResult(plan, limits, run_id, groups, tuple(batches), coverage, scan, usage,
                                 root_findings, selected, child_findings, retained, root_comparisons, child_comparisons, evidence,
                                 tuple(citations[key] for key in sorted(citations)), tuple(sorted(assessed)), tuple(errors),
                                 tuple(diagnostics), stop,
                                 "finished" if finished else "incomplete", "incomplete" if incomplete else "unverified",
-                                answer, compact_comparative, answer_citations, publication_state)
+                                answer, compact_comparative, answer_citations, publication_state, disposition, published)

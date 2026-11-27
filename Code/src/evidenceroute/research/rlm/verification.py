@@ -15,7 +15,7 @@ from pydantic import Field, ValidationError
 from evidenceroute.research.rlm.bedrock import BedrockRootClient
 from evidenceroute.research.rlm.budget import BudgetExceeded, EstimatedTokenBudget
 from evidenceroute.research.rlm.checkpoint import MAX_VERIFICATION_RUNS, CheckpointError, ResearchCheckpoint, plan_continuation
-from evidenceroute.research.rlm.checkpoint_validation import validate_checkpoint, validate_recovery_proposals
+from evidenceroute.research.rlm.checkpoint_validation import checkpoint_version, validate_checkpoint, validate_recovery_proposals
 from evidenceroute.research.rlm.claude import ClaudeModelError
 from evidenceroute.research.rlm.comparison import Comparison, ranked_cross_year_pairs
 from evidenceroute.research.rlm.coverage import SectionTarget
@@ -389,7 +389,10 @@ def record_verification(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironmen
     """Attach a settled verification run, preserving the original findings and access records."""
     if len(checkpoint.verification_runs) >= MAX_VERIFICATION_RUNS:
         raise CheckpointError("Checkpoint verification history limit reached.")
-    updated = checkpoint.model_copy(update={"version": max(2, checkpoint.version), "verification_runs": (*checkpoint.verification_runs, run)})
+    updated = checkpoint.model_copy(update={
+        "version": checkpoint_version(checkpoint.plan, checkpoint.runs, verified=True),
+        "verification_runs": (*checkpoint.verification_runs, run),
+    })
     validate_checkpoint(updated, corpus)
     return updated
 

@@ -14,7 +14,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from evidenceroute.research.rlm.checkpoint_validation import CHECKPOINT_VERSIONS, CheckpointError, validate_checkpoint
+from evidenceroute.research.rlm.checkpoint_validation import CHECKPOINT_VERSIONS, CheckpointError, checkpoint_version, validate_checkpoint
 from evidenceroute.research.rlm.comparison import Comparison
 from evidenceroute.research.rlm.corpus_research import (
     BatchOutcome, CorpusGroupOutcome, CorpusLimits, CorpusResearchResult, CorpusUsage, execute_corpus_research,
@@ -98,7 +98,7 @@ def _sum_usage(entries: Iterable[CorpusUsage]) -> CorpusUsage:
 
 
 class ResearchCheckpoint(_CheckpointModel):
-    version: Literal[1, 2, 3]
+    version: Literal[1, 2, 3, 4]
     corpus_identity: Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
     plan: ResearchPlan
     runs: tuple[CheckpointRun, ...] = Field(min_length=1, max_length=MAX_CHECKPOINT_RUNS)
@@ -127,6 +127,8 @@ class ResearchCheckpoint(_CheckpointModel):
             (node for run in self.runs for node in run.coverage.invocations),
             incomplete=self.research_status == "incomplete",
             compact_comparative=any(run.comparative_capture for run in self.runs),
+            generic_plan=None if self.scan_terms or (self.discovery and self.plan.intent.objective == "year_over_year")
+            else self.plan,
         )
 
     @property
@@ -221,9 +223,10 @@ def create_checkpoint(
         discovery = discovery or result.scan.discovery
         if discovery is None:
             scan_terms = scan_terms or result.scan.terms
+    runs = (CheckpointRun.from_result(result, result.plan.requested_companies),)
     checkpoint = ResearchCheckpoint(
-        version=3 if result.comparative_capture else 1, corpus_identity=corpus.snapshot_identity, plan=result.plan,
-        runs=(CheckpointRun.from_result(result, result.plan.requested_companies),), interpretation=interpretation,
+        version=checkpoint_version(result.plan, runs), corpus_identity=corpus.snapshot_identity, plan=result.plan,
+        runs=runs, interpretation=interpretation,
         discovery=discovery, scan_terms=scan_terms,
         discovery_cache=_complete_scan(result.scan, result.plan) if discovery is not None and result.comparative_capture else None,
     )
@@ -278,9 +281,10 @@ def continue_research(
         scan_terms=checkpoint.scan_terms or None, root_guidance=goal, _target_companies=targets,
         _cached_scan=checkpoint.discovery_cache,
     )
+    runs = (*checkpoint.runs, CheckpointRun.from_result(result, targets))
     updated = checkpoint.model_copy(update={
-        "version": 3 if result.comparative_capture else checkpoint.version,
-        "runs": (*checkpoint.runs, CheckpointRun.from_result(result, targets)),
+        "version": checkpoint_version(checkpoint.plan, runs, bool(checkpoint.verification_runs)),
+        "runs": runs,
     })
     validate_checkpoint(updated, runner.corpus)
     return updated
@@ -334,9 +338,16 @@ def load_checkpoint(path: Path | str, corpus: CorpusEnvironment) -> ResearchChec
 def save_checkpoint(path: Path | str, checkpoint: ResearchCheckpoint) -> None:
     """Write one checkpoint atomically using a same-directory, private temporary file."""
     target = Path(path)
-    exclude = {"verification_runs"} if not checkpoint.verification_runs else set()
+    if checkpoint.version != checkpoint_version(checkpoint.plan, checkpoint.runs, bool(checkpoint.verification_runs)):
+        raise CheckpointError("Checkpoint version differs from its recorded history.")
+    exclude = {} if checkpoint.verification_runs else {"verification_runs": True}
+    if checkpoint.version < 4:
+        exclude["plan"] = {"intent": {"required_operands"}}
+        outcome = {"invocation": {"required_operands"}, "conclusions": True,
+                   "withheld_conclusions": True, "acknowledged_local_finding_ids": True}
+        exclude["runs"] = {"__all__": {"coverage": {"invocations": {"__all__": outcome}}}}
     if checkpoint.discovery_cache is None:
-        exclude.add("discovery_cache")
+        exclude["discovery_cache"] = True
     payload = checkpoint.model_dump_json(exclude=exclude).encode("utf-8")
     _decode_checkpoint(payload)
     temporary = None
