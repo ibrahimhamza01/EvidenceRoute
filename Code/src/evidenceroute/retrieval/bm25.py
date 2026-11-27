@@ -14,7 +14,7 @@ import hashlib
 import json
 import math
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -91,3 +91,40 @@ class BM25Retriever:
         results = [RetrievalResult(chunk=self.corpus[i], score=score)
                    for i, score in self.scores(query, filters).items()]
         return rank_results(results)[:top_k]
+
+
+def score_texts(query: str, documents: Sequence[str], config: BM25Config | None = None) -> list[float]:
+    """Score plain documents with the same Okapi BM25 formula as ``BM25Retriever``.
+
+    IDF is computed over ``documents``. Length normalization follows ``config``.
+    """
+    config = config or BM25Config()
+    tokenized = [tokenize(document, remove_stopwords=config.remove_stopwords) for document in documents]
+    if not tokenized:
+        return []
+    counts = [Counter(tokens) for tokens in tokenized]
+    frequencies: dict[str, int] = {}
+    for seen in counts:
+        for term in seen:
+            frequencies[term] = frequencies.get(term, 0) + 1
+    n_docs = len(tokenized)
+    lengths = [sum(seen.values()) for seen in counts]
+    average = (sum(lengths) / n_docs) if n_docs else 0.0
+    idf = {
+        term: math.log(1.0 + (n_docs - frequency + 0.5) / (frequency + 0.5))
+        for term, frequency in frequencies.items()
+    }
+    k1, b = config.k1, config.b
+    query_terms = list(dict.fromkeys(tokenize(query, remove_stopwords=config.remove_stopwords)))
+    scores = []
+    for seen, length in zip(counts, lengths):
+        length_norm = 1.0 - b + (b * (length / average) if average else 0.0)
+        total = 0.0
+        for term in query_terms:
+            weight = idf.get(term)
+            if weight is None or term not in seen:
+                continue
+            frequency = seen[term]
+            total += weight * (frequency * (k1 + 1.0) / (frequency + k1 * length_norm))
+        scores.append(total)
+    return scores

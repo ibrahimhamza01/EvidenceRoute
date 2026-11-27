@@ -37,9 +37,15 @@ class BoundOperand(SourceOperand):
 
 class Assessment(StrictInput):
     model_config = ConfigDict(frozen=True)
-    statement: str = Field(min_length=1, max_length=700)
+    statement: str = Field(
+        min_length=1, max_length=1200,
+        description="The requested answer in at most 1200 characters. Do not restate every finding.",
+    )
     disposition: AnswerDisposition = Field(description="Investigator assessment of the requested answer within this root's scope.")
-    qualification: Note | None = None
+    qualification: str | None = Field(
+        default=None, min_length=1, max_length=600,
+        description="Optional caveat in at most 600 characters. Omit it when the statement is enough.",
+    )
 
 
 class ConclusionDraft(Assessment):

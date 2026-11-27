@@ -76,6 +76,8 @@ _FINDING_FIELDS = frozenset({
     "comparisons", "risk", "assessments", "ref", "context_ref", "finding_index", "ai_context_finding_index",
     "same_risk", "relevance", "entailment", "rationale", "infrastructure_connection", "ai_specificity",
     "ai_specific_connection",
+    "conclusions", "statement", "qualification", "disposition", "bindings",
+    "ticker", "filing_year", "section_id", "period_text",
 })
 
 

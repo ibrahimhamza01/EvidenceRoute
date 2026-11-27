@@ -203,6 +203,7 @@ class RecursiveResearch:
                        "Copy ticker, filing_year, and section_id from that finding. Do not send finding_id as ref. "
                        "Leave period_text null unless that exact text is in the bound quote. "
                        "Preserve the requested metric, unit, period, and qualifiers. A related measure is not a substitute. "
+                       "Keep statement to 1200 characters and qualification to 600. "
                        "Use cite_refs alone for descriptive findings or when a relationship lacks support.")
             if invocation.required_operands:
                 prompt += "\nEach conclusion requires these source operands: " + observation_json(invocation.required_operands)
@@ -340,6 +341,18 @@ class RecursiveSession:
             if len(entries) < 6:
                 entries.append(f"{chunk}/{span}")
         return locators
+
+    def generic_findings_ready(self) -> bool:
+        """Submitted findings cover every assigned document-section pair. Reads do not count."""
+        partitions = self.invocation.partitions
+        if (self.invocation.depth == 0 or not partitions or self.compact_comparative
+                or self.runner.comparison_scan is not None):
+            return False
+        covered = {
+            (item.source.document_id, item.source.section_id)
+            for finding in self.submitted_findings.values() for item in finding.evidence
+        }
+        return {(pair.document_id, pair.section_id) for pair in partitions} <= covered
 
     def allow_investigation_tool(self, name: str, arguments: dict, local_slots: int) -> bool:
         """Protect an original-text read opportunity for each resolved year."""

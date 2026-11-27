@@ -363,6 +363,7 @@ class RootController:
         capture_turn_used = False
         capture_next = False
         comparison_fallback = None
+        conclusion_correction = None
         tool_limit = self._limits.max_tool_calls
         reinvestigation_limit = _recursive.runner.max_root_reinvestigation_calls if _recursive else None
 
@@ -425,6 +426,7 @@ class RootController:
                             notice += (" Bind required operands with dN or sN aliases, not finding IDs. "
                                        "Leave period_text null unless the quote contains that exact text. "
                                        "Keep the requested metric, unit, period, and qualifier. "
+                                       "Statement max 1200 characters; qualification max 600. "
                                        "If a requested part has no supporting excerpt, name that part instead of substituting a related measure.")
                         if replay_reason == "truncated_response" and self._comparative:
                             notice += " Prioritize one comparison per company and reference the strongest evidence."
@@ -441,6 +443,9 @@ class RootController:
                     )
                 else:
                     notice = ""
+                    if _recursive.generic_findings_ready():
+                        notice = ("Submitted findings cover every assigned document and section. "
+                                  "You may finish, or keep investigating within the remaining budget. ")
                 if allocation is not None and not finalization_reason:
                     if not unassigned:
                         offered_tools = [tool for tool in tools if (
@@ -642,6 +647,10 @@ class RootController:
                         if validation:
                             step.finding_validation = validation
                     except FindingValidationError as exc:
+                        if conclusion_correction is not None:
+                            citations = ()
+                            stop = "finished"
+                            break
                         pending = self._finding_feedback(step, exc)
                         continue
                     if (issues and finalization_reason and comparison_fallback is None
@@ -656,6 +665,23 @@ class RootController:
                         pending = self._feedback(step, "comparison_correction",
                                                  "Use a short mechanism label (120 characters max). "
                                                  f"Use only these acknowledged aliases: {aliases}.")
+                        continue
+                    schema_issues = [issue for issue in _recursive.conclusion_rejections if issue.category == "schema"]
+                    if (schema_issues and _recursive.generic_root and conclusion_correction is None
+                            and allocation is not None and allocation.finalization_left
+                            and iteration < self._limits.max_iterations):
+                        conclusion_correction = (citations, _recursive.selected_local_finding_ids,
+                                                 _recursive.selected_inherited_findings, _recursive.used_finding_ids)
+                        detail = "; ".join(f"{issue.path} {issue.code}" for issue in schema_issues[:4])
+                        pending = self._feedback(
+                            step, "conclusion_correction",
+                            f"Conclusion schema rejected ({detail}). "
+                            "Keep the same acknowledged bindings and cite_refs. "
+                            "Use at most 1200 characters for statement and 600 for qualification. "
+                            "Do not investigate again.",
+                        )
+                        if finalization_reason is None:
+                            finalization_reason = "conclusion_correction"
                         continue
                     answer = _recursive.render_answer("")
                     stop = "finished"
@@ -735,6 +761,12 @@ class RootController:
         ):
             (citations, _recursive.selected_local_finding_ids, _recursive.selected_inherited_findings,
              _recursive.used_finding_ids) = comparison_fallback
+            answer, stop, budget_stop = _recursive.render_answer(""), "finished", None
+        elif conclusion_correction is not None and conclusion_correction[0] and (
+            stop != "finished" or not citations
+        ):
+            (citations, _recursive.selected_local_finding_ids, _recursive.selected_inherited_findings,
+             _recursive.used_finding_ids) = conclusion_correction
             answer, stop, budget_stop = _recursive.render_answer(""), "finished", None
         report = coverage.report()
         metadata = _recursive.trace_fields(report) if _recursive is not None else {}

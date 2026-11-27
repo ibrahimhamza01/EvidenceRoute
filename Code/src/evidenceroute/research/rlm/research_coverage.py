@@ -227,8 +227,8 @@ def aggregate_research_trees(
                                 for step in run.steps for op in step.operations for ref in op.acknowledged_finding_refs))
             if run and run.conclusions else (),
             run.conclusions if run else (), run.withheld_conclusions if run else False,
-            tuple(issue for step in (run.steps if run else ()) for issue in step.finding_validation
-                  if issue.path.startswith("synthesis.conclusions")),
+            tuple(issue for step in run.steps for issue in step.finding_validation
+                  if issue.path.startswith("synthesis.conclusions")) if run and run.withheld_conclusions else (),
         ))
         for child, child_acknowledged in children:
             assert child.invocation is not None

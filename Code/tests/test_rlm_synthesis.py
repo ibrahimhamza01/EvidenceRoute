@@ -9,14 +9,14 @@ import pytest
 
 from evidenceroute.research.rlm import CorpusEnvironment
 from evidenceroute.research.rlm.bedrock import BedrockConfig
-from evidenceroute.research.rlm.budget import SharedLimits
+from evidenceroute.research.rlm.budget import FinalizationPolicy, SharedLimits
 from evidenceroute.research.rlm.checkpoint import CheckpointError, continue_research, create_checkpoint, load_checkpoint, save_checkpoint
 from evidenceroute.research.rlm.controller import ScriptedModelClient, finish_input_schema
 from evidenceroute.research.rlm.corpus_research import CorpusLimits, execute_corpus_research
 from evidenceroute.research.rlm.planning import ResearchIntent, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.spans import passage_spans
-from evidenceroute.research.rlm.synthesis import SourceOperand, validate_conclusion
+from evidenceroute.research.rlm.synthesis import SourceOperand, resolve_conclusions, validate_conclusion
 from evidenceroute.research.rlm.tools import EvidenceRef
 from evidenceroute.research.rlm.verification import (
     BedrockSemanticVerifier, VerificationLimits, record_verification, verification_report, verify_checkpoint,
@@ -115,6 +115,81 @@ def run(corpus, *, companies=("AAPL", "AMZN"), years=(2024,), sections=("item_1a
     result = execute_corpus_research(plan, runner, limits=limits, max_groups=batch_size)
     assert bool(result.errors) == (mode == "unfinished")
     return result, runner, clients
+
+
+def test_conclusion_schema_names_the_rejected_field_and_one_correction_keeps_findings(corpus):
+    bindings = [
+        {"ref": "d1", "ticker": "AAPL", "filing_year": 2024, "section_id": "item_1a"},
+        {"ref": "d2", "ticker": "AMZN", "filing_year": 2024, "section_id": "item_1a"},
+    ]
+    _, issues = resolve_conclusions([{
+        "statement": "x" * 1201, "disposition": "answered", "qualification": "y" * 601, "bindings": bindings,
+    }], {}, (), None, [], type("Coverage", (), {"visible_chunks": ()})())
+    assert {(issue.path, issue.code) for issue in issues} == {
+        ("synthesis.conclusions[0].statement", "string_too_long"),
+        ("synthesis.conclusions[0].qualification", "string_too_long"),
+    }
+    _, accepted = resolve_conclusions([{
+        "statement": "x" * 701, "disposition": "answered", "bindings": bindings,
+    }], {}, (), None, [], type("Coverage", (), {"visible_chunks": ()})())
+    assert accepted[0].code == "unacknowledged_finding_reference"
+    assert accepted[0].path == "synthesis.conclusions[0].bindings"
+
+    required = tuple(SourceOperand(ticker=ticker, filing_year=2024, section_id="item_1a") for ticker in ("AAPL", "AMZN"))
+    plan = resolve_research_plan(ResearchIntent(
+        question="How do the selected disclosures compare?", companies=("AAPL", "AMZN"), company_selection="explicit",
+        fiscal_years=(2024,), section_ids=("item_1a",), topic="Disclosures", comprehensive=False, objective="review",
+        inferred_fields=(), required_operands=required,
+    ), corpus)
+    clients = []
+
+    def factory(inv):
+        actions = []
+        if inv.depth:
+            for pair in inv.partitions:
+                filing = corpus.get_filing(pair.document_id)
+                chunk, span, claim = EXCERPTS[filing.ticker, filing.fiscal_year, pair.section_id]
+                actions.append(tool("get_spans", chunk_id=chunk, span_ids=[span]))
+            actions.append(dict(type="finish", answer="Child evidence.", findings=[{
+                "claim": claim, "analysis_status": "analyzed",
+                "evidence": [{"chunk_id": chunk, "span_id": span}],
+            }]))
+        else:
+            bindings = []
+            for group in plan.groups:
+                actions.append(tool("delegate_research", question="Inspect disclosures.", goal="Find scoped evidence.",
+                                    partitions=[asdict(pair) for pair in group.targets]))
+                for pair in group.targets:
+                    filing = corpus.get_filing(pair.document_id)
+                    bindings.append(dict(ticker=filing.ticker, filing_year=filing.fiscal_year,
+                                         section_id=pair.section_id, ref=f"d{len(bindings) + 1}"))
+            refs = [item["ref"] for item in bindings]
+            actions.append(dict(type="synthesis", synthesis=dict(
+                cite_refs=refs, analysis_status="analyzed", conclusions=[{
+                    "statement": "x" * 1201, "disposition": "answered", "bindings": bindings,
+                }])))
+            actions.append(dict(type="synthesis", synthesis=dict(
+                cite_refs=refs, analysis_status="analyzed", conclusions=[{
+                    "statement": STATEMENT, "disposition": "answered", "bindings": bindings,
+                }])))
+        client = ScriptedModelClient(actions)
+        clients.append(client)
+        return client
+
+    runner = RecursiveResearch(
+        corpus, factory,
+        shared_limits=SharedLimits(max_delegations=2, max_partitions=4, max_provider_attempts=16,
+                                   max_corpus_attempts=16, max_reported_tokens=80_000),
+        finalization=FinalizationPolicy(child_provider_attempts=4, finalization_attempts=2),
+    )
+    result = execute_corpus_research(plan, runner, limits=CorpusLimits(
+        max_batches=1, max_provider_attempts=16, max_corpus_attempts=16, max_delegations=2,
+        max_partitions=4, max_reported_tokens=80_000, deadline_seconds=60,
+    ), max_groups=2)
+    assert STATEMENT in result.answer and result.answer_disposition == "answered"
+    assert "string_too_long" not in result.answer
+    feedback = " ".join(item or "" for client in clients for item in client.observations)
+    assert "conclusion_correction" in feedback and "synthesis.conclusions[0].statement string_too_long" in feedback
 
 
 def test_canonical_conclusion_replay_and_continuation(corpus, path):
