@@ -67,6 +67,7 @@ def test_round_trip_retains_partial_work_and_runs_only_failed_assignment(corpus,
     assert [finding.evidence[0].source.ticker for finding in loaded.findings] == ["AAPL", "AMZN"]
     original_apple, original_amazon = loaded.findings
     assert loaded.assignments[0].pending_reason is None and loaded.assignments[1].pending_reason == "child_failed"
+    assert loaded.publication == initial.publication
     assert [group.ticker for group in plan_continuation(loaded).groups] == ["AMZN"]
     assert [group.ticker for group in plan_continuation(loaded, ("AAPL",)).groups] == ["AAPL"]
 
@@ -93,7 +94,50 @@ def test_round_trip_retains_partial_work_and_runs_only_failed_assignment(corpus,
     assert restored.historical_usage == initial.current_usage
     assert restored.current_usage.corpus_attempts == 3 and restored.cumulative_usage.corpus_attempts == 7
     assert restored.historical_usage.lexical_chunks_scanned == 97 and restored.current_usage.lexical_chunks_scanned == 44
+    assert restored.publication == updated.publication
+    assert restored.publication.publication_state == "selected_evidence"
+    assert "Constraints on these products could impair" in restored.publication.answer
+    assert [ref.chunk_id for ref in restored.publication.answer_citations] == [
+        original_apple.evidence[0].source.chunk_id, original_amazon.evidence[0].source.chunk_id,
+    ]
     assert not plan_continuation(restored).groups
+
+
+def test_checkpoint_keeps_local_findings_with_missing_selection_out_of_answer(corpus, demo, checkpoint_path):
+    plan = make_initial(corpus, demo, companies=("AAPL",)).plan
+    disclosure = demo["DISCLOSURES"]["AAPL"]
+    tool = demo["_tool"]
+
+    def factory(invocation):
+        if invocation.depth:
+            return ScriptedModelClient([demo["_finish"]()])
+        return ScriptedModelClient([
+            tool("delegate_research", question="Review Apple FX risks.", goal="Find relevant disclosures.",
+                 partitions=[asdict(pair) for pair in invocation.partitions]),
+            *demo["_submit"](disclosure),
+            demo["_finish"]("s1"),
+        ])
+
+    runner = RecursiveResearch(corpus, factory, shared_limits=demo["_runner"](corpus).shared_limits)
+    result = execute_corpus_research(plan, runner, limits=demo["_limits"](1))
+    checkpoint = create_checkpoint(corpus, result)
+    assert checkpoint.findings == result.root_findings
+    finding, = result.root_findings
+    assert disclosure[2] in result.answer and result.publication_state == "selected_evidence"
+    assert result.answer_citations == (finding.evidence[0].source,)
+    assert result.answer.endswith(checkpoint.publication.answer)
+
+    historical = checkpoint.model_dump(mode="json")
+    root = historical["runs"][0]["coverage"]["invocations"][0]
+    assert root.pop("selected_local_finding_ids") == [finding.finding_id]
+    checkpoint_path.write_text(json.dumps(historical))
+    loaded = load_checkpoint(checkpoint_path, corpus)
+    assert loaded.version == checkpoint.version and loaded.findings == checkpoint.findings
+    assert loaded.evidence == checkpoint.evidence and loaded.citations == checkpoint.citations
+    assert loaded.merged_coverage(corpus).targets == checkpoint.merged_coverage(corpus).targets
+    assert loaded.cumulative_usage == checkpoint.cumulative_usage and loaded.research_status == checkpoint.research_status
+    assert loaded.publication.publication_state == "insufficient_evidence" and not loaded.publication.answer_citations
+    assert "lack a reconstructible selection" in loaded.publication.answer and finding.claim not in loaded.publication.answer
 
 
 def test_default_selects_unattempted_and_preserves_unresolvable_denominator(corpus, demo):

@@ -70,6 +70,12 @@ def test_full_corpus_checkpoint_resume_without_rescan_or_completed_research(corp
     path = tmp_path / "corpus.json"
     checkpoint = create_checkpoint(corpus, initial)
     assert len(checkpoint.findings) == 2
+    assert initial.publication_state == "selected_evidence"
+    assert initial.answer.endswith(checkpoint.publication.answer)
+    assert initial.answer_citations == checkpoint.publication.answer_citations
+    assert set(initial.answer_citations) == {item.source for item in checkpoint.evidence}
+    assert all(finding.claim in initial.answer for finding in checkpoint.findings)
+    assert "Semantically unverified" in initial.answer and "No filing-wide novelty conclusion is established" in initial.answer
     save_checkpoint(path, checkpoint)
 
     def unexpected(*args, **kwargs):
@@ -95,6 +101,7 @@ def test_full_corpus_checkpoint_resume_without_rescan_or_completed_research(corp
     reviewed = review_checkpoint(final, corpus, verifier, limits=VerificationLimits())
     after = verification_report(reviewed)
     assert reviewed.comparisons == final.comparisons and reviewed.findings == final.findings
+    assert reviewed.publication == final.publication == checkpoint.publication
     assert after["conclusions"][0]["status"] == "partially_supported"
     assert "general data-center power or water constraint" in after["answer"]
     assert "specifically concerns AI" not in after["answer"]

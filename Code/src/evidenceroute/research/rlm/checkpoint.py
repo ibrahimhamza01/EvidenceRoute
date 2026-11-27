@@ -24,6 +24,7 @@ from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import Finding, FindingEvidence
 from evidenceroute.research.rlm.interpretation import InterpretationLimits
 from evidenceroute.research.rlm.natural_language import QuestionResearchResult
+from evidenceroute.research.rlm.publication import ResearchPublication, publish_research_findings
 from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.research_coverage import ResearchCoverage, merge_research_coverage
@@ -118,6 +119,15 @@ class ResearchCheckpoint(_CheckpointModel):
     @property
     def citations(self) -> tuple[EvidenceRef, ...]:
         return tuple(sorted({ref for run in self.runs for ref in run.citations}, key=lambda ref: ref.chunk_id))
+
+    @property
+    def publication(self) -> ResearchPublication:
+        """Render original investigator evidence from the saved ledger, including continuations."""
+        return publish_research_findings(
+            (node for run in self.runs for node in run.coverage.invocations),
+            incomplete=self.research_status == "incomplete",
+            compact_comparative=any(run.comparative_capture for run in self.runs),
+        )
 
     @property
     def comparisons(self) -> tuple[Comparison, ...]:

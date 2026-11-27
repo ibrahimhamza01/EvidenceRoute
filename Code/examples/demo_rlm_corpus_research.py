@@ -144,6 +144,7 @@ def main(argv=None) -> int:
         "resolved_targets": len(plan.resolved_targets), "independent_semantic_verification": bool(checkpoint and checkpoint.verification_runs),
         "group_counts": result.group_counts if result else None,
         "result": result, "final_report": verification_report(checkpoint) if checkpoint else None,
+        "publication": checkpoint.publication if checkpoint else None,
         "coverage": checkpoint.merged_coverage(corpus) if checkpoint else result.coverage,
     }
     print(json.dumps(trace_data(json.loads(observation_json(report))), indent=2))

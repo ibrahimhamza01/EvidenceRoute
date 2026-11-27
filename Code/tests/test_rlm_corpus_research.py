@@ -4,17 +4,20 @@ import json
 import runpy
 from dataclasses import asdict
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from evidenceroute.research.rlm import CorpusEnvironment
 from evidenceroute.research.rlm.budget import FinalizationPolicy, SharedLimits
+from evidenceroute.research.rlm.checkpoint import create_checkpoint
 from evidenceroute.research.rlm.controller import ModelAttempt, RootLimits, ScriptedModelClient
 from evidenceroute.research.rlm.corpus_research import CorpusLimits, execute_corpus_research
 from evidenceroute.research.rlm.discovery import DiscoverySpec
 from evidenceroute.research.rlm.planning import interpret_intent, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.spans import passage_spans
+from evidenceroute.research.rlm.tools import EvidenceRef
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 
@@ -167,6 +170,11 @@ def test_zero_candidates_and_unresolved_subset_keep_original_denominator(corpus)
                for target in result.coverage.targets)
     assert all(node.selected_inherited_finding_ids == node.used_finding_ids for node in result.coverage.invocations
                if node.invocation.depth == 0)
+    assert result.publication_state == "comparison_evidence"
+    assert tuple(ref.chunk_id for ref in result.answer_citations) == tuple(dict.fromkeys(
+        chunk_id for comparison in (*result.root_comparisons, *result.acknowledged_child_comparisons)
+        for chunk_id in comparison.assessed_chunk_ids
+    ))
     assert len({node.invocation.invocation_id for node in result.coverage.invocations}) == 4
     for item in result.evidence:
         chunk = corpus.get_chunk(item.source.chunk_id)
@@ -230,6 +238,116 @@ def test_scheduling_without_a_scan_keeps_noncomparative_multi_section_scope(corp
     assert result.execution_status == "finished" and result.research_status == "incomplete"
     assert result.scan is None and result.coverage.required_target_count == 4
     assert [inv.partitions for inv in invocations if inv.depth] == [group.targets for group in plan.groups]
+    assert result.publication_state == "insufficient_evidence" and not result.answer_citations
+    assert "Insufficient captured evidence" in result.answer and "cannot establish absence" in result.answer
+    assert "Scripted abstention" not in result.answer
+
+
+@pytest.mark.parametrize("root_decision", ["selected", "unfinished", "declined", "unacknowledged"])
+def test_descriptive_publication_uses_recorded_evidence_with_or_without_discovery(corpus, monkeypatch, root_decision):
+    for module in ("corpus_research", "recursive"):
+        monkeypatch.setattr(f"evidenceroute.research.rlm.{module}.uuid4", lambda: UUID(int=1))
+    plan = resolve_research_plan(interpret_intent("Review the stated supply risks.", lambda *_: {
+        "company_selection": "explicit", "companies": ["AMZN"], "fiscal_years": [2024],
+        "section_ids": ["item_1a"], "objective": "review", "topic": "Supply risk",
+        "comprehensive": False, "inferred_fields": [],
+    }), corpus)
+    pair, = plan.resolved_targets
+    chunks = sorted(corpus.read_chunks(pair.document_id, pair.section_id, limit=3).items,
+                    key=lambda chunk: chunk.chunk_id, reverse=True)
+    first, second, unused = (chunk.chunk_id for chunk in chunks)
+    spans = {chunk.chunk_id: next(iter(passage_spans(chunk.text))) for chunk in chunks}
+
+    def tool(name, **arguments):
+        return {"type": "tool", "name": name, "arguments": arguments}
+
+    def draft(claim, *keys, **qualifications):
+        return {"claim": claim, "analysis_status": "analyzed",
+                "evidence": [{"chunk_id": key, "span_id": spans[key]} for key in keys], **qualifications}
+
+    drafts = [
+        draft("If supply tightens, expenses could rise by $5 million per quarter.", first, second,
+              uncertainty="The estimate is conditional."),
+        {**draft("Expenses might stay flat during FY2024.", first, conflict="The supplied estimates differ."),
+         "analysis_status": "conflicting"},
+        draft("A third retained claim.", unused),
+    ]
+
+    def factory(invocation):
+        if invocation.depth:
+            return ScriptedModelClient([
+                *(tool("get_spans", chunk_id=key, span_ids=[span]) for key, span in spans.items()),
+                {"type": "finish", "answer": "Child draft.", "findings": drafts},
+            ])
+        decisions = [tool("delegate_research", question="Read disclosures.", goal="Record exact evidence.",
+                          partitions=[asdict(pair)])]
+        if root_decision == "selected":
+            prefix = invocation.invocation_id.removesuffix("root")
+            decisions.extend([
+                tool("get_chunk", chunk_id=unused),
+                {"type": "finish", "answer": "Root draft.", "analysis_status": "analyzed",
+                 "used_finding_ids": [f"{prefix}child-1:finding-{index}" for index in (1, 2)],
+                 "cited_chunk_ids": [first, unused]},
+            ])
+        elif root_decision != "unfinished":
+            decisions.append({"type": "finish", "answer": "Root draft."})
+        client = ScriptedModelClient(decisions)
+        if root_decision == "unacknowledged":
+            client.last_observation_delivered = False
+        return client
+
+    runner = RecursiveResearch(corpus, factory, shared_limits=SharedLimits(max_delegations=1, max_partitions=1))
+    discovery = DiscoverySpec.from_intent(plan.intent, ("unlikelyliteralfixture",))
+    direct = execute_corpus_research(plan, runner, limits=overall())
+    scanned = execute_corpus_research(plan, runner, limits=overall(), discovery=discovery)
+    assert direct.answer == scanned.answer and direct.answer_citations == scanned.answer_citations
+    assert direct.coverage == scanned.coverage and direct.citations == scanned.citations
+    assert direct.root_selected_inherited_findings == scanned.root_selected_inherited_findings
+    assert direct.usage.corpus_attempts == scanned.usage.corpus_attempts
+    assert direct.usage.provider_attempts == scanned.usage.provider_attempts == 0
+    assert direct.execution_status == scanned.execution_status
+    assert direct.research_status == scanned.research_status == "incomplete"
+    assert direct.stop_reason == scanned.stop_reason == "schedule_completed"
+    publication = create_checkpoint(corpus, direct).publication
+    assert direct.answer.endswith(publication.answer) and direct.answer_citations == publication.answer_citations
+    assert "Research is incomplete" in direct.answer and "Root draft." not in direct.answer
+    child = direct.coverage.invocations[1]
+    assert len(child.findings) == 3
+    for finding, original in zip(child.findings, drafts):
+        assert finding.claim == original["claim"]
+        for evidence in finding.evidence:
+            chunk = corpus.get_chunk(evidence.source.chunk_id)
+            start, end = passage_spans(chunk.text)[evidence.span_id]
+            assert evidence.source == EvidenceRef.from_chunk(chunk) and evidence.quote == chunk.text[start:end]
+
+    expected_state, keys = {
+        "selected": ("selected_evidence", [first, second]),
+        "unfinished": ("partial_evidence", [first, second, unused]),
+        "declined": ("insufficient_evidence", []),
+        "unacknowledged": ("insufficient_evidence", []),
+    }[root_decision]
+    assert direct.publication_state == scanned.publication_state == publication.publication_state == expected_state
+    assert [ref.chunk_id for ref in direct.answer_citations] == keys
+    cited_in_answer = [key for line in direct.answer.splitlines() if "Evidence chunks " in line
+                       for key in line.split("Evidence chunks ")[1].split(" Uncertainty.")[0].split(" Conflict.")[0].split(", ")]
+    assert list(dict.fromkeys(cited_in_answer)) == keys
+    if root_decision == "selected":
+        assert direct.execution_status == "finished" and direct.coverage.targets[0].status == "partial"
+        assert [ref.chunk_id for ref in direct.citations] == sorted([first, unused])
+        assert cited_in_answer.count(first) == 2
+        assert "Findings selected by finished roots." in direct.answer
+        assert "A third retained claim." not in direct.answer
+    if root_decision == "unfinished":
+        assert direct.execution_status == "incomplete" and not direct.citations
+        assert "Partial findings from unfinished execution." in direct.answer
+    if keys:
+        assert "AMZN FY2024" in direct.answer and "Semantically unverified" in direct.answer
+        assert all(draft["claim"] in direct.answer for draft in drafts[:2])
+        assert "The estimate is conditional." in direct.answer and "The supplied estimates differ." in direct.answer
+    if root_decision == "declined":
+        assert child.acknowledged_findings == direct.acknowledged_child_findings == child.findings
+    if root_decision == "unacknowledged":
+        assert direct.retained_unacknowledged_child_findings == child.findings and not child.acknowledged_findings
 
 
 def test_batch_exception_after_work_still_settles_provider_and_corpus_usage(corpus, monkeypatch):

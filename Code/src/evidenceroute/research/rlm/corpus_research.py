@@ -14,9 +14,10 @@ from evidenceroute.research.rlm.budget import BudgetUsage, SharedBudget, SharedL
 from evidenceroute.research.rlm.comparison import Comparison, render_comparative_scope, render_comparisons
 from evidenceroute.research.rlm.discovery import CorpusScan, DiscoverySpec, discover_research_plan, scan_research_plan
 from evidenceroute.research.rlm.controller import ExecutionTrace
-from evidenceroute.research.rlm.findings import Finding, FindingEvidence, render_findings
+from evidenceroute.research.rlm.findings import Finding, FindingEvidence
 from evidenceroute.research.rlm.planned_research import GroupOutcome, admit_company_groups, execute_research_plan
 from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan
+from evidenceroute.research.rlm.publication import PublicationState, publish_research_findings
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.research_coverage import ResearchCoverage, aggregate_research_trees
 from evidenceroute.research.rlm.tools import EvidenceRef
@@ -103,6 +104,8 @@ class CorpusResearchResult:
     research_status: Literal["incomplete", "unverified"]
     answer: str
     comparative_capture: bool = False
+    answer_citations: tuple[EvidenceRef, ...] = ()
+    publication_state: PublicationState = "insufficient_evidence"
 
     @property
     def group_counts(self) -> dict[str, int]:
@@ -368,14 +371,12 @@ def execute_corpus_research(
                    for ticker in plan.requested_companies)
     coverage = aggregate_research_trees(runner.corpus, plan, traces)
     root_findings = tuple(finding for trace in traces for finding in trace.findings)
-    selected_local_ids = {finding_id for trace in traces for finding_id in trace.selected_local_finding_ids}
     selected = tuple(finding for trace in traces if trace.stop_reason == "finished"
                      for finding in trace.selected_inherited_findings)
     roots = {trace.invocation.invocation_id for trace in traces}
-    unfinished_roots = {trace.invocation.invocation_id for trace in traces if trace.stop_reason != "finished"}
     child_findings = tuple(finding for child in coverage.invocations if child.invocation.parent_id in roots
                            for finding in child.acknowledged_findings)
-    if review_discovery:
+    if not comparative:
         used_ids = {finding_id for trace in traces if trace.stop_reason == "finished" for finding_id in trace.used_finding_ids}
         selected = tuple({finding.finding_id: finding for finding in (*selected, *child_findings, *runner._prior_findings)
                           if finding.finding_id in used_ids}.values())
@@ -433,10 +434,8 @@ def execute_corpus_research(
               f"Pending execution or scope. {pending_groups}")
     if retained:
         answer += f"\nRetained child findings without parent acknowledgement. {len(retained)}."
-    if comparative and runner.comparative_capture:
-        answer += ("\n\nNo filing-wide novelty conclusion is established. Investigator assessments await a separate "
-                   "semantic review. The original comparisons and citations are available in the structured report.")
-    elif comparative:
+    compact_comparative = comparative and runner.comparative_capture
+    if comparative and not compact_comparative:
         assessment = "Batch-root comparisons.\n" + render_comparisons(root_comparisons)
         if child_comparisons:
             assessment += "\n\nAcknowledged child comparisons.\n" + render_comparisons(child_comparisons)
@@ -444,28 +443,22 @@ def execute_corpus_research(
             root_comparisons, assessment, requested=plan.requested_companies,
             admitted={group.ticker for group in groups if group.outcome and group.outcome.admitted}, incomplete=incomplete,
         )
+        sources = {item.source.chunk_id: item.source for item in evidence}
+        cited_ids = dict.fromkeys(chunk_id for item in (*root_comparisons, *child_comparisons)
+                                  for chunk_id in item.assessed_chunk_ids)
+        answer_citations = tuple(sources[chunk_id] for chunk_id in cited_ids)
+        publication_state: PublicationState = "comparison_evidence" if answer_citations else "insufficient_evidence"
     else:
-        answer += ("\n\nResearch is incomplete. Evidence applies to the passages reviewed. "
-                   "This result cannot establish absence or answer for the full requested scope."
-                   if incomplete else "\n\nResearch conclusions await independent semantic verification.")
-        if review_discovery:
-            selected_findings = tuple(finding for finding in root_findings if finding.finding_id in selected_local_ids) + selected
-            partial_ids = {finding.finding_id for trace in traces if trace.stop_reason != "finished"
-                           for finding in trace.findings}
-            partial_ids.update(finding.finding_id for child in coverage.invocations
-                               if child.invocation.parent_id in roots
-                               and (child.stop_reason != "finished" or child.invocation.parent_id in unfinished_roots)
-                               for finding in child.acknowledged_findings)
-            selected_ids = {finding.finding_id for finding in selected_findings}
-            partial_findings = tuple(finding for finding in (*root_findings, *child_findings)
-                                     if finding.finding_id in partial_ids - selected_ids)
-            for heading, findings in (("Findings selected by finished roots.", selected_findings),
-                                      ("Partial findings from unfinished execution.", partial_findings)):
-                if findings:
-                    answer += "\n\n" + heading + "\n" + render_findings(findings)
+        publication = publish_research_findings(
+            coverage.invocations, incomplete=incomplete, compact_comparative=compact_comparative,
+            prior_findings=runner._prior_findings,
+        )
+        answer += "\n\n" + publication.answer
+        answer_citations = publication.answer_citations
+        publication_state = publication.publication_state
     return CorpusResearchResult(plan, limits, run_id, groups, tuple(batches), coverage, scan, usage,
                                 root_findings, selected, child_findings, retained, root_comparisons, child_comparisons, evidence,
                                 tuple(citations[key] for key in sorted(citations)), tuple(sorted(assessed)), tuple(errors),
                                 tuple(diagnostics), stop,
                                 "finished" if finished else "incomplete", "incomplete" if incomplete else "unverified",
-                                answer, comparative and runner.comparative_capture)
+                                answer, compact_comparative, answer_citations, publication_state)

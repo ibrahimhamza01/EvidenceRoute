@@ -591,6 +591,7 @@ def test_review_plan_executes_with_scoped_discovery_and_original_evidence(corpus
     assert research.root_selected_inherited_findings == research.acknowledged_child_findings
     assert {code for _, code in research.errors} == {"unknown_id", "unseen_citation"}
     assert "A stronger dollar" in research.answer
+    assert research.publication_state == "selected_evidence" and research.answer_citations == research.citations
     assert research.root_comparisons == ()
     assert result.interpretation.correction_attempt == (2 if needs_correction else None)
     assert result.usage.provider_attempts == 7 + len(replies)
@@ -680,6 +681,8 @@ def test_apple_review_saves_partial_findings_and_sanitized_validation_diagnostic
     assert "A stronger dollar" in result.answer
     assert len(result.citations) == len(result.root_selected_inherited_findings) == int(root_finishes)
     assert ("Partial findings from unfinished execution." in result.answer) != root_finishes
+    assert result.publication_state == ("selected_evidence" if root_finishes else "partial_evidence")
+    assert result.answer_citations == (evidence[0].source,)
 
     root, child = result.diagnostics
     assert child["stop_reason"] == "model_error"

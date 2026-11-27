@@ -99,6 +99,7 @@ def main(argv=None):
         "required_target_count": coverage.required_target_count,
         "findings": restored.findings,
         "citations": restored.citations,
+        "publication": restored.publication,
         "historical_usage": restored.historical_usage,
         "current_usage": restored.current_usage,
         "cumulative_usage": restored.cumulative_usage,
