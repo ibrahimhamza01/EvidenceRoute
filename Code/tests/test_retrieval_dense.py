@@ -178,3 +178,15 @@ def test_sentence_transformer_search_preserves_canonical_provenance(st_dense, fu
     results = st_dense.search("financial results and business risks", top_k=5)
     assert len(results) == 5
     assert all(r.chunk == full_corpus.get(r.chunk.chunk_id) for r in results)
+
+
+@pytest.mark.parametrize("query,filters", [
+    ("export controls", ChunkFilter(tickers="NVDA", fiscal_years=2024)),
+    ("supply chain risks", None),
+    ("revenue growth and supply risks", ChunkFilter(fiscal_years=2024)),
+])
+def test_deep_rankings_are_identical_across_repeated_searches(dense, query, filters):
+    # Qdrant's raw scores jitter in the last float32 digits between identical calls;
+    # rounding before the chunk_id tie-break must keep deep rankings stable.
+    runs = [signature(dense.search(query, top_k=50, filters=filters)) for _ in range(10)]
+    assert all(run == runs[0] for run in runs)

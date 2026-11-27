@@ -8,6 +8,7 @@ Reproducibility: the collection is rebuilt from the chunk corpus in ``chunk_id``
 order with deterministic point IDs. An index manifest (embedding model, dimension,
 corpus fingerprint, schema version) is stored in the collection metadata, and
 ``ensure_index`` rebuilds whenever the stored manifest differs from the current one.
+Query scores are rounded to ``SCORE_DECIMALS`` so repeated searches rank identically.
 """
 from __future__ import annotations
 
@@ -39,6 +40,17 @@ FILTER_FIELDS = {
     "document_id": models.PayloadSchemaType.KEYWORD,
     "section_id": models.PayloadSchemaType.KEYWORD,
 }
+
+
+# In embedded mode, Qdrant scores (and returned vectors) for identical calls were
+# observed to differ by up to ~5e-8, which can swap passages with nearly equal scores.
+# Scores are rounded to this many decimals before ranking so the ``chunk_id`` tie-break
+# is stable.
+SCORE_DECIMALS = 6
+
+
+def stable_score(score: float) -> float:
+    return round(float(score), SCORE_DECIMALS)
 
 
 class DenseIndexError(RuntimeError):
@@ -263,7 +275,7 @@ class DenseRetriever:
             chunk = self.corpus.get(chunk_id) if chunk_id else None
             if chunk is None:
                 raise DenseIndexError(f"Index returned unknown chunk {chunk_id!r}; rebuild the index")
-            results.append(RetrievalResult(chunk=chunk, score=float(point.score)))
+            results.append(RetrievalResult(chunk=chunk, score=stable_score(point.score)))
         return rank_results(results)[:top_k]
 
     def _fetch_with_complete_ties(self, vector: list[float], top_k: int,
@@ -271,8 +283,9 @@ class DenseRetriever:
         """Fetch enough points that every point tied with the k-th score is included.
 
         Qdrant orders equal scores arbitrarily. If the fetched window ends inside a
-        group of points tied at the cutoff score, widen it until the whole group is
-        present, so the ``chunk_id`` tie-break sees every candidate.
+        group of points tied at the cutoff score (after ``stable_score`` rounding),
+        widen it until the whole group is present, so the ``chunk_id`` tie-break sees
+        every candidate.
         """
         limit = top_k + self.tie_buffer
         while True:
@@ -281,8 +294,9 @@ class DenseRetriever:
                                               with_payload=True).points
             if len(points) < limit or len(points) < top_k:
                 return points  # every matching point was returned
-            cutoff = sorted((p.score for p in points), reverse=True)[top_k - 1]
-            if min(p.score for p in points) < cutoff:
+            scores = sorted((stable_score(p.score) for p in points), reverse=True)
+            cutoff = scores[top_k - 1]
+            if scores[-1] < cutoff:
                 return points  # the tie group at the cutoff ends inside the window
             limit *= 2
 
