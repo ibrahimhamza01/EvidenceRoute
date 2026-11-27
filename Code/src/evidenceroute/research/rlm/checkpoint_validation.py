@@ -430,6 +430,9 @@ def validate_checkpoint(checkpoint: ResearchCheckpoint, corpus: CorpusEnvironmen
                  "Checkpoint batch scope exceeds the selected assignments.")
         _validate_budget(run)
         nodes, new = _validate_coverage(run, plan, canonical, findings)
+        metrics_ids = {item.invocation_id for item in run.invocation_metrics}
+        _require(not metrics_ids or metrics_ids == set(nodes) and len(metrics_ids) == len(run.invocation_metrics),
+                 "Checkpoint invocation metrics differ from its invocation inventory.")
         findings.update(new)
         _validate_results(run, plan, canonical, nodes, findings)
     _validate_verification_history(checkpoint)
@@ -449,8 +452,10 @@ def _validate_verification_history(checkpoint: ResearchCheckpoint) -> None:
                     for node in run.coverage.invocations for finding in node.findings}
         comparisons = {comparison_id(item): item for run in source_runs
                        for item in (*run.root_comparisons, *run.acknowledged_child_comparisons)}
+        proposals = {item.target_id: item for item in verification.proposals}
+        validate_recovery_proposals(checkpoint, verification.proposals, findings)
         for item in verification.items:
-            comparison = comparisons.get(item.target_id) if item.kind == "comparison" else None
+            comparison = comparisons.get(item.target_id) if item.kind == "comparison" else proposals.get(item.target_id)
             _require(set(item.finding_ids).issubset(findings)
                      and (item.kind == "finding" or comparison is not None and item.finding_ids == comparison.finding_ids),
                      "Verification references a finding or comparison outside its source runs.")
@@ -458,3 +463,17 @@ def _validate_verification_history(checkpoint: ResearchCheckpoint) -> None:
                 validate_review_evidence(item, findings, comparison)
             except ValueError as exc:
                 raise CheckpointError(str(exc)) from None
+
+
+def validate_recovery_proposals(checkpoint, proposals, findings):
+    groups = {group.ticker: set(group.targets) for group in checkpoint.plan.groups}
+    for proposal in proposals:
+        _require(checkpoint.plan.intent.objective == "year_over_year"
+                 and proposal.years == tuple(sorted(set(checkpoint.plan.intent.fiscal_years)))
+                 and proposal.ticker in groups and set(proposal.finding_ids).issubset(findings),
+                 "Recovery proposal is outside the original research scope.")
+        for year, fid in zip(proposal.years, proposal.finding_ids):
+            _require(all(e.source.ticker == proposal.ticker and e.source.fiscal_year == year
+                         and SectionTarget(e.source.document_id, e.source.section_id) in groups[proposal.ticker]
+                         and e.span_id is not None for e in findings[fid].evidence),
+                     "Recovery evidence differs from its proposed fiscal year or scope.")

@@ -17,7 +17,7 @@ from evidenceroute.research.rlm.planning import ResearchIntent, resolve_research
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.tools import observation_json
 from evidenceroute.research.rlm.verification import (
-    BedrockSemanticVerifier, VerificationLimits, record_verification, review_checkpoint, verification_report, verify_checkpoint,
+    BedrockSemanticVerifier, VerificationLimits, record_verification, recover_checkpoint, review_checkpoint, verification_report, verify_checkpoint,
 )
 
 APPLE_CHUNK = "cd7988623c9a3bf545f06045"
@@ -190,11 +190,18 @@ def main(argv=None):
     parser.add_argument("--checkpoint", type=Path, help="Source research checkpoint.")
     parser.add_argument("--limits-file", type=Path, help="Explicit JSON verification limits.")
     parser.add_argument("--kind", choices=("all", "findings", "comparisons"), default="all", help="Cases to review.")
-    parser.add_argument("--outstanding", action="store_true", help="Review outstanding current cases without revisiting settled reviews.")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--recover", action="store_true", help="Review bounded pairs proposed from retained checkpoint findings.")
+    parser.add_argument("--company", action="append", help="Select a ticker for --recover. Repeat for multiple companies.")
+    modes.add_argument("--outstanding", action="store_true", help="Review outstanding current cases without revisiting settled reviews.")
     parser.add_argument("--save-checkpoint", type=Path, help="Save the recorded review of a supplied checkpoint.")
     args = parser.parse_args(argv)
     if args.live and not (args.checkpoint and args.limits_file):
         parser.error("--live requires --checkpoint and --limits-file.")
+    if args.recover and not (args.checkpoint and args.limits_file and args.kind == "all"):
+        parser.error("--recover requires --checkpoint and --limits-file. Omit --kind.")
+    if args.company and not args.recover:
+        parser.error("--company requires --recover.")
     if args.outstanding and args.kind != "all":
         parser.error("--outstanding uses the current comparison and finding inventory. Omit --kind.")
     if args.save_checkpoint and not args.checkpoint:
@@ -216,7 +223,10 @@ def main(argv=None):
         for checkpoint in inputs:
             verifier = (BedrockSemanticVerifier.from_env(disable_retries=True) if args.live else
                         BedrockSemanticVerifier(OfflineVerificationTransport(), config=BedrockConfig(model="offline-verifier")))
-            if args.outstanding:
+            if args.recover:
+                updated = recover_checkpoint(checkpoint, corpus, verifier, limits=limits,
+                                             companies=tuple(args.company) if args.company else None)
+            elif args.outstanding:
                 updated = review_checkpoint(checkpoint, corpus, verifier, limits=limits)
             else:
                 run = verify_checkpoint(checkpoint, corpus, verifier, limits=limits,

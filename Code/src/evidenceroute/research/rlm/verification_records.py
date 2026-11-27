@@ -21,7 +21,7 @@ UnverifiedReason = Literal[
     "invalid_assessment", "missing_assessment", "invalid_response", "transport_error", "truncated_response",
     "not_requested",
 ]
-CaseKind = Literal["finding", "comparison"]
+CaseKind = Literal["finding", "comparison", "recovery"]
 
 
 class _Record(StrictInput):
@@ -114,6 +114,28 @@ def component_status(components: tuple[ComponentReview, ...]) -> VerificationSta
     return "insufficient_evidence"
 
 
+class RecoveryCandidate(_Record):
+    ticker: Identifier
+    years: tuple[int, int]
+    finding_ids: tuple[Identifier, Identifier]
+
+    @property
+    def target_id(self) -> str:
+        return sha256(observation_json(self).encode("utf-8")).hexdigest()
+
+
+class ReviewEvidenceError(ValueError):
+    def __init__(self, field: str, code: str, message: str | None = None):
+        super().__init__(message or f"{field}: {code}")
+        self.field = field
+        self.code = code
+
+
+class ReviewDiagnostic(_Record):
+    field: Annotated[str, Field(max_length=120, pattern=r"^[a-z_0-9.\[\]]+$")]
+    code: Annotated[str, Field(max_length=48, pattern=r"^[a-z_0-9]+$")]
+
+
 class VerificationItem(_Record):
     kind: CaseKind
     target_id: Identifier
@@ -123,12 +145,13 @@ class VerificationItem(_Record):
     components: tuple[ComponentReview, ...] = Field(default=(), max_length=8)
     comparison: ComparisonReview | None = None
     unverified_reason: UnverifiedReason | None = None
+    diagnostics: tuple[ReviewDiagnostic, ...] = Field(default=(), max_length=4)
 
     @model_validator(mode="after")
     def validate_status(self) -> VerificationItem:
         if (self.status != component_status(self.components)
                 or (self.unverified_reason is not None) != (self.status == "unverified")
-                or (self.comparison is not None) != (self.kind == "comparison" and self.status != "unverified")
+                or (self.comparison is not None) != (self.kind != "finding" and self.status != "unverified")
                 or (self.kind == "finding" and self.finding_ids != (self.target_id,))
                 or len(set(self.finding_ids)) != len(self.finding_ids)):
             raise ValueError("Inconsistent verification result.")
@@ -142,13 +165,16 @@ class VerificationRun(_Record):
     limits: VerificationLimits
     usage: VerificationUsage
     items: tuple[VerificationItem, ...]
+    proposals: tuple[RecoveryCandidate, ...] = Field(default=(), max_length=128)
 
     @model_validator(mode="after")
     def validate_limits(self) -> VerificationRun:
         reviewed = sum(item.status != "unverified" for item in self.items)
         if (self.usage.provider_attempts > self.limits.max_provider_attempts
                 or reviewed > min(self.limits.max_items, self.usage.provider_attempts * self.limits.batch_size)
-                or len({(item.kind, item.target_id) for item in self.items}) != len(self.items)):
+                or len({(item.kind, item.target_id) for item in self.items}) != len(self.items)
+                or {item.target_id for item in self.items if item.kind == "recovery"} != {item.target_id for item in self.proposals}
+                or len({item.target_id for item in self.proposals}) != len(self.proposals)):
             raise ValueError("Inconsistent verification inventory or usage.")
         return self
 
@@ -167,21 +193,22 @@ def comparison_id(comparison: Comparison) -> str:
     return sha256(observation_json(content).encode("utf-8")).hexdigest()
 
 
-def subject_digest(findings: tuple[Finding, ...], comparison: Comparison | None) -> str:
+def subject_digest(findings: tuple[Finding, ...], comparison: Comparison | RecoveryCandidate | None) -> str:
     """Bind a review to its original claim and exact evidence selection."""
     content = {"findings": [{"claim": item.claim, "evidence": item.evidence} for item in findings],
-               "comparison_id": comparison_id(comparison) if comparison is not None else None}
+               "comparison_id": (comparison.target_id if isinstance(comparison, RecoveryCandidate)
+                                 else comparison_id(comparison) if comparison is not None else None)}
     return sha256(observation_json(content).encode("utf-8")).hexdigest()
 
 
-def validate_review_evidence(item: VerificationItem, findings: dict[str, Finding], comparison: Comparison | None) -> None:
+def validate_review_evidence(item: VerificationItem, findings: dict[str, Finding], comparison: Comparison | RecoveryCandidate | None) -> None:
     """Check evidence links and the structural limits of a comparative assessment."""
     if item.subject_digest != subject_digest(tuple(findings[fid] for fid in item.finding_ids), comparison):
         raise ValueError("Verification subject differs from its original claim or selected evidence.")
 
     def year(pointer: EvidencePointer) -> int:
         if pointer.finding_id not in item.finding_ids or pointer.evidence_index >= len(findings[pointer.finding_id].evidence):
-            raise ValueError("Verification references evidence outside its case.")
+            raise ReviewEvidenceError("evidence", "unknown_evidence_ref", "Verification references evidence outside its case.")
         return findings[pointer.finding_id].evidence[pointer.evidence_index].source.fiscal_year
 
     component_years = [set(map(year, component.evidence)) for component in item.components]
@@ -191,19 +218,19 @@ def validate_review_evidence(item: VerificationItem, findings: dict[str, Finding
     assert comparison is not None
     earlier, later = comparison.years
     if any(year(pointer) != earlier for pointer in review.earlier_evidence):
-        raise ValueError("Earlier-year assessment cites evidence from the wrong year.")
+        raise ReviewEvidenceError("comparison.earlier_evidence", "wrong_fiscal_year")
     relationship_years = set(map(year, review.relationship_evidence))
     if review.relationship != "unclear" and relationship_years != {earlier, later}:
-        raise ValueError("A resolved relationship requires selected evidence from both years.")
-    if (comparison.outcome == "comparable_both_years" and item.status == "supported"
+        raise ReviewEvidenceError("comparison.relationship_evidence", "both_years_required")
+    if (isinstance(comparison, Comparison) and comparison.outcome == "comparable_both_years" and item.status == "supported"
             and review.relationship not in {"same_risk", "more_specific_wording"}):
-        raise ValueError("Support for the same underlying risk requires a shared relationship.")
-    if comparison.relationship is not None and item.status == "supported":
+        raise ReviewEvidenceError("comparison.relationship", "inconsistent_support")
+    if (isinstance(comparison, RecoveryCandidate) or comparison.relationship is not None and item.status == "supported"):
         if review.relationship in {"same_risk", "more_specific_wording"} and review.earlier_year != "supports_risk":
-            raise ValueError("A verified shared risk requires earlier evidence supporting that risk.")
+            raise ReviewEvidenceError("comparison.earlier_year", "inconsistent_support")
     if review.earlier_year in {"nonmention", "insufficient"} and (
         any(component.status == "contradicted" and years == {earlier}
             for component, years in zip(item.components, component_years))
-        or (comparison.outcome == "conflicting" and item.status == "supported")
+        or (isinstance(comparison, Comparison) and comparison.outcome == "conflicting" and item.status == "supported")
     ):
-        raise ValueError("Earlier-year nonmention or insufficient evidence cannot establish contradiction.")
+        raise ReviewEvidenceError("comparison.earlier_year", "nonmention_is_not_contradiction")

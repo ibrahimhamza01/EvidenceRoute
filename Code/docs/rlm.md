@@ -1116,6 +1116,65 @@ The first full-corpus pass can exit 1 after saving partial progress. Each additi
 Native offline regressions replayed the six AMD excerpts and exercised abstention, both-year capture, a missing earlier-year mechanism, and failed finalization after capture. The Amazon–Alphabet fixture retained four year-specific findings and independently reviewed six cases across two authorized stub passes. The second pass reused the first pass's two settled comparisons. The quality workflow retained the 25-company and 50-target denominator across restart. A separate failure simulation left 20 companies eligible after the first six attempts. Continuation investigated all 20 under the new allowance, reusing the initial scan and preserving the failed child's accepted findings. No paid requests were made. Live capture behavior, comparative quality and resource consumption under the revised profile remain unmeasured.
 
 
+## Final stabilization before corpus-wide evaluation
+
+The quality runs at `b437d97` spent **8 attempts, 40,335 reported tokens, and 29.75 seconds** on AMD and **12 attempts, 63,847 tokens, and 40.68 seconds** on Amazon and Alphabet. Reviewing the second checkpoint added **3 attempts, 6,733 tokens, and 10.44 seconds**. AMD retained three findings from both years. One cross-year draft was rejected. A child risk label exceeded 120 characters and a root assessment used invalid AI context. The general water and power dependency was disclosed in both years, with a potential revenue consequence in FY2024. The selected evidence leaves the AI link unresolved.
+
+Amazon's acknowledged excerpts included the limited semiconductor supplier statement in both years. The exact sentence appeared twice per year in overlapping chunks. The selected offsets at the end of the earlier overlapping chunks had no following text. The offsets in the later chunks ended just before the consequence sentence, which says availability constraints could adversely affect the ability to develop and operate AI technology. The explicit supplier dependency was already grounded. The trace shows an empty submission, zero rejected finding records, and later references to aliases that had never been issued. Native Converse replay kept the delivered results in history. Long history, repeated text, alias confusion, and novelty-oriented assignment wording remain hypotheses about the model's choice. The local audit includes the verbatim spans and their canonical context.
+
+Alphabet retained four findings. The bundled root reply reduced its child result from **4,563 to 2,443 bytes** and offered only the first two FY2024 findings. The FY2023 finding remained in checkpoint state. Four historical finding reviews returned supported and two comparisons returned `invalid_assessment`. The original verification arguments were not recorded. Schema bounds, unknown evidence aliases, wrong-year references, and relationship/evidence inconsistency can produce that code. Historical marks of support also overstated some exact wording. Competitive accelerator capacity does not establish an actual shortage, and the deployment disclosure says it **may** depend on availability and pricing.
+
+The stabilization keeps the quality ceilings unchanged.
+
+- **Capture** indexes up to six acknowledged span locators per year and explicitly invites shared risks as separate, useful observations. Single or two-span reads can supply a following canonical span where it fits the existing byte share. Exact text, offsets, and aliases remain stable. An empty capture remains valid.
+- **Root delivery** sends a local alias, fiscal year, claim, and whole selected quotes with canonical chunk and span IDs. Host-side findings keep full metadata. When space is tight, the packer tries a complete two-year comparison, including its context references, then a related cross-year pair. The exact Alphabet finding replay offered all four records in **2,879 bytes** with a two-child envelope of **4,384 bytes**. A pressure fixture offered the central pair in **1,630 bytes** and logged the other two as omitted. Acknowledgement remains restricted to delivered records.
+- **Synthesis** gives explicit alias and label instructions. Invalid optional AI context is stripped and its category downgraded where needed, preserving general evidence. When all attempted comparisons fail on correctable inputs and usable aliases exist, a native invocation can spend one existing protected finish attempt on correction. Already valid comparisons stay available. No provider ceiling increases.
+- **Recovery and verification** offer at most one lexically related pair per selected company, from up to twelve distinct retained excerpts or excerpt sets per year. A fresh review judges the relationship and the original year-specific claims. Proposals, results, diagnostics, and usage are recorded separately from investigator comparisons. Previously omitted findings retain their original access history. Unclear one-year reviews can provide no earlier evidence and request a gap. Invalid cases retain bounded field and code diagnostics while valid peer results survive. Narrow checks flag categorical dependency language and shortage claims unsupported by competitive-capacity wording. Finding reports can quote reviewed evidence even when a comparison fails. Historical review records are preserved.
+- **Evaluation** keeps investigator metrics in new checkpoints so continuation can report company-level capture, rejection, provider usage, and latency. Root and shared verification usage stay in overall totals. Historical invocation telemetry can be supplied with the original detailed report.
+
+Offline checkpoint-only recovery loaded the two actual checkpoints and selected AMD's water/power pair and Alphabet's deployment-cost pair, including its previously omitted FY2023 finding. The scripted verifier assessed both as more specific later wording with the underlying risk already present. Reload preserved the original findings, access ledgers and verification history. The canonical demonstration completed **25 companies, 50 targets and 13 batches**, including the singleton. An initial failure simulation resumed 20 assignments with zero additional scan and a separate verification pass. These are offline control results. Live capture rates, verifier judgment quality and corpus-wide expense still need measurement.
+
+### Final live commands
+
+Use the Sonnet 4.5 environment and explicit quality limit files documented in the preceding section. `rlm-stabilization-recovery-limits.json` allows two requests, 12,000 charged tokens, two items, one item per request, 1,024 output tokens, 10,000 evidence input bytes and 60 seconds per recovery pass. The dated historical checkpoints remain valid input.
+
+```bash
+export PYTHONPATH=Code/src BEDROCK_REGION=us-east-1
+export BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+export CLAUDE_TIMEOUT_SECONDS=20 CLAUDE_MAX_OUTPUT_TOKENS=1024
+
+python Code/examples/demo_rlm_verification.py --live --recover --company AMD \
+  --checkpoint rlm-amd-quality-live-checkpoint.json --limits-file rlm-stabilization-recovery-limits.json \
+  --save-checkpoint rlm-amd-recovered-live-checkpoint.json > rlm-amd-recovered-live.json
+
+python Code/examples/demo_rlm_verification.py --live --recover --company GOOGL \
+  --checkpoint rlm-amzn-googl-quality-live-checkpoint.json --limits-file rlm-stabilization-recovery-limits.json \
+  --save-checkpoint rlm-amzn-googl-recovered-live-checkpoint.json > rlm-amzn-googl-recovered-live.json
+
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live \
+  --resume rlm-amzn-googl-recovered-live-checkpoint.json --company AMZN \
+  --goal "Compare reliance on semiconductor suppliers and the effects of availability in both filings. Capture year-specific shared risks." \
+  --limits-file rlm-quality-tree-limits.json \
+  --save-checkpoint rlm-amzn-targeted-live-checkpoint.json > rlm-amzn-targeted-live.json
+
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live --trace \
+  --limits-file rlm-quality-initial-limits.json \
+  --save-checkpoint rlm-final-corpus-live-checkpoint.json > rlm-final-corpus-initial-live.json
+
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live \
+  --resume rlm-final-corpus-live-checkpoint.json --limits-file rlm-quality-full-limits.json \
+  --save-checkpoint rlm-final-corpus-live-checkpoint.json > rlm-final-corpus-continued-live.json
+
+python Code/examples/demo_rlm_verification.py --live --outstanding \
+  --checkpoint rlm-final-corpus-live-checkpoint.json --limits-file rlm-quality-verification-limits.json \
+  --save-checkpoint rlm-final-corpus-live-checkpoint.json > rlm-final-corpus-reviewed-live.json
+
+python rlm-stabilization-evaluate.py rlm-final-corpus-live-checkpoint.json > rlm-final-corpus-evaluation.json
+```
+
+The initial corpus pass can exit 1 after saving partial progress. Repeat outstanding review with a newly authorized allowance and a distinct report filename. Use `--recover` with selected companies for missing matched mechanisms. The evaluator records positive controls and distinguishes supported evidence from completed assignments without findings. A completed assignment and a reviewed two-year relationship both leave filing-wide novelty open.
+
+
 ## Issue #16 acceptance review
 
 The branch provides the bounded RLM-inspired strategy, runnable examples and audit records requested by the issue. The branch diff from its mainline base contains only RLM modules, examples, tests and this guide. [Issue #16](https://github.com/ibrahimhamza01/EvidenceRoute/issues/16)

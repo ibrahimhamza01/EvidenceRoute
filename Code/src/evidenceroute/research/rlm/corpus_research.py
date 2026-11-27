@@ -182,9 +182,11 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
             if edge and edge.child:
                 submitted = (op.observation_attempted or op.observation_sent) and not op.delivery_error
                 operation.update(child_id=edge.invocation.invocation_id, full_observation_bytes=edge.full_observation_bytes,
-                                 retained_finding_ids=[item.finding_id for item in edge.child.findings],
+                                 retained_finding_ids=[item.finding_id for item in edge.child.transferable_findings],
                                  child_status=edge.status, child_error=edge.error,
                                  offered_finding_ids=edge.offered_finding_ids,
+                                 omitted_finding_ids=tuple(item.finding_id for item in edge.child.transferable_findings
+                                                          if item.finding_id not in edge.offered_finding_ids),
                                  finding_references=dict(edge.finding_references),
                                  submitted_finding_ids=edge.offered_finding_ids if submitted else (),
                                  acknowledged_finding_ids=edge.delivered_finding_ids,
@@ -204,8 +206,23 @@ def _diagnostics(node: ExecutionTrace, detailed: bool) -> dict:
         if step.finding_validation and not step.operations:
             decision["finding_validation"] = [asdict(issue) for issue in step.finding_validation]
         decisions.append(decision)
+    attempts = node.model_attempts
+    submissions = [op for step in node.steps for op in step.operations if op.tool_name == "submit_findings"]
+    metrics = {
+        "provider_attempts": len(attempts),
+        "reported_tokens": sum((a.input_tokens or 0) + (a.output_tokens or 0) +
+                               (a.cache_read_input_tokens or 0) + (a.cache_creation_input_tokens or 0) for a in attempts),
+        "attempts_with_missing_usage": sum(a.input_tokens is None or a.output_tokens is None for a in attempts),
+        "elapsed_seconds": node.elapsed_seconds,
+        "provider_seconds": sum(a.latency_seconds for a in attempts),
+        "empty_captures": sum(op.outcome == "executed" and not op.accepted_finding_refs and not op.finding_validation
+                              and (op.observation or {}).get("ok", False) for op in submissions),
+        "capture_calls": sum(op.outcome in {"executed", "rejected"} for op in submissions),
+        "rejected_records": sum(len(op.finding_validation) for op in submissions),
+        "comparison_diagnostics": sum(len(step.finding_validation) for step in node.steps if not step.operations),
+    }
     return {"invocation_id": node.invocation.invocation_id, "stop_reason": node.stop_reason,
-            "budget_stop": node.budget_stop, "generated_finding_ids": [item.finding_id for item in node.findings],
+            "budget_stop": node.budget_stop, "metrics": metrics, "generated_finding_ids": [item.finding_id for item in node.findings],
             "selected_local_finding_ids": node.selected_local_finding_ids,
             "unused_capture_reservation": node.unused_capture_reservation,
             "decisions": decisions}

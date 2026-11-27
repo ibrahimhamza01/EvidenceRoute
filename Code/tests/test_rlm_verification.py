@@ -204,6 +204,9 @@ def test_native_verifier_rejects_malformed_output_without_erasing_valid_peers(co
     else:
         assert run.items[1].status == "unverified"
     assert "private provider content" not in run.model_dump_json()
+    if reason == "invalid_assessment":
+        assert run.items[0].diagnostics
+        assert run.items[0].diagnostics[0].field.startswith("components")
 
 
 @pytest.mark.parametrize(("options", "reason"), [

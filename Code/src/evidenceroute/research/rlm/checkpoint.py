@@ -46,6 +46,19 @@ class CheckpointInterpretation(_CheckpointModel):
     usage: CorpusUsage
 
 
+class InvocationMetrics(_CheckpointModel):
+    invocation_id: str
+    provider_attempts: int = Field(ge=0)
+    reported_tokens: int = Field(ge=0)
+    attempts_with_missing_usage: int = Field(ge=0)
+    elapsed_seconds: float = Field(ge=0)
+    capture_calls: int = Field(ge=0)
+    rejected_records: int = Field(ge=0)
+    comparison_diagnostics: int = Field(ge=0)
+    provider_seconds: float | None = Field(default=None, ge=0)
+    empty_captures: int | None = Field(default=None, ge=0)
+
+
 class CheckpointRun(_CheckpointModel):
     run_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
     target_companies: tuple[str, ...]
@@ -61,6 +74,7 @@ class CheckpointRun(_CheckpointModel):
     execution_status: Literal["finished", "incomplete"]
     research_status: Literal["incomplete", "unverified"]
     comparative_capture: bool = False
+    invocation_metrics: tuple[InvocationMetrics, ...] = ()
 
     @classmethod
     def from_result(cls, result: CorpusResearchResult, companies: tuple[str, ...]) -> CheckpointRun:
@@ -71,6 +85,8 @@ class CheckpointRun(_CheckpointModel):
             acknowledged_child_comparisons=result.acknowledged_child_comparisons, citations=result.citations,
             stop_reason=result.stop_reason, execution_status=result.execution_status, research_status=result.research_status,
             comparative_capture=result.comparative_capture,
+            invocation_metrics=tuple(InvocationMetrics(invocation_id=item["invocation_id"], **item["metrics"])
+                                     for item in result.diagnostics),
         )
 
 

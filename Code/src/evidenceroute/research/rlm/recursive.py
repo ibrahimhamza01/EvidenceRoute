@@ -15,7 +15,7 @@ from pydantic import Field, ValidationError
 from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy, SharedBudget, SharedLimits
 from evidenceroute.research.rlm.comparison import (
     CompactAssessment, CompactComparisonDraft, Comparison, _has_ai_context, render_comparisons,
-    resolve_comparison, resolve_reference_comparison,
+    ranked_cross_year_pairs, resolve_comparison, resolve_reference_comparison,
 )
 from evidenceroute.research.rlm.discovery import CandidatePageRequest, CorpusScan
 from evidenceroute.research.rlm.controller import (
@@ -232,7 +232,10 @@ class RecursiveResearch:
         if session.compact_comparative:
             prompt += (" Capture each grounded year-specific observation once, including general infrastructure risks "
                        "with an uncertain AI link or no earlier-year counterpart. Record those gaps as uncertainty. "
+                       "Capture the same mechanism separately for each year when disclosed in both. Existing-risk "
+                       "counterevidence is useful even if no new risk can be established. "
                        "Use an empty submission only when the delivered excerpts support no useful scoped observation. "
+                       "Copy chunk and span IDs, including prior IDs shown for repeated text. Use sN only after receipt. "
                        "Finish with references only. A root can cite child references without repeating child comparisons. "
                        "Separate support for the underlying risk, risk category, AI connection "
                        "and disclosure relationship. Silence is nonmention. Only an opposing statement about the same risk "
@@ -296,6 +299,17 @@ class RecursiveSession:
         self.comparisons: tuple[Comparison, ...] = ()
         self.used_finding_ids: tuple[str, ...] = ()
         self.analysis_status: AnalysisStatus = "incomplete"
+
+    def capture_locators(self) -> dict[int, list[str]]:
+        locators: dict[int, list[str]] = {}
+        for (document, _section, _text), (chunk, span) in self.delivered_span_text.items():
+            year = self._year_by_document.get(document)
+            if year is None:
+                continue
+            entries = locators.setdefault(year, [])
+            if len(entries) < 6:
+                entries.append(f"{chunk}/{span}")
+        return locators
 
     def allow_investigation_tool(self, name: str, arguments: dict, local_slots: int) -> bool:
         """Protect an original-text read opportunity for each resolved year."""
@@ -549,7 +563,18 @@ class RecursiveSession:
             ref = f"d{self.next_reference}"
             self.next_reference += 1
             references[finding.finding_id] = ref
-            finding_records[finding.finding_id] = {"ref": ref, **asdict(finding)}
+            if self.compact_comparative:
+                source = finding.evidence[0].source
+                record = {"ref": ref, "ticker": source.ticker, "year": source.fiscal_year,
+                          "claim": finding.claim, "analysis_status": finding.analysis_status,
+                          "coverage_status": finding.coverage_status,
+                          "evidence": [{"chunk_id": item.source.chunk_id, "span_id": item.span_id, "quote": item.quote}
+                                       for item in finding.evidence]}
+                record.update({key: value for key, value in (
+                    ("uncertainty", finding.uncertainty), ("conflict", finding.conflict)) if value is not None})
+                finding_records[finding.finding_id] = record
+            else:
+                finding_records[finding.finding_id] = {"ref": ref, **asdict(finding)}
         body = {
             "ok": successful or bool(findings), "result": {
                 "child_invocation_id": invocation.invocation_id, "status": status,
@@ -622,7 +647,26 @@ class RecursiveSession:
         content = encode()
         if len(content.encode("utf-8")) > cap:
             return None, (), ()
+        if self.compact_comparative:
+            by_id = {finding.finding_id: finding for finding in retained}
+            years = self.runner.comparison_scan.years
+            groups = [tuple(by_id[fid] for fid in item.finding_ids) for item in child.comparisons
+                      if item.both_years_contributed and set(item.finding_ids).issubset(by_id)]
+            groups += ranked_cross_year_pairs(retained, years)
+            # Even without shared lexical words, represent both years when a pair fits.
+            groups += [(left, right) for left in retained for right in retained
+                       if (left.evidence[0].source.fiscal_year, right.evidence[0].source.fiscal_year) == years]
+            for group in groups:
+                findings[:] = group
+                candidate = encode()
+                if len(candidate.encode("utf-8")) <= cap:
+                    content = candidate
+                    break
+            else:
+                findings.clear()
         for finding in retained:
+            if finding in findings:
+                continue
             findings.append(finding)
             candidate = encode()
             if len(candidate.encode("utf-8")) > cap:
@@ -788,6 +832,15 @@ class RecursiveSession:
         return citations
 
     @staticmethod
+    def _without_ai_context(assessment: CompactAssessment) -> CompactAssessment:
+        category = assessment.risk_category
+        if category == "ai_infrastructure_dependency":
+            category = "general_infrastructure"
+        elif category == "ai_enabled_threat":
+            category = "uncertain"
+        return assessment.model_copy(update={"ai_specificity": None, "context_ref": None, "risk_category": category})
+
+    @staticmethod
     def _compact_comparison(raw, path, available, issues) -> CompactComparisonDraft | None:
         if not isinstance(raw, dict) or not isinstance(raw.get("assessments"), list) or not 1 <= len(raw["assessments"]) <= 8:
             issues.append(FindingValidationIssue(path, "schema", "invalid_assessments"))
@@ -797,8 +850,17 @@ class RecursiveSession:
         for index, item in enumerate(raw["assessments"]):
             field = f"{path}.assessments[{index}]"
             try:
-                assessment = CompactAssessment.model_validate(item)
-                if assessment.ref not in available or (assessment.context_ref and assessment.context_ref not in available):
+                try:
+                    assessment = CompactAssessment.model_validate(item)
+                except ValidationError as exc:
+                    if not isinstance(item, dict) or any(error["loc"] not in {("context_ref",), ("ai_specificity",)}
+                                                         for error in exc.errors()):
+                        raise
+                    assessment = RecursiveSession._without_ai_context(CompactAssessment.model_validate({
+                        **item, "ai_specificity": None, "context_ref": None,
+                    }))
+                    issues.append(FindingValidationIssue(field, "comparison", "invalid_ai_context"))
+                if assessment.ref not in available:
                     issues.append(FindingValidationIssue(field, "provenance", "unacknowledged_finding_reference"))
                     continue
                 fid = available[assessment.ref].finding_id
@@ -806,13 +868,12 @@ class RecursiveSession:
                     issues.append(FindingValidationIssue(field, "comparison", "duplicate_finding_reference"))
                     continue
                 if assessment.context_ref:
-                    finding = available[assessment.ref]
-                    context = available[assessment.context_ref]
-                    source = finding.evidence[0].source
-                    if (assessment.ai_specificity != "contextual"
+                    context = available.get(assessment.context_ref)
+                    source = available[assessment.ref].evidence[0].source
+                    if (assessment.ai_specificity != "contextual" or context is None
                             or not _has_ai_context(context, source.ticker, source.fiscal_year)):
                         issues.append(FindingValidationIssue(field, "comparison", "invalid_ai_context"))
-                        continue
+                        assessment = RecursiveSession._without_ai_context(assessment)
                 used.add(fid)
                 accepted.append(assessment)
             except ValidationError as exc:

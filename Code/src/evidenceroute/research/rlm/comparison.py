@@ -15,6 +15,7 @@ from evidenceroute.research.rlm.discovery import (
 )
 from evidenceroute.research.rlm.findings import Finding
 from evidenceroute.research.rlm.tools import Identifier, StrictInput
+from evidenceroute.retrieval.tokenization import tokenize
 
 
 class EvidenceAssessment(StrictInput):
@@ -75,13 +76,17 @@ RiskRelationship = Literal["same", "more_specific", "different", "conflicting", 
 
 
 class CompactAssessment(StrictInput):
-    ref: FindingReference
+    ref: FindingReference = Field(description="Copy one acknowledged sN (investigator) or dN (parent) receipt alias verbatim.")
     risk_category: RiskCategory
     entailment: Literal["supports", "contradicts", "nonmention", "uncertain"] = Field(
         description="Does the passage support or explicitly oppose the underlying risk? Use nonmention for silence."
     )
-    ai_specificity: Literal["explicit", "contextual"] | None = None
-    context_ref: FindingReference | None = None
+    ai_specificity: Literal["explicit", "contextual"] | None = Field(
+        default=None, description="Omit for general infrastructure. Use explicit only if this exact excerpt links the mechanism to AI.",
+    )
+    context_ref: FindingReference | None = Field(
+        default=None, description="Optional acknowledged same-company, same-year exact AI evidence for contextual linkage.",
+    )
 
     @property
     def relevance(self) -> str:
@@ -98,7 +103,7 @@ class CompactAssessment(StrictInput):
 
 
 class CompactComparisonDraft(StrictInput):
-    risk: str = Field(min_length=1, max_length=120, description="Neutral underlying risk mechanism, without a novelty claim.")
+    risk: str = Field(min_length=1, max_length=120, description="Short mechanism label, ideally 2–8 words and at most 120 characters. Omit claims and explanations.")
     relationship: RiskRelationship = Field(
         description="Relationship between disclosures. Silence is nonmention, and different risks are distinct from conflict."
     )
@@ -304,3 +309,25 @@ def render_comparative_scope(
         "Admitted companies with unresolved assessments. " + (", ".join(unresolved) or "None identified."),
         f"Companies outside the admitted scope ({len(not_admitted)}). " + (", ".join(not_admitted) or "None."),
     ])
+
+
+def ranked_cross_year_pairs(findings: tuple[Finding, ...], years: tuple[int, int]) -> list[tuple[Finding, Finding]]:
+    """Rank a bounded sample by shared informative words in exact excerpts."""
+    by_year = {year: {} for year in years}
+    for finding in findings:
+        source = finding.evidence[0].source
+        if source.fiscal_year not in by_year:
+            continue
+        bucket = by_year[source.fiscal_year]
+        text = " ".join(item.quote for item in finding.evidence)
+        if len(bucket) < 12:
+            bucket.setdefault(text, finding)
+    earlier, later = ([(finding, set(tokenize(text))) for text, finding in by_year[year].items()] for year in years)
+    scored = []
+    for left, left_words in earlier:
+        for right, right_words in later:
+            common = len(left_words & right_words)
+            if left.evidence[0].source.ticker == right.evidence[0].source.ticker and common >= 3:
+                scored.append((common / len(left_words | right_words), common, left, right))
+    scored.sort(key=lambda row: (-row[0], -row[1], row[2].finding_id, row[3].finding_id))
+    return [(left, right) for _, _, left, right in scored]

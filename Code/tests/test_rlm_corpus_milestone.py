@@ -527,3 +527,187 @@ def test_quality_resume_has_room_for_failed_initial_assignments(corpus, monkeypa
     assert final.cumulative_usage.delegated_invocations == 26
     assert final.findings[:len(checkpoint.findings)] == checkpoint.findings
     assert final.current_usage.lexical_chunks_scanned == 0
+
+
+# Verbatim checkpoint finding claims and cited spans from the live Alphabet investigator.
+_LIVE_ALPHABET = (
+    ("e0ec543a580b908a6602bba5", ("1504:1686",),
+     "In FY2024, GOOGL disclosed that the availability of AI accelerators, including GPUs and custom-built TPUs, "
+     "faces highly competitive and rapidly evolving industry supply capacity constraints."),
+    ("62bad042e2e9d8334c2e6267", ("634:926",),
+     "In FY2024, GOOGL disclosed that its ability to deploy AI technologies critical for products and services depends "
+     "on the availability and pricing of third-party equipment, technical infrastructure operations costs including "
+     "network capacity, energy, and equipment costs."),
+    ("15787429383b3e9839f69716", ("608:820",),
+     "In FY2023, GOOGL disclosed that its ability to deploy AI technologies critical for products and services may "
+     "depend on the availability and pricing of third-party equipment and technical infrastructure."),
+    ("e0ec543a580b908a6602bba5", ("417:578",),
+     "In FY2024, GOOGL disclosed that supply interruptions affecting the company or its vendors could delay "
+     "critical data center upgrades or expansions."),
+)
+_LIVE_AMAZON = (
+    ("08d421523afa40cc084a4477", ("1605:1789",)), ("b79aa2561327a953e141e2aa", ("16:200",)),
+    ("1852186e04d3918d176cac40", ("1605:1789",)), ("4d1474550060251037c5f981", ("16:200",)),
+)
+
+
+@pytest.mark.parametrize("pressure", [False, True])
+def test_stabilized_live_alphabet_batch_and_amazon_capture(corpus, pressure):
+    plan = _plan(corpus, ("AMZN", "GOOGL"))
+    groups = {group.ticker: group for group in plan.groups}
+    google_findings = [{"claim": claim, "analysis_status": "analyzed",
+                        "evidence": [{"chunk_id": cid, "span_id": spans[0]}]}
+                       for cid, spans, claim in _LIVE_ALPHABET]
+    if pressure:
+        for index in (0, 3):
+            google_findings[index]["uncertainty"] = "Additional relevance remains unresolved. " * 9
+            google_findings[index]["conflict"] = "Another interpretation requires evidence. " * 9
+    google = NativeScript([_span_calls(tuple((cid, spans) for cid, spans, _ in _LIVE_ALPHABET)),
+                           ("submit_findings", {"findings": google_findings}),
+                           ("finish_research", {"synthesis": {}})])
+    amazon_findings = [{
+        "claim": "Amazon relies on a limited group of suppliers for semiconductors including GPUs for AI infrastructure.",
+        "analysis_status": "analyzed", "evidence": [{"chunk_id": cid, "span_id": "16:200"}],
+    } for cid in (_LIVE_AMAZON[1][0], _LIVE_AMAZON[3][0])]
+    # The original Amazon response submitted an empty list. The scripted
+    # positive control selects two directly supported atomic observations.
+    followup = [("search_chunks", {"query": "semiconductor supplier dependence", "limit": 1})] * 4
+    amazon = NativeScript([_span_calls(_LIVE_AMAZON), followup,
+                           ("submit_findings", {"findings": amazon_findings}),
+                           ("finish_research", {"synthesis": {"cite_refs": ["s1", "s2"]}})])
+    root = NativeScript([[_assign(groups["GOOGL"]), _assign(groups["AMZN"])],
+                         ("finish_research", {"synthesis": {"cite_refs": ["d2", "d3"]}})])
+
+    def factory(invocation):
+        transport = root
+        if invocation.depth:
+            ticker = corpus.get_filing(invocation.partitions[0].document_id).ticker
+            transport = google if ticker == "GOOGL" else amazon
+        return BedrockRootClient(transport, config=BedrockConfig(model="offline"))
+
+    result = execute_corpus_research(plan, _runner(corpus, factory, QUALITY), limits=_limits(1, 2, QUALITY),
+                                     discovery=DiscoverySpec.from_intent(plan.intent, PHRASES), detailed_trace=True)
+    assert result.execution_status == "finished" and result.usage.accepted_submissions == 6
+    step = result.diagnostics[0]["decisions"][0]
+    alphabet, amzn = step["operations"]
+    assert step["envelope_bytes"] <= 6000 and alphabet["observation_bytes"] <= 3000
+    assert {item.source.fiscal_year for finding in result.root_selected_inherited_findings for item in finding.evidence} == {2023, 2024}
+    assert set(alphabet["offered_finding_ids"]).isdisjoint(alphabet["omitted_finding_ids"])
+    if pressure:
+        assert alphabet["omitted_finding_ids"]
+    assert set(amzn["acknowledged_finding_ids"]) == set(amzn["offered_finding_ids"])
+    capture = amazon.requests[2]
+    assert "Capture both years separately" in capture["system"][0]["text"]
+    assert "Acknowledged chunk/span locators by year" in capture["system"][0]["text"]
+    results = [block["toolResult"]["content"][0]["json"]["result"]
+               for message in capture["messages"] for block in message["content"]
+               if "toolResult" in block and block["toolResult"]["content"][0]["json"].get("ok")]
+    for cid in (_LIVE_AMAZON[1][0], _LIVE_AMAZON[3][0]):
+        assert any(entry.get("source", {}).get("chunk_id") == cid
+                   and "Constraints on the availability" in entry.get("spans", {}).get("201:369", "")
+                   for entry in results)
+    checkpoint = create_checkpoint(corpus, result)
+    refs = {proposal.ticker: proposal.finding_ids for proposal in _review_recovery(corpus, checkpoint).verification_runs[-1].proposals}
+    assert refs["GOOGL"] == tuple(finding.finding_id for finding in checkpoint.findings
+                                  if finding.claim in {_LIVE_ALPHABET[2][2], _LIVE_ALPHABET[1][2]})[::-1]
+
+
+def _review_recovery(corpus, checkpoint):
+    from evidenceroute.research.rlm.verification import recover_checkpoint
+
+    class Verifier:
+        def send(self, payload, *, timeout_seconds):
+            cases = json.loads(payload["messages"][0]["content"][0]["text"])["cases"]
+            reviews = []
+            for case in cases:
+                evidence = case["selected_evidence"]
+                assert {item["year"] for item in evidence} == {2023, 2024}
+                refs = [item["ref"] for item in evidence]
+                earlier = [item["ref"] for item in evidence if item["year"] == 2023]
+                if case["company"] == "GOOGL":
+                    statement = "AI deployment may depend on availability and pricing of third-party equipment."
+                    relationship = "more_specific_wording"
+                else:
+                    statement = "Amazon relies on a limited group of suppliers for semiconductor products."
+                    relationship = "same_risk"
+                reviews.append({"ref": case["ref"], "components": [
+                    {"statement": statement, "status": "supported", "evidence": refs},
+                ], "comparison": {"relationship": relationship, "relationship_evidence": refs,
+                                  "earlier_year": "supports_risk", "earlier_evidence": earlier}})
+            return {"stopReason": "tool_use", "usage": {"inputTokens": 500, "outputTokens": 250},
+                    "output": {"message": {"role": "assistant", "content": [{"toolUse": {
+                        "toolUseId": "verified", "name": "submit_verification", "input": {"reviews": reviews},
+                    }}]}}}
+
+    return recover_checkpoint(checkpoint, corpus, BedrockSemanticVerifier(Verifier(), config=BedrockConfig(model="offline")),
+                              limits=VerificationLimits(max_provider_attempts=2, max_items=4))
+
+
+def test_comparison_retries_long_label_and_preserves_general_assessment(corpus):
+    plan = _plan(corpus, ("AMD",))
+    reads = _span_calls(_AMD_MECHANISMS)
+    drafts = [{
+        "claim": "Potential power or water shortages could limit customers' data-center expansion.",
+        "analysis_status": "analyzed", "evidence": [{"chunk_id": key, "span_id": span[0]}],
+    } for key, span in _AMD_MECHANISMS]
+    assessments = [
+        {"ref": "s1", "risk_category": "general_infrastructure", "entailment": "supports"},
+        {"ref": "s2", "risk_category": "ai_infrastructure_dependency", "entailment": "supports",
+         "ai_specificity": "contextual", "context_ref": "s1"},
+    ]
+    def finish(label):
+        return ("finish_research", {"synthesis": {"cite_refs": ["s1", "s2"], "comparisons": [
+            {"risk": label, "relationship": "more_specific", "assessments": assessments},
+        ]}})
+    child = NativeScript([reads * 2, reads[0], ("submit_findings", {"findings": drafts}),
+                          finish("Data center risk " * 12), finish("Power and water availability")])
+    root = NativeScript([_assign(plan.groups[0]), ("finish_research", {"synthesis": {"cite_refs": ["d1", "d2"]}})])
+    runner = _runner(corpus, lambda invocation: BedrockRootClient(child if invocation.depth else root,
+                                                                 config=BedrockConfig(model="offline")))
+    result = execute_corpus_research(plan, runner, limits=_limits(1, 1),
+                                     discovery=DiscoverySpec.from_intent(plan.intent, PHRASES))
+    assert result.execution_status == "finished"
+    assert "comparison_correction" in json.dumps(child.requests[-1]["messages"][-1])
+    item, = result.acknowledged_child_comparisons
+    assert item.relationship == "more_specific" and item.evidence_years == (2023, 2024)
+    assert item.ai_specific_years == item.ai_contextual_years == ()
+    assert {assessment.risk_category for assessment in item.assessments} == {"general_infrastructure"}
+
+
+def test_one_year_verification_accepts_uncertainty_and_guards_modality(corpus):
+    plan = _plan(corpus, ("GOOGL",))
+    item = _LIVE_ALPHABET[1]
+    child = NativeScript([*_span_calls(((item[0], item[1]),)),
+                          ("submit_findings", {"findings": [{
+                              "claim": item[2], "analysis_status": "analyzed",
+                              "evidence": [{"chunk_id": item[0], "span_id": item[1][0]}],
+                          }]}),
+                          ("finish_research", {"synthesis": {"comparisons": [{
+                              "risk": "Third-party infrastructure availability", "relationship": "unclear",
+                              "assessments": [{"ref": "s1", "risk_category": "ai_infrastructure_dependency",
+                                               "entailment": "supports", "ai_specificity": "explicit"}],
+                          }]}})])
+    root = NativeScript([_assign(plan.groups[0]), ("finish_research", {"synthesis": {"cite_refs": ["d1"]}})])
+    runner = _runner(corpus, lambda invocation: BedrockRootClient(child if invocation.depth else root,
+                                                                 config=BedrockConfig(model="offline")), QUALITY)
+    result = execute_corpus_research(plan, runner, limits=_limits(1, 1, QUALITY),
+                                     discovery=DiscoverySpec.from_intent(plan.intent, PHRASES))
+    checkpoint = create_checkpoint(corpus, result)
+    response = {"reviews": [
+        {"ref": "v1", "components": [{"statement": "Deployment depends on equipment availability.",
+                                     "status": "supported", "evidence": ["e1"]},
+                                    {"statement": "Availability and pricing may affect AI deployment.",
+                                     "status": "supported", "evidence": ["e1"]}]},
+        {"ref": "v2", "components": [{"statement": "Earlier evidence could not be assessed.",
+                                     "status": "insufficient_evidence", "evidence": [], "gap": "Find FY2023."}],
+         "comparison": {"relationship": "unclear", "earlier_year": "insufficient"}},
+    ]}
+    from evidenceroute.research.rlm.verification import record_verification, verify_checkpoint
+    verifier = BedrockSemanticVerifier(NativeScript([("submit_verification", response)]), config=BedrockConfig(model="offline"))
+    assessment = verify_checkpoint(checkpoint, corpus, verifier, limits=VerificationLimits())
+    report = verification_report(record_verification(checkpoint, corpus, assessment))
+    items = {item.kind: item for item in report["items"]}
+    assert items["finding"].status == "partially_supported"
+    assert items["comparison"].status == "insufficient_evidence"
+    assert items["comparison"].comparison.earlier_year == "insufficient"
+    assert "may depend" in report["answer"] and "Deployment depends" not in report["answer"]

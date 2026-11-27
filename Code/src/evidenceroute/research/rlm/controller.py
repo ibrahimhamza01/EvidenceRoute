@@ -346,6 +346,7 @@ class RootController:
         replay_reason = None
         capture_turn_used = False
         capture_next = False
+        comparison_fallback = None
         tool_limit = self._limits.max_tool_calls
         reinvestigation_limit = _recursive.runner.max_root_reinvestigation_calls if _recursive else None
 
@@ -400,6 +401,10 @@ class RootController:
                     )
                     if _recursive.reference_synthesis:
                         notice += " Select accepted sN and delivered dN finding references. The host renders the answer."
+                        if _recursive.compact_comparative:
+                            notice += (" Copy aliases from receipts exactly. Use empty synthesis if no aliases were issued. "
+                                       "Use neutral mechanism labels of 2–8 words (120 characters max). "
+                                       "Omit optional AI context unless a same-year excerpt grounds the link.")
                         if replay_reason == "truncated_response" and self._comparative:
                             notice += " Prioritize one comparison per company and reference the strongest evidence."
                     else:
@@ -462,9 +467,14 @@ class RootController:
                             "Evidence capture. Record atomic observations supported by the acknowledged spans from "
                             "each filing. Capture a supported infrastructure risk with its uncertainty even when "
                             "the AI link, another year, or novelty is unresolved. A passage about market demand alone "
-                            "supports only a demand observation. Use an empty list if the excerpts support no "
+                            "supports only a demand observation. Capture both years separately when a risk is shared. "
+                            "Use an empty list if the excerpts support no "
                             "meaningful observation for this research topic. Comparison follows in a separate turn."
                         )
+                        locators = _recursive.capture_locators()
+                        if locators:
+                            notice += (" Acknowledged chunk/span locators by year (latest tool results can supply more): "
+                                       + observation_json(locators))
                     else:
                         turn_tool_limit = min(tool_limit - 1, calls + max(0, corpus_slots - 1))
                         notice += " One local tool slot and one investigation turn are reserved for evidence capture."
@@ -604,6 +614,19 @@ class RootController:
                     except FindingValidationError as exc:
                         pending = self._finding_feedback(step, exc)
                         continue
+                    if (issues and finalization_reason and comparison_fallback is None
+                            and step.provider_tool_requests and allocation is not None
+                            and allocation.finalization_left and iteration < self._limits.max_iterations
+                            and not _recursive.comparisons and len(_recursive.acknowledged_references) >= 2
+                            and any(issue.code in {"string_too_long", "unacknowledged_finding_reference"}
+                                    for issue in issues)):
+                        comparison_fallback = (citations, _recursive.selected_local_finding_ids,
+                                               _recursive.selected_inherited_findings, _recursive.used_finding_ids)
+                        aliases = ", ".join(sorted(_recursive.acknowledged_references))
+                        pending = self._feedback(step, "comparison_correction",
+                                                 "Use a short mechanism label (120 characters max). "
+                                                 f"Use only these acknowledged aliases: {aliases}.")
+                        continue
                     answer = _recursive.render_answer("")
                     stop = "finished"
                     break
@@ -677,6 +700,12 @@ class RootController:
                 stop = "deadline"
                 break
 
+        if comparison_fallback is not None and not _recursive.comparisons and comparison_fallback[0] and (
+            stop != "finished" or not citations
+        ):
+            (citations, _recursive.selected_local_finding_ids, _recursive.selected_inherited_findings,
+             _recursive.used_finding_ids) = comparison_fallback
+            answer, stop, budget_stop = _recursive.render_answer(""), "finished", None
         report = coverage.report()
         metadata = _recursive.trace_fields(report) if _recursive is not None else {}
         if _recursive is not None and _recursive.capture_reserved:
@@ -717,7 +746,9 @@ class RootController:
                 result = self._dispatcher.dispatch(action.name, action.arguments,
                                                    delivered_chunks=recursive.direct_ids if recursive else None,
                                                    delivered_spans=recursive.delivered_span_text
-                                                   if recursive and recursive.compact_comparative else None)
+                                                   if recursive and recursive.compact_comparative else None,
+                                                   adjacent_bytes=(batch_share if batch_share is not None else self._limits.max_response_bytes)
+                                                   if recursive and recursive.capture_reserved else None)
         operation.tool_seconds = self._clock() - started
         delegation = operation.delegation
         operation.outcome = ("rejected" if result.arguments is None or
