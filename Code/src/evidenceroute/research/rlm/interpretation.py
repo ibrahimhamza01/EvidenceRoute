@@ -44,9 +44,10 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   and records the inference. Use section_selection "inferred" when the question names no section and the inventory
   identifies the relevant processed section or sections, such as financial statements or MD&A. Put only those
   inventory IDs in section_ids and explain the choice in scope_notes. Do not infer an ID absent from the inventory
-  and do not replace a named unavailable section with a different available one. Leave section_ids out of
-  inferred_fields. Ask for clarification when the appropriate section is unclear. Broad all-section or full-filing
-  requests are unsupported, since the corpus has selected sections.
+  and do not replace a named unavailable section with a different available one. Section inference is only
+  section_selection. inferred_fields accepts only company_selection, fiscal_years, objective, topic, and
+  comprehensive. Leave section_ids out of inferred_fields. Ask for clarification when the appropriate section is
+  unclear. Broad all-section or full-filing requests are unsupported, since the corpus has selected sections.
 - The review mode covers descriptive, evidence-based disclosure research. That includes corpus-wide description
   and a question one filing section can answer, including comparative figures that section already discloses. Its
   objective is review and required_operands is []. generic_synthesis covers ordinary filing-grounded comparisons
@@ -71,7 +72,8 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   one filing. For review and ai_infrastructure_comparison, required_operands is [].
 - For ready modes include requirements and question-specific lexical phrases likely to occur verbatim in the
   filing text. Prefer short topic variants, synonyms and acronyms. Use inferred_fields for every inferred
-  requirement other than section scope and briefly document those assumptions in scope_notes.
+  requirement other than section scope. Its only values are company_selection, fiscal_years, objective, topic,
+  and comprehensive. Briefly document those assumptions in scope_notes.
   Use [] when there are no other inferred fields.
   Provide only structured fields and concise scope notes, without private reasoning."""
 
@@ -85,7 +87,8 @@ review and the same operands. An ai_infrastructure_comparison stays that mode. D
 different question or drop a source. For expressly named sections, use "explicit" with every requested ID.
 For unspecified risk-factor scope, use "risk_factors_default" with section_ids []; the application will provide
 Item 1A and mark the inference. For an inferred section, keep "inferred" and every inferred inventory ID.
-Leave section_ids out of inferred_fields. If the comparison needs more than eight operands, return unsupported
+Leave section_ids out of inferred_fields. When validation_feedback reports literal_error, its permitted value
+lists the only accepted tokens for that field. If the comparison needs more than eight operands, return unsupported
 and explain that limit instead of omitting operands. Return a clarification or unsupported outcome when
 warranted by the original question."""
 
@@ -126,14 +129,22 @@ class _Requirements(IntentRequirements):
     companies: tuple[Annotated[str, Field(min_length=1, max_length=160)], ...] = Field(max_length=50)
     fiscal_years: tuple[Annotated[int, Field(ge=1900, le=9999)], ...] = Field(min_length=1, max_length=10)
     section_selection: Literal["explicit", "risk_factors_default", "inferred"] = Field(
-        description="Named filing sections, the risk-factor default, or sections inferred from the inventory.",
+        description=(
+            "The only field that records section inference. "
+            "explicit: the question names the sections and section_ids lists every one. "
+            "risk_factors_default: unnamed risk factors; section_ids is []. "
+            "inferred: the question names no section and section_ids lists inventory IDs only."
+        ),
     )
     section_ids: tuple[Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$", max_length=64)], ...] = Field(
         max_length=20,
         description="Requested section IDs for explicit or inferred selection. Use [] for risk_factors_default.",
     )
     inferred_fields: tuple[Literal["company_selection", "fiscal_years", "objective", "topic", "comprehensive"], ...] = Field(
-        description="Mark inferred requirements other than section scope. The application records section inference.",
+        description=(
+            "Inferred requirements other than section scope, or []. "
+            "Permitted values: company_selection, fiscal_years, objective, topic, comprehensive."
+        ),
     )
     topic: str = Field(min_length=1, max_length=2_000)
     scope_notes: str | None = Field(min_length=1, max_length=800)
@@ -157,6 +168,7 @@ class ValidationIssue:
     path: str
     category: Literal["missing_field", "schema", "inconsistent_requirements", "discovery_phrase"]
     code: str
+    permitted: str = ""
 
 
 @dataclass(frozen=True)
@@ -182,6 +194,52 @@ _SCHEMA_ERRORS = {
     "greater_than_equal", "less_than_equal", "json_invalid",
 }
 _MAX_ISSUES = 4
+_INFERRED_FIELDS = ("company_selection", "fiscal_years", "objective", "topic", "comprehensive")
+_PERMITTED = {
+    "mode": "review, generic_synthesis, ai_infrastructure_comparison, ambiguous, unsupported",
+    "company_selection": "all, explicit",
+    "section_selection": "explicit, risk_factors_default, inferred",
+    "objective": "review, year_over_year",
+    "inferred_fields": ", ".join(_INFERRED_FIELDS),
+}
+_REDUNDANT_INFERENCE = frozenset({
+    "section", "sections", "section_id", "section_ids", "section_selection", "section_name", "section_names",
+})
+
+
+def _token(value: str) -> str:
+    return "_".join(value.strip().casefold().replace("-", " ").split())
+
+
+def _normalize_inference(arguments: dict) -> None:
+    """Drop section tokens that only repeat section_selection, and keep one copy of each real field."""
+    if not isinstance(arguments, dict):
+        return
+    requirements = arguments.get("requirements")
+    if not isinstance(requirements, dict):
+        return
+    selection = requirements.get("section_selection")
+    if isinstance(selection, str) and _token(selection) in {"explicit", "risk_factors_default", "inferred"}:
+        requirements["section_selection"] = _token(selection)
+    raw = requirements.get("inferred_fields")
+    if not isinstance(raw, list):
+        return
+    kept = []
+    for item in raw:
+        if not isinstance(item, str):
+            kept.append(item)
+            continue
+        token = "fiscal_years" if _token(item) == "fiscal_year" else _token(item)
+        if token in _REDUNDANT_INFERENCE or token in kept:
+            continue
+        kept.append(token if token in _INFERRED_FIELDS else item)
+    requirements["inferred_fields"] = kept
+
+
+def _permitted(path: str, code: str) -> str:
+    if code != "literal_error":
+        return ""
+    return _PERMITTED.get(path.split(".")[-1].split("[", 1)[0], "")
 
 
 def _field_path(location: tuple, *, extra: bool) -> str:
@@ -208,7 +266,8 @@ def _schema_issues(error: ValidationError) -> tuple[ValidationIssue, ...]:
             path = _field_path(item["loc"], extra=code == "extra_forbidden")
             category = ("missing_field" if code == "missing" else
                         "discovery_phrase" if path.startswith("discovery_phrases") else "schema")
-            issue = ValidationIssue(path, category, code if code in _SCHEMA_ERRORS else "invalid_value")
+            code = code if code in _SCHEMA_ERRORS else "invalid_value"
+            issue = ValidationIssue(path, category, code, _permitted(path, code))
         if issue not in issues:
             issues.append(issue)
         if len(issues) == _MAX_ISSUES:
@@ -528,6 +587,7 @@ class BedrockIntentInterpreter(BedrockRootClient):
     def _validate_interpretation(
         question: str, arguments: dict, inventory: dict, previous_scope: dict,
     ) -> InterpretationOutcome:
+        _normalize_inference(arguments)
         try:
             parsed = _Interpretation.model_validate_json(json.dumps(arguments, allow_nan=False))
         except ValidationError as exc:

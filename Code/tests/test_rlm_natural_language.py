@@ -144,6 +144,11 @@ def test_inventory_and_original_question_reach_one_forced_structured_request(cor
         "review", "generic_synthesis", "ai_infrastructure_comparison", "ambiguous", "unsupported",
     ]
     assert "section_ids" not in requirements["properties"]["inferred_fields"]["items"]["enum"]
+    assert requirements["properties"]["inferred_fields"]["items"]["enum"] == [
+        "company_selection", "fiscal_years", "objective", "topic", "comprehensive",
+    ]
+    assert "explicit" in requirements["properties"]["section_selection"]["description"]
+    assert "inferred" in requirements["properties"]["section_selection"]["description"]
     submitted = json.loads(payload["messages"][0]["content"][0]["text"])
     assert submitted["question"] == result.question == result.plan.intent.question
     inventory = submitted["corpus_inventory"]
@@ -243,8 +248,9 @@ def test_blocked_questions_have_explicit_outcomes(corpus, data, question, status
      ValidationIssue("requirements.fiscal_years", "inconsistent_requirements", "invalid_inferred_years")),
     (_structured(inferred_fields=["topic"], scope_notes=None),
      ValidationIssue("requirements.scope_notes", "inconsistent_requirements", "scope_notes_required")),
-    (_structured(inferred_fields=["section_ids"], scope_notes="Inferred section."),
-     ValidationIssue("requirements.inferred_fields[0]", "schema", "literal_error")),
+    (_structured(inferred_fields=["segments"], scope_notes="Inferred section."),
+     ValidationIssue("requirements.inferred_fields[0]", "schema", "literal_error",
+                     "company_selection, fiscal_years, objective, topic, comprehensive")),
     (_structured(section_selection="explicit"),
      ValidationIssue("requirements.section_ids", "inconsistent_requirements", "explicit_sections_required")),
     (_structured(companies=[]),
@@ -330,6 +336,32 @@ def test_correction_clears_generated_ids_from_risk_default(corpus):
     assert result.plan.intent.inferred_fields == ("section_ids",)
     assert result.plan.missing_requirements == ()
     assert result.usage.provider_attempts == 2 and result.usage.reported_tokens == 250
+
+
+def test_redundant_section_metadata_keeps_a_valid_plan(corpus):
+    data = _structured(inferred_fields=["section_ids", "Section IDs", "sections"], scope_notes="Risk factors.")
+    result = _run(corpus, MockTransport([_interpretation(data)]), max_batches=0,
+                  question="What foreign exchange risks did Apple disclose in its FY2024 annual report?")
+    assert result.interpretation.outcome.status == "ready"
+    assert result.interpretation.validation_failures == ()
+    assert result.plan.intent.section_ids == ("item_1a",)
+    assert result.plan.intent.inferred_fields == ("section_ids",)
+
+
+def test_literal_error_feedback_lists_permitted_values(corpus):
+    bad = _structured(inferred_fields=["section_ids", "segments"], scope_notes="Risk factors.")
+    transport = MockTransport([_interpretation(bad), _interpretation(_structured())])
+    result = _run(corpus, transport, max_batches=0,
+                  question="What foreign exchange risks did Apple disclose in its FY2024 annual report?")
+    issue, = result.interpretation.validation_failures[0].issues
+    assert issue == ValidationIssue(
+        "requirements.inferred_fields[0]", "schema", "literal_error",
+        "company_selection, fiscal_years, objective, topic, comprehensive",
+    )
+    feedback = json.loads(transport.requests[1][0]["messages"][0]["content"][0]["text"])["validation_feedback"]
+    assert feedback[0]["permitted"] == issue.permitted
+    assert "Leave section_ids out of inferred_fields" in transport.requests[1][0]["system"][0]["text"]
+    assert result.plan.intent.section_ids == ("item_1a",)
 
 
 def test_invalid_correction_stops_after_one_correction_even_with_a_spare_attempt(corpus):
