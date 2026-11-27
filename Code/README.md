@@ -123,6 +123,8 @@ python Code/examples/demo_rlm_corpus_research.py --profile full-corpus --live \
 
 Use `rlm-milestone-full-limits.json` for a single larger pass. Checkpoint saves occur at pass boundaries. Default continuation selects unresolved assignments. To investigate a specific verification gap, set `--resume`, `--company`, and `--goal` with fresh research and verification allowances. See the [small verified comparison](docs/rlm.md#live-validation-commands).
 
+For the quality-oriented comparison, select `--profile full-corpus-quality` and use its larger explicit limits. The economical `full-corpus` profile remains available for controlled runs. Use `demo_rlm_verification.py --outstanding --checkpoint FILE --limits-file FILE --save-checkpoint FILE` for a separate verification pass over outstanding cases. Check `assignment_evidence` and `outstanding_verification` in the report. Add `--live` to authorize Bedrock calls. [Quality limits and live commands](docs/rlm.md#next-live-validation)
+
 ### Python integration
 
 This live example creates the corpus and runner once. Reuse both across benchmark questions. Use a separate checkpoint path and harness ID for each question. Each invocation gets a fresh model client.

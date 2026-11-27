@@ -69,8 +69,8 @@ def main(argv=None) -> int:
         parser.error("A continuation uses saved discovery settings.")
     if args.goal and not args.resume:
         parser.error("--goal requires --resume.")
-    if args.fail_amd_finish and (args.live or args.profile != "full-corpus"):
-        parser.error("--fail-amd-finish requires the offline full-corpus profile.")
+    if args.fail_amd_finish and (args.live or not COMPARATIVE_PROFILES[args.profile].comparative_capture):
+        parser.error("--fail-amd-finish requires an offline profile with comparative capture.")
     if args.live and not args.limits_file:
         parser.error("--live requires --limits-file with explicit overall allowances.")
 
@@ -81,9 +81,10 @@ def main(argv=None) -> int:
             limits = CorpusLimits.model_validate_json(args.limits_file.read_bytes())
         elif profile.comparative_capture:
             limits = CorpusLimits(
-                max_batches=13, max_provider_attempts=234, max_reported_tokens=1_300_000,
-                max_corpus_attempts=156, max_delegations=25, max_partitions=4 if args.limited else 50,
-                deadline_seconds=2340.0,
+                max_batches=13, max_provider_attempts=13 * shared.max_provider_attempts,
+                max_reported_tokens=13 * shared.max_reported_tokens, max_corpus_attempts=13 * shared.max_corpus_attempts,
+                max_delegations=25, max_partitions=4 if args.limited else 50,
+                deadline_seconds=13 * shared.deadline_seconds,
             )
         else:
             limits = CorpusLimits(

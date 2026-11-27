@@ -67,6 +67,7 @@ _RISK = re.compile(
     r"\b(?:risks?|depend\w*|rely|reliance|constrain\w*|shortages?|interrupt\w*|"
     r"disrupt\w*|availab\w*|limit\w*|fail\w*|outages?|supply|sufficient|unable)\b"
 )
+_DISRUPTION = re.compile(r"\b(?:shortages?|outages?|constrain\w*|disrupt\w*|interrupt\w*|impair\w*)\b")
 _INFLECTIONS = {
     "accelerators": "accelerator", "centers": "center", "centres": "center", "centre": "center",
     "chips": "chip", "constraints": "constraint", "dependencies": "dependency",
@@ -133,14 +134,28 @@ class CorpusScan:
     unvisited_targets: tuple[SectionTarget, ...] = ()
     discovery: DiscoverySpec | None = None
 
-    def shortlist(self, pairs: tuple[SectionTarget, ...], *, per_section: int = 3) -> list[dict]:
+    def shortlist(
+        self, pairs: tuple[SectionTarget, ...], *, per_section: int = 3, mechanism_hint: bool = False,
+    ) -> list[dict]:
         authorized = set(pairs)
-        return [{"ticker": row.ticker, "fiscal_year": row.fiscal_year, "section_id": row.pair.section_id,
-                 "document_id": row.pair.document_id, "candidate_count": len(row.candidates),
-                 "chunks": [item.chunk_id for item in row.candidates[:per_section]],
-                 "matching_span_ids": self._span_hints(row.candidates[:per_section]),
-                 "next_offset": per_section if len(row.candidates) > per_section else None}
-                for row in self.sections if row.pair in authorized]
+        shortlist = []
+        for row in self.sections:
+            if row.pair not in authorized:
+                continue
+            candidates = row.candidates[:per_section]
+            entry = {"ticker": row.ticker, "fiscal_year": row.fiscal_year, "section_id": row.pair.section_id,
+                     "document_id": row.pair.document_id, "candidate_count": len(row.candidates),
+                     "chunks": [item.chunk_id for item in candidates], "matching_span_ids": self._span_hints(candidates),
+                     "next_offset": per_section if len(row.candidates) > per_section else None}
+            if mechanism_hint:
+                for hit in row.candidates:
+                    if hit.matching_span_ids and any(_INFRA_STRONG.fullmatch(term) for term in hit.terms) and any(
+                        _DISRUPTION.search(term) for term in hit.terms
+                    ):
+                        entry["infrastructure_mechanism_hint"] = self._span_hints((hit,))
+                        break
+            shortlist.append(entry)
+        return shortlist
 
     def candidate_page(self, pair: SectionTarget, offset: int, limit: int) -> dict:
         row = next((row for row in self.sections if row.pair == pair), None)

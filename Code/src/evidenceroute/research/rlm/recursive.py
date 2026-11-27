@@ -202,19 +202,22 @@ class RecursiveResearch:
                 "Use scoped search_chunks for gaps or different wording. No lexical miss proves absence."
             )
         if self.comparison_scan is not None and not session.delegation_first:
-            shortlist = self.comparison_scan.shortlist(partitions or ())
+            shortlist = self.comparison_scan.shortlist(partitions or (), mechanism_hint=session.compact_comparative)
             prompt += (
                 "\nLexical candidates (IDs and span hints, at most three per section): " + observation_json(shortlist)
                 + "\nUse get_spans for matching passages and list_candidates with next_offset for more scoped IDs. "
                 "Use scoped search_chunks for gaps or different wording, including sections with no candidates. "
-                "Read promising evidence in each fiscal "
-                "year and check the same risk in both filings. Choose chunk_id and span_id from acknowledged "
-                "evidence to create findings. Evaluate relevance to the topic separately from what the passage supports or contradicts. "
-                "Accelerator demand alone does not establish an infrastructure risk. Assess separately whether the exact "
-                "source links the mechanism to AI infrastructure. "
-                "Mark relevance other or uncertain where appropriate and abstain if support is insufficient. "
+                "Accelerator demand alone does not establish an infrastructure risk. "
                 "Investigate counterevidence and report gaps. No lexical miss proves absence."
             )
+            if session.compact_comparative:
+                prompt += (" Start with an exact span from each year when available. Prefer the infrastructure mechanism "
+                           "hint where relevant. Use one get_spans call for up to four nearby spans in the same chunk. "
+                           "Include surrounding text if a span ends mid-sentence. When a year lacks hints, search that "
+                           "filing early or read its authorized section directly.")
+            else:
+                prompt += (" Choose acknowledged chunk and span IDs. Evaluate risk relevance and AI linkage separately "
+                           "from passage support and contradiction. Report insufficient support explicitly.")
         if session.delegation_first:
             prompt += ("\nStart with one delegate_research call per company, keeping all its fiscal years together. "
                        "Once every admitted group has an attempt, synthesize delivered results or investigate specific gaps.")
@@ -224,12 +227,14 @@ class RecursiveResearch:
             "\nUse submit_findings as soon as you have supported claims from acknowledged chunk and span IDs. "
             "Keep evidence for each finding in one document and section. In reference synthesis, select the returned sN "
             "references and dN references from delivered child findings. The host derives citations and renders the answer. "
-            "Report uncertainty and conflicts. Abstain when evidence is insufficient. Search misses do not establish absence."
+            "Report uncertainty and conflicts. Search misses do not establish absence."
         )
         if session.compact_comparative:
-            prompt += (" Capture each year-specific claim once and leave novelty to comparisons. "
-                       "Use an empty submission when evidence is insufficient. "
-                       "Finish with references only. A root can cite child references without repeating child comparisons. Separate support for the underlying risk, risk category, AI connection "
+            prompt += (" Capture each grounded year-specific observation once, including general infrastructure risks "
+                       "with an uncertain AI link or no earlier-year counterpart. Record those gaps as uncertainty. "
+                       "Use an empty submission only when the delivered excerpts support no useful scoped observation. "
+                       "Finish with references only. A root can cite child references without repeating child comparisons. "
+                       "Separate support for the underlying risk, risk category, AI connection "
                        "and disclosure relationship. Silence is nonmention. Only an opposing statement about the same risk "
                        "can contradict it. AI dependencies, AI-enabled threats and unrelated AI risks are distinct categories.")
             enable = getattr(model, "enable_compact_comparative_finish", None)
@@ -274,6 +279,11 @@ class RecursiveSession:
         self.compact_comparative = runner.comparative_capture and runner.comparison_scan is not None
         self.capture_reserved = self.compact_comparative and invocation.depth > 0 and budget.active_allocation is not None
         self.capture_attempted = False
+        self._year_by_document = {
+            pair.document_id: runner.corpus.get_filing(pair.document_id).fiscal_year for pair in authorized
+        } if self.capture_reserved else {}
+        years = set(self._year_by_document.values())
+        self.pending_year_reads = years if len(years) > 1 else set()
         self.reference_synthesis = self.compact_comparative or runner.discovery_scan is not None or (
             invocation.depth == 0 and runner.comparison_scan is not None
         )
@@ -286,6 +296,31 @@ class RecursiveSession:
         self.comparisons: tuple[Comparison, ...] = ()
         self.used_finding_ids: tuple[str, ...] = ()
         self.analysis_status: AnalysisStatus = "incomplete"
+
+    def allow_investigation_tool(self, name: str, arguments: dict, local_slots: int) -> bool:
+        """Protect an original-text read opportunity for each resolved year."""
+        if not self.pending_year_reads or name == SUBMIT_FINDINGS:
+            return True
+        year = None
+        if name in {"get_spans", "get_chunk"} and isinstance(arguments.get("chunk_id"), str):
+            try:
+                chunk = self.runner.corpus.get_chunk(arguments["chunk_id"])
+            except KeyError:
+                pass
+            else:
+                if SectionTarget(chunk.document_id, chunk.section_id) in self.invocation.partitions:
+                    year = chunk.fiscal_year
+        elif name in {"read_chunks", "get_section"} and isinstance(arguments.get("document_id"), str):
+            year = self._year_by_document.get(arguments["document_id"])
+        if year in self.pending_year_reads:
+            self.pending_year_reads.remove(year)
+            return True
+        corpus_slots = self.budget.limits.max_corpus_attempts - self.budget.corpus_attempts - 1
+        return min(local_slots, corpus_slots) > len(self.pending_year_reads)
+
+    def year_read_notice(self) -> str:
+        years = ", ".join(f"FY{year}" for year in sorted(self.pending_year_reads))
+        return f"Use the remaining investigation read slots for original text in {years}."
 
     def can_delegate(self, *, initial_assignment: bool = False) -> bool:
         if self.invocation.depth and len(self.invocation.partitions or ()) <= 1:

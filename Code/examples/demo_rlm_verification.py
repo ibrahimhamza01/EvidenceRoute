@@ -17,7 +17,7 @@ from evidenceroute.research.rlm.planning import ResearchIntent, resolve_research
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.tools import observation_json
 from evidenceroute.research.rlm.verification import (
-    BedrockSemanticVerifier, VerificationLimits, record_verification, verification_report, verify_checkpoint,
+    BedrockSemanticVerifier, VerificationLimits, record_verification, review_checkpoint, verification_report, verify_checkpoint,
 )
 
 APPLE_CHUNK = "cd7988623c9a3bf545f06045"
@@ -190,10 +190,13 @@ def main(argv=None):
     parser.add_argument("--checkpoint", type=Path, help="Source research checkpoint.")
     parser.add_argument("--limits-file", type=Path, help="Explicit JSON verification limits.")
     parser.add_argument("--kind", choices=("all", "findings", "comparisons"), default="all", help="Cases to review.")
+    parser.add_argument("--outstanding", action="store_true", help="Review outstanding current cases without revisiting settled reviews.")
     parser.add_argument("--save-checkpoint", type=Path, help="Save the recorded review of a supplied checkpoint.")
     args = parser.parse_args(argv)
     if args.live and not (args.checkpoint and args.limits_file):
         parser.error("--live requires --checkpoint and --limits-file.")
+    if args.outstanding and args.kind != "all":
+        parser.error("--outstanding uses the current comparison and finding inventory. Omit --kind.")
     if args.save_checkpoint and not args.checkpoint:
         parser.error("--save-checkpoint requires --checkpoint.")
     corpus = CorpusEnvironment()
@@ -209,21 +212,28 @@ def main(argv=None):
         inputs = ([load_checkpoint(args.checkpoint, corpus)] if args.checkpoint
                   else [fixture_checkpoint(corpus, ticker) for ticker in ("AAPL", "GOOGL")])
         reports = []
+        attempts = 0
         for checkpoint in inputs:
             verifier = (BedrockSemanticVerifier.from_env(disable_retries=True) if args.live else
                         BedrockSemanticVerifier(OfflineVerificationTransport(), config=BedrockConfig(model="offline-verifier")))
-            run = verify_checkpoint(checkpoint, corpus, verifier, limits=limits,
-                                    finding_ids=() if args.kind == "comparisons" else None,
-                                    comparison_ids=() if args.kind == "findings" else None)
-            updated = record_verification(checkpoint, corpus, run)
+            if args.outstanding:
+                updated = review_checkpoint(checkpoint, corpus, verifier, limits=limits)
+            else:
+                run = verify_checkpoint(checkpoint, corpus, verifier, limits=limits,
+                                        finding_ids=() if args.kind == "comparisons" else None,
+                                        comparison_ids=() if args.kind == "findings" else None)
+                updated = record_verification(checkpoint, corpus, run)
+            pass_attempts = updated.verification_usage.provider_attempts - checkpoint.verification_usage.provider_attempts
+            attempts += pass_attempts
             if args.save_checkpoint:
                 save_checkpoint(args.save_checkpoint, updated)
             report = verification_report(updated)
-            reports.append({**report, "status_counts": dict(Counter(item.status for item in report["items"]))})
+            reports.append({**report, "pass_provider_attempts": pass_attempts,
+                            "status_counts": dict(Counter(item.status for item in report["items"]))})
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     output = {"mode": "live Bedrock" if args.live else "scripted verification fixtures", "reports": reports,
-              "live_provider_attempts": sum(report["current_verification_usage"].provider_attempts for report in reports) if args.live else 0}
+              "live_provider_attempts": attempts if args.live else 0}
     print(json.dumps(json.loads(observation_json(output)), indent=2))
     return 0
 

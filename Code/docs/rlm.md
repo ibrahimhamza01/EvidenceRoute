@@ -1033,6 +1033,89 @@ python Code/examples/demo_rlm_corpus_research.py --profile full-corpus --live \
 Use `rlm-milestone-full-limits.json` on the first call for an allowance covering all 13 trees in one pass. Inspect pending assignments after any live allowance stops. For a specific verification gap, add `--company TICKER --goal "Find earlier-year evidence for the same mechanism"` to a resume call and supply fresh allowances. A separate verifier invocation, even with the same model, provides a semantic assessment whose accuracy remains subject to review. Full-corpus live execution, live cost and latency changes, and held-out quality remain open.
 
 
+## AMD live capture follow-up
+
+The focused AMD run `4837bdbd50f34b999b2543b88f8b0e20` at `71c6733` used the economical `full-corpus` profile. The saved report and validated checkpoint record **6 attempts, 23,300 reported tokens, 16.96 seconds, 187 scanned chunks and 20 candidates**. Four calls delivered six exact spans. One scoped search subsequently returned candidate IDs, and the other search was skipped at the local read cap. The named capture tool received a valid empty list. The investigator and root both finalized by reference. The checkpoint holds zero findings, comparisons and citations, and no submission records were rejected. Execution finished with unresolved analysis.
+
+### What the delivered evidence supported
+
+| Fiscal year | Original chunk and span | Supported observation |
+| --- | --- | --- |
+| 2023 | `a13ada334ad8f009b2a43f01` `359:520`, `521:724` | Demand varies across AMD end markets. AMD reported significant AI accelerator demand in Q4 2023. |
+| 2024 | `e7fbf3d91de1c9c912d9ab11` `970:1167` | AMD reported significant AI accelerator demand since Q4 2023. |
+| 2024 | `e8e013b9b919159fb6168bca` `626:787`, `788:999` | Similar demand language recurred in a second chunk. |
+| 2024 | `26bd14970249e9ca31c54908` `1319:1486` | AMD expected intense competition in the supply of GPUs and other AI accelerators. |
+
+These are valid year-specific observations. They establish demand variability, demand history and expected competition. The selected sentences and their surrounding chunks leave a particular infrastructure dependency unresolved. FY2023 rank 2 repeats the FY2024 competition sentence. Neither demand nor competition establishes a new infrastructure constraint.
+
+The stronger mechanism was already in discovery. FY2023 rank 3 (`043757f52188a8c6fb2a2857`, `296:513`) says that power or water shortages could impair customers' data-center expansion and consumption of AMD products. FY2024 rank 5 (`483314af3b949a29920abbbf`, `393:680`) repeats the mechanism and adds a potential revenue impact. The executed FY2024 search surfaced that later chunk ID after the allotted reads, and no exact text from either mechanism reached the model. Those two spans support separate general infrastructure findings and a shared underlying constraint. The AI-specific causal link remains unresolved. Other retained candidates concern third-party operations, supplier constraints, export controls and regulation. The root-level `rlm-amd-live-audit.json` contains the six verbatim excerpts, their chunk context, and the ranked candidates with canonical URLs.
+
+### Capture request and targeted changes
+
+The live request contracted from **15,084 to 12,156 bytes** and **5,166 to 4,310 input tokens** at capture. The Converse adapter appends the latest native tool results to its message list and sends the full history with the new tool list. The six span IDs were already acknowledged on the previous turn. The capture request offered only `submit_findings`, used named tool choice, and replaced the investigation budget notice with the capture instruction. An offline replay at `71c6733` retained the earlier messages as an exact prefix. Its tool configuration shrank by 4,805 bytes and its system prompt by 176 bytes, while messages grew by 1,044 bytes. The replay used substitute search arguments because the artifact omitted the original arguments and raw payload. It demonstrates request construction and evidence retention. It cannot determine how the model evaluated those excerpts or why it chose an empty list.
+
+The capture prompt and schema now ask for atomic supported observations from one filing. An evidenced infrastructure risk remains eligible while AI linkage, another fiscal year or novelty is unresolved. The investigator records those gaps as uncertainty. Demand alone supports a demand observation. An empty list remains valid when the excerpts support no useful scoped observation.
+
+The comparative shortlist surfaces one infrastructure mechanism hint per year when the retained lexical candidates contain both a strong infrastructure anchor and a disruption or constraint term. The existing ranking and candidate inventory remain available. The investigator starts with original text from each year, can combine up to four nearby spans from one chunk in one call, and can follow a lower-ranked mechanism or use scoped search as needed. For a resolved two-year assignment, the controller reserves one scoped original-text attempt for each year before the final exploration slots can be used elsewhere. The reservation also applies to a year with zero candidates. This protects an opportunity. Provider behavior, tool errors, deadline and token admission still affect actual coverage.
+
+### Quality profile and continuation
+
+The economical `full-corpus` profile retains its ceilings. Use `full-corpus-quality` for the next live validation. Its nine local tool slots allow four investigation operations per year and one capture. Its nine child provider slots allow six adaptive investigation turns, a capture turn and two protected finishes. Two child pools plus two root assignment turns and two root finishes require 22 shared attempts. The 160,000-token threshold provides room for the longer conversation history. It is a configured ceiling subject to in-flight reported usage, and the actual costs still require live measurement.
+
+| Per-tree setting | Economical | Quality |
+| --- | ---: | ---: |
+| Shared provider attempts / corpus attempts | 18 / 12 | 22 / 18 |
+| Local decisions / tools / child attempts | 6 / 6 / 6 | 9 / 9 / 9 |
+| Reported token threshold | 100,000 | 160,000 |
+| Observation bytes / deadline | 6,000 / 180 s | 6,000 / 180 s |
+| Depth / root follow-up tools / protected finish attempts | 1 / 0 / 2 | 1 / 0 / 2 |
+
+Read `assignment_evidence` for execution state, retained finding counts and years, and findings with verifier support. A completed zero-finding assignment has unresolved analysis. Default continuation selects unresolved execution, and an explicit `--company AMD --goal "Inspect the water and energy dependency in both filings"` selects the completed AMD assignment for a bounded revisit. `outstanding_verification` counts unreviewed or previously unverified current cases. The verifier CLI's `--outstanding` uses `review_checkpoint` to advance the saved review inventory. Settled reviews, including insufficient-evidence judgments, are reused. Each pass has a fresh explicit allowance. Cases that remain unverified may need smaller batches, revised evidence, or explicitly selected IDs.
+
+### Next live validation
+
+The prepared JSON files are generated by `python rlm-quality-limits.py` in this workspace. Their explicit caps are below. All research files also set 3,038 scan chunks, 328 scan pages, and a 10-second scan allowance. The continuation has capacity for all 25 groups even if the whole first pass fails. Completed groups remain outside its default selection.
+
+| Limits file | Batches | Attempts | Reported tokens | Corpus calls | Delegations / partitions | Seconds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rlm-quality-tree-limits.json` | 1 | 22 | 160,000 | 18 | 2 / 4 | 180 |
+| `rlm-quality-initial-limits.json` | 3 | 66 | 480,000 | 54 | 6 / 12 | 540 |
+| `rlm-quality-full-limits.json` | 13 | 286 | 2,080,000 | 234 | 25 / 50 | 2,340 |
+
+`rlm-quality-verification-limits.json` allows 16 requests, 64,000 charged tokens, 32 items, two items per request, 1,024 output tokens, 16,000 evidence input bytes, and 240 seconds per pass.
+
+```bash
+export PYTHONPATH=Code/src BEDROCK_REGION=us-east-1
+export BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+export CLAUDE_TIMEOUT_SECONDS=20 CLAUDE_MAX_OUTPUT_TOKENS=1024
+
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live --trace \
+  --company AMD --limits-file rlm-quality-tree-limits.json \
+  --save-checkpoint rlm-amd-quality-live-checkpoint.json > rlm-amd-quality-live.json
+
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live --trace \
+  --company AMZN --company GOOGL --limits-file rlm-quality-tree-limits.json \
+  --verification-limits-file rlm-quality-verification-limits.json \
+  --save-checkpoint rlm-amzn-googl-quality-live-checkpoint.json > rlm-amzn-googl-quality-live.json
+
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live --trace \
+  --limits-file rlm-quality-initial-limits.json \
+  --save-checkpoint rlm-full-quality-live-checkpoint.json > rlm-full-quality-initial-live.json
+
+python Code/examples/demo_rlm_corpus_research.py --profile full-corpus-quality --live \
+  --resume rlm-full-quality-live-checkpoint.json --limits-file rlm-quality-full-limits.json \
+  --save-checkpoint rlm-full-quality-live-checkpoint.json > rlm-full-quality-continued-live.json
+
+python Code/examples/demo_rlm_verification.py --live --outstanding \
+  --checkpoint rlm-full-quality-live-checkpoint.json --limits-file rlm-quality-verification-limits.json \
+  --save-checkpoint rlm-full-quality-live-checkpoint.json > rlm-full-quality-reviewed-live.json
+```
+
+The first full-corpus pass can exit 1 after saving partial progress. Each additional verification pass requires a new invocation with the explicit limits file. For the Amazon–Alphabet run, compare Amazon's paired semiconductor supplier excerpts (`b79aa2561327a953e141e2aa` and `4d1474550060251037c5f981`) and Alphabet's paired third-party equipment disclosures (`15787429383b3e9839f69716` and `62bad042e2e9d8334c2e6267`). Amazon states substantially the same AI supply dependency in both years. Alphabet states the deployment dependency in both years and names more cost drivers in FY2024. `python rlm-quality-positive-control.py rlm-amzn-googl-quality-live.json` audits candidate ranking, acknowledged text and retained evidence for those controls. The controls do not establish novelty.
+
+Native offline regressions replayed the six AMD excerpts and exercised abstention, both-year capture, a missing earlier-year mechanism, and failed finalization after capture. The Amazon–Alphabet fixture retained four year-specific findings and independently reviewed six cases across two authorized stub passes. The second pass reused the first pass's two settled comparisons. The quality workflow retained the 25-company and 50-target denominator across restart. A separate failure simulation left 20 companies eligible after the first six attempts. Continuation investigated all 20 under the new allowance, reusing the initial scan and preserving the failed child's accepted findings. No paid requests were made. Live capture behavior, comparative quality and resource consumption under the revised profile remain unmeasured.
+
+
 ## Issue #16 acceptance review
 
 The branch provides the bounded RLM-inspired strategy, runnable examples and audit records requested by the issue. The branch diff from its mainline base contains only RLM modules, examples, tests and this guide. [Issue #16](https://github.com/ibrahimhamza01/EvidenceRoute/issues/16)

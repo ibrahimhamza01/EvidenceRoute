@@ -49,7 +49,11 @@ class SubmitFindings(StrictInput):
 
 class CaptureFindings(SubmitFindings):
     findings: list[SpanFindingDraft] = Field(max_length=MAX_FINDINGS_PER_SUBMISSION, description=(
-        "One year and one filing section per finding. Submit an empty list when acknowledged evidence is insufficient."
+        "Record an atomic observation supported by acknowledged text from one fiscal year and filing section. "
+        "A supported infrastructure dependency, disruption or constraint is eligible with an unresolved AI link "
+        "or missing comparison year. Record uncertainty separately from the claim. Leave AI relevance, "
+        "cross-year relationships and novelty to comparison. Use an empty list when no meaningful scoped "
+        "observation is supported by the acknowledged text."
     ))
 
 

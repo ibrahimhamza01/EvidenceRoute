@@ -458,8 +458,13 @@ class RootController:
                         turn_tool_limit = min(tool_limit, calls + 1)
                         if callable(force):
                             force(SUBMIT_FINDINGS)
-                        notice = ("Evidence capture. Submit year-specific findings using acknowledged spans. "
-                                  "Submit an empty list if evidence is insufficient. Comparison follows in a separate turn.")
+                        notice = (
+                            "Evidence capture. Record atomic observations supported by the acknowledged spans from "
+                            "each filing. Capture a supported infrastructure risk with its uncertainty even when "
+                            "the AI link, another year, or novelty is unresolved. A passage about market demand alone "
+                            "supports only a demand observation. Use an empty list if the excerpts support no "
+                            "meaningful observation for this research topic. Comparison follows in a separate turn."
+                        )
                     else:
                         turn_tool_limit = min(tool_limit - 1, calls + max(0, corpus_slots - 1))
                         notice += " One local tool slot and one investigation turn are reserved for evidence capture."
@@ -659,6 +664,12 @@ class RootController:
                 self._feedback(step, "tool_call_limit", "Tool call budget exhausted.")
                 stop = "tool_call_limit"
                 break
+            if _recursive is not None and not _recursive.allow_investigation_tool(
+                action.name, action.arguments, turn_tool_limit - calls,
+            ):
+                step.outcome = "skipped"
+                pending = self._feedback(step, "year_read_reserved", _recursive.year_read_notice())
+                continue
             calls += 1
             pending = self._execute_tool(step, action, deadline, coverage, _recursive,
                                          initial_assignment=step.assignment_stage == "assignment")
@@ -830,6 +841,12 @@ class RootController:
             self._feedback(operation, "invalid_arguments", validation_message(exc))
         else:
             operation.tool_name = trace_data(action.name)
+            if recursive is not None and not recursive.allow_investigation_tool(
+                action.name, action.arguments, tool_limit - calls,
+            ):
+                operation.outcome = "skipped"
+                self._feedback(operation, "year_read_reserved", recursive.year_read_notice())
+                return calls
             self._execute_tool(operation, action, deadline, coverage, recursive, initial_assignment=initial_assignment,
                                batch_share=batch_share)
         return calls + 1

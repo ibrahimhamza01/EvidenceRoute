@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from time import monotonic
 from typing import Annotated, Callable
@@ -11,7 +12,7 @@ from pydantic import Field, ValidationError
 
 from evidenceroute.research.rlm.bedrock import BedrockRootClient
 from evidenceroute.research.rlm.budget import BudgetExceeded, EstimatedTokenBudget
-from evidenceroute.research.rlm.checkpoint import MAX_VERIFICATION_RUNS, CheckpointError, ResearchCheckpoint
+from evidenceroute.research.rlm.checkpoint import MAX_VERIFICATION_RUNS, CheckpointError, ResearchCheckpoint, plan_continuation
 from evidenceroute.research.rlm.checkpoint_validation import validate_checkpoint
 from evidenceroute.research.rlm.claude import ClaudeModelError
 from evidenceroute.research.rlm.comparison import Comparison
@@ -327,11 +328,7 @@ def review_checkpoint(
     limits: VerificationLimits, clock: Callable[[], float] = monotonic,
 ) -> ResearchCheckpoint:
     """Run one authorized verification pass, prioritizing unreviewed current comparisons."""
-    latest = _latest_reviews(checkpoint)
-    comparisons = tuple(comparison_id(item) for item in _current_comparisons(checkpoint))
-    reviewed = {key for key, entry in latest.items() if entry.status != "unverified"}
-    comparison_ids = tuple(key for key in comparisons if ("comparison", key) not in reviewed)
-    finding_ids = tuple(item.finding_id for item in checkpoint.findings if ("finding", item.finding_id) not in reviewed)
+    finding_ids, comparison_ids = _outstanding_reviews(checkpoint, _latest_reviews(checkpoint), _current_comparisons(checkpoint))
     if not comparison_ids and not finding_ids:
         return checkpoint
     run = verify_checkpoint(checkpoint, corpus, verifier, limits=limits, comparison_ids=comparison_ids,
@@ -368,6 +365,13 @@ def _current_comparisons(checkpoint: ResearchCheckpoint) -> tuple[Comparison, ..
             by_risk.setdefault(key, {})[comparison_id(item)] = item
         active.update(by_risk)
     return tuple(item for cases in active.values() for item in cases.values())
+
+
+def _outstanding_reviews(checkpoint: ResearchCheckpoint, latest: dict, current: tuple[Comparison, ...]):
+    reviewed = {key for key, entry in latest.items() if entry.status != "unverified"}
+    finding_ids = tuple(item.finding_id for item in checkpoint.findings if ("finding", item.finding_id) not in reviewed)
+    comparison_ids = tuple(key for item in current if ("comparison", key := comparison_id(item)) not in reviewed)
+    return finding_ids, comparison_ids
 
 
 def verification_report(checkpoint: ResearchCheckpoint) -> dict:
@@ -442,11 +446,31 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
     by_ticker = {}
     for conclusion in conclusions:
         by_ticker.setdefault(conclusion["ticker"], []).append(conclusion)
+    assignments = []
+    retained_counts = Counter(finding.evidence[0].source.ticker for finding in findings.values())
+    retained_years: dict[str, set[int]] = {}
+    for finding in findings.values():
+        source = finding.evidence[0].source
+        retained_years.setdefault(source.ticker, set()).add(source.fiscal_year)
+    verified_findings = Counter(findings[item.target_id].evidence[0].source.ticker for item in finding_conclusions
+                                if item.status in {"supported", "partially_supported"})
     for group in checkpoint.assignments:
+        ticker = group.ticker
         status = group.outcome.assignment_status if group.outcome else "pending"
         reason = f" ({group.pending_reason})" if group.pending_reason else ""
+        count = retained_counts[ticker]
         qualification = " Novelty unresolved." if comparative else ""
-        answer.append(f"{group.ticker} assignment {status}{reason}.{qualification}")
+        answer.append(f"{ticker} assignment {status}{reason}. {count} retained findings.{qualification}")
+        if not count:
+            answer.append("  Analysis unresolved. No findings were captured.")
+        elif comparative and not by_ticker.get(ticker):
+            answer.append("  Analysis unresolved. Year-specific findings are available without a comparison.")
+        assignments.append({
+            "ticker": ticker, "execution": status, "pending_reason": group.pending_reason,
+            "retained_findings": count, "finding_years": tuple(sorted(retained_years.get(ticker, ()))),
+            "findings_with_verifier_support": verified_findings[ticker],
+            "comparisons": len(by_ticker.get(ticker, ())), "novelty_unresolved": comparative,
+        })
         for conclusion in by_ticker.get(group.ticker, ()):
             disagreement = " Investigator disagreement remains unresolved." if conclusion["disagreement_unresolved"] else ""
             answer.append(f'  {conclusion["risk_label"]} [{conclusion["status"]}].{disagreement}')
@@ -459,8 +483,12 @@ def verification_report(checkpoint: ResearchCheckpoint) -> dict:
                     final_sources.update((source.chunk_id, source) for source in sources)
                     chunks = ", ".join(source.chunk_id for source in sources)
                     answer.append(f"  Verifier-supported component. {component.statement} [{chunks}]")
+    pending_findings, pending_comparisons = _outstanding_reviews(checkpoint, latest, current)
     return {
         "answer": "\n".join(answer), "conclusions": tuple(conclusions), "assignments": checkpoint.assignments,
+        "assignment_evidence": tuple(assignments),
+        "continuation_companies": tuple(group.ticker for group in plan_continuation(checkpoint).groups),
+        "outstanding_verification": {"findings": len(pending_findings), "comparisons": len(pending_comparisons)},
         "citations": checkpoint.citations, "conclusion_citations": tuple(final_sources.values()),
         "finding_conclusions": finding_conclusions, "original_findings": checkpoint.findings,
         "original_comparisons": checkpoint.comparisons,

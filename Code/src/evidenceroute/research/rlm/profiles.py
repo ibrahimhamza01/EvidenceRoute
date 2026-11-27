@@ -70,3 +70,17 @@ COMPARATIVE_PROFILES["full-corpus"] = ComparativeProfile.model_validate({
     "comparative_capture": True,
     "max_root_reinvestigation_calls": 0,
 })
+
+
+# Two children each get up to four operations per year plus capture. Each
+# provider pool accommodates six adaptive decisions, capture, and two finishes.
+# The root holds two assignment turns and two protected finishes.
+COMPARATIVE_PROFILES["full-corpus-quality"] = ComparativeProfile(
+    max_groups=2, comparative_capture=True, max_root_reinvestigation_calls=0,
+    shared_limits=SharedLimits(max_depth=1, max_delegations=2, max_partitions=4, max_provider_attempts=22,
+                               max_corpus_attempts=18, max_reported_tokens=160_000, deadline_seconds=180.0),
+    local_limits=RootLimits(max_iterations=9, max_tool_calls=9, max_response_bytes=6_000, deadline_seconds=180.0),
+    finalization=FinalizationPolicy(child_provider_attempts=9, finalization_attempts=2,
+                                    finalization_tool_choice="required", root_token_headroom=12_000,
+                                    child_token_headroom=12_000),
+)
