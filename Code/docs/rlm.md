@@ -34,7 +34,7 @@ A bounded delegation observation carries the child's stop reason, analysis statu
 | Evidence access and coverage | Direct chunk access supplies the whole original chunk. A delegated finding supplies only its delivered excerpt. A section window advances text coverage but supplies no chunk IDs. The per-invocation tracker still reports acknowledged pagination. Planned execution also rolls up original chunk IDs and section-window ranges across the tree against the full plan. |
 | Analysis status | The model declares its assessment, uncertainty, and conflicts. The controller defaults the invocation to `incomplete` when no status or supporting references are supplied. A validated `finished` action can still have partial coverage or incomplete analysis. A search miss cannot establish that a disclosure was absent. |
 | Citation and quotation validation | Citation IDs must refer to evidence the invocation received. The host resolves selected span IDs to exact canonical text and metadata. Legacy quotes must occur in the original chunk. Evidence drawn solely from a delivered finding stays within its delivered excerpts and requires selecting or declaring that finding. |
-| Semantic correctness | Independent claim verification is pending. A valid citation and exact quote establish the source and wording, while the claim's interpretation still needs review. |
+| Semantic support | Exact citations establish source and wording. An optional separate invocation assesses entailment. [Semantic verification](#independent-semantic-verification) |
 
 This is **RLM-inspired recursive long-context processing**. The original paper uses a programmable REPL to inspect, partition, and recurse over external input. EvidenceRoute exposes typed corpus and delegation tools for this SEC workflow. [Recursive Language Models](https://arxiv.org/abs/2512.24601)
 
@@ -66,6 +66,33 @@ Run the scripted example with local canonical files. It delegates FY2023 and FY2
 PYTHONPATH=Code/src python Code/examples/demo_rlm_recursive.py
 ```
 
+## Benchmark and router integration
+
+Use `evidenceroute.research.rlm.natural_language.research_question` as the question-to-answer entry point. Reuse a `CorpusEnvironment` across questions. Configure a `RecursiveResearch` runner with a fresh client factory, such as `lambda _: BedrockRootClient.from_env(disable_retries=True)`, and explicit `CorpusLimits`. The demo shows profile setup, interpretation headroom, and offline substitution of both clients. [Question demo](../examples/demo_rlm_question.py)
+
+```python
+from evidenceroute.research.rlm.natural_language import research_question
+
+result = research_question(question, runner, limits=limits, max_groups=2)
+research = result.research
+```
+
+Allow for interpretation and at least one full tree allocation in `limits`. Use `interpreter_factory` to substitute a scripted interpreter offline. The natural-language path handles descriptive SEC reviews and supported two-year AI-infrastructure comparisons. If `research` is absent, record `result.interpretation.outcome` and overall usage. Ambiguity, unsupported scope, failure and exhausted resources have different meanings from an evidence-based abstention.
+
+For a fixed-scope experiment, resolve a caller-supplied `ResearchIntent` into a `ResearchPlan` and call `execute_corpus_research(plan, runner, limits=limits, discovery=spec)` with a `DiscoverySpec` for the scoped answer path. Record which entry point was used since fixing scope bypasses interpretation.
+
+| Integration field | Source |
+| --- | --- |
+| Question and run identity | Keep the harness's `question_id` and the original question. Attach `research.run_id` when a research result exists. |
+| Answer and original SEC citations | Use `research.answer` and `research.citations`. Each citation includes chunk, document and section IDs, ticker, fiscal year and SEC URL. Use finding evidence for exact quotes and span IDs. |
+| Scope, coverage and uncertainty | Keep `research.coverage.required_target_count`, per-target access, missing requirements and `research.groups` with pending reasons. Read `Finding.uncertainty`, `Finding.conflict`, analysis status and comparison outcomes. Retained findings and discovered chunks may extend beyond the answer's citations. |
+| Completion and errors | Keep `execution_status`, `research_status`, `stop_reason` and errors. Execution is `finished` when at least one batch ran and no required group remains pending. Research may still be `incomplete`. `unverified` records that the pipeline found no tracked incompleteness and leaves semantic certainty unresolved. |
+| Usage and latency | Use `result.usage` for interpretation plus research, or `research.usage` for research alone. Record reported tokens, estimates, missing-counter counts, provider attempts and `elapsed_seconds`. The overall timer starts after the corpus is loaded. |
+
+Verification is optional. When a research result exists, call `create_checkpoint(corpus, result)`, then `verify_checkpoint(checkpoint, corpus, verifier, limits=verification_limits)` under a separate allowance. Attach the result with `record_verification` to obtain `verification_report` and combined usage. The original answer and coverage remain available. Use explicit continuation for a chosen evidence gap.
+
+Map the result inside the existing benchmark by its question ID. Compare original citation IDs with supporting evidence groups and score answer quality and abstention separately. Citation IDs are sorted for reporting and carry no retrieval rank for MRR or ranked top-K metrics. Keep the question inputs, budget and verification policy fixed across comparable trials. The router can treat `corpus_wide` as a candidate for RLM and use the existing strategy dispatch. Routing confidence describes predicted scope. Use held-out answer, evidence, latency and usage results to assess the strategy choice. [Benchmark guide](evaluation.md) · [Routing guide](routing.md)
+
 ## Course setup with Amazon Bedrock
 
 Bedrock is AWS's managed model API. EvidenceRoute uses Boto3's `bedrock-runtime` client to sign and send Converse requests. AWS authentication and **Claude Sonnet 4.5** access were verified for the course account in `us-east-1`. The account's IAM permissions denied Sonnet 4.6. [AWS Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)
@@ -93,27 +120,25 @@ BEDROCK_REGION=us-east-1 BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-2025092
 
 Direct Anthropic Messages remains available through `--provider anthropic --live` for environments with a separate `ANTHROPIC_API_KEY`. It uses optional `ANTHROPIC_BASE_URL` and `CLAUDE_MODEL` (default `claude-sonnet-4-6`) and shares the `CLAUDE_*` request limits above.
 
-## Design Decisions & Trade-offs
+## Design decisions and trade-offs
 
-| Decision | Choice and reason | Alternatives and limitations |
-| --- | --- | --- |
-| RLM-01 · Local validated snapshot | Reuse filing, section, chunk, and corpus schemas. Validate provenance and text offsets and return defensive copies of mutable records. | Streaming Parquet would reduce peak memory. The current snapshot pays the loading cost up front for straightforward lookups. |
-| RLM-02 · Exact pages and lexical search | Character windows and whole chunks preserve source text. Existing BM25 lookup and chunk-ID tie breaking give repeatable search. | Whole sections can be too large for a tool turn. Dense search could find different wording at the cost of another model and index. Keyword search can miss relevant evidence. The initial BM25 build is lazy. |
-| RLM-03 · Allowlisted tool schemas | Generate schemas and validate requests using the same argument models. The dispatcher owns execution. | Separate schemas and validators can drift. An unrestricted function interface would broaden model-controlled execution. Adding a tool requires an explicit registry change. |
-| RLM-04 · Bounded decisions and observations | Reuse the root-client interface. Reject oversized results as a whole so evidence and offsets remain consistent. | Parsing prose would need extra conventions. Truncating JSON could remove provenance. Oversized requests may need a smaller page or section window. |
-| RLM-05 · Separate scope, access, and analysis | Merge acknowledged ranges per invocation and preserve child pagination in its own trace. | Rolling up summaries as coverage would overstate how much the parent inspected. Unspecified root requirements stay unknown. |
-| RLM-06 · Preserve native messages and execute batches sequentially | Bedrock can return multiple tool-use blocks in one reply. Preserve the complete assistant message and pair each result with its original ID in one user message. Validate IDs before dispatch and reject mixed batches containing `finish_research`. The direct Messages transport requests single-tool turns and can handle a batch safely. | Four calls are executable per decision. Oversized batches up to the protocol ceiling can be rejected with one error per ID. This costs a model turn and allows recovery without executing part of the batch or breaking the provider history. |
-| RLM-07 · AWS SDK, bounded attempts, and opt-in | Use the existing Boto3 dependency and standard credential chain. Disable SDK retries for Converse so the shared loop owns retry accounting and time checks. Reuse the session and apply the remaining time to new request clients. | Handwritten signing and credential rotation would duplicate SDK behavior. A new client per attempt adds setup cost. Socket timeouts and credential resolution are synchronous and cannot guarantee a hard deadline. Late decisions are discarded. |
-| RLM-08 · Per-attempt usage and acknowledged delivery | Record input/output and cache counters when supplied, wall latency, Bedrock latency when supplied, and sanitized errors. Credit a provider observation only after an assistant response acknowledges the turn. | An iteration count hides retries. A lost response leaves delivery and usage unknown. Neither adapter requests prompt caching or estimates cost. |
-| RLM-09 · Small chunk pages by default | The model-facing `search_chunks` and `read_chunks` tools default to one whole chunk and still accept an explicit limit up to ten. Tool descriptions show the run's byte cap. Oversized responses report the attempted size and cap and suggest a smaller page or text window when possible. | A larger default can return more evidence per successful call but exceeded the demo budget for the NVIDIA search. Starting with one chunk can require more turns for broad questions. Silently dropping results would obscure pagination. Increasing the byte cap also increases the amount of evidence replayed in later model requests. |
-| RLM-10 · Sequential delegation with one budget | Scope shrinks at every delegation below the root. A shared budget also caps work across sibling branches. | Per-child budgets would multiply resources. Parallel delegation would need synchronized admission and trace handling. Pairs are the current indivisible scope units. |
-| RLM-11 · Carry original excerpts with findings | Validate source quotes against accessible chunks, track generated and delivered findings separately, and require declared finding use for delegated citations. Preserve child coverage, failures and conflict notes. | Sending whole child histories would expose unrelated context and use more tokens. Excerpts limit what parents can quote without fetching more evidence. Declared use is a model report and does not verify the claim. |
-| RLM-12 · Reserve provider slots for finalization | Hold provider capacity for each configured child ahead of admission, and protect finish-only slots for each invocation. Charge every transport attempt, including retries, to its active phase and the shared cap. | Prompting alone leaves the last slot spendable on retrieval. Fixed shares isolate siblings but may leave capacity unused for children that never launch. Child slots left over at exit return to root investigation. |
-| RLM-13 · Constrain and size protected finish requests | Use a finish-specific prompt and output cap. Allow native named tool choice where supported and keep runtime validation in both modes. After a truncated investigation reply, reuse the last valid history for protected finalization. | The course Sonnet 4.5 profile accepted named choice on a protected finish that used 332 output tokens. The need for the higher cap remains untested. Truncation recovery is offline-tested and ends investigation early to preserve capacity for synthesis. |
-| RLM-14 · Keep required scope independent of execution | Enumerate required slots from metadata before applying limits. Group years by company and retain unresolved slots. | Top-K retrieval could skip entire companies. Trimming to the budget would shrink the coverage denominator. One run may need to take a bounded slice, with its results still measured against the original plan. |
-| RLM-15 · Roll up evidence by canonical IDs and section offsets | Deduplicate acknowledged whole-chunk IDs across invocations. Merge acknowledged character ranges only within the same canonical document/section pair. | Document-wide pagination offsets can refer to different items in different scopes. Counting child excerpts as whole chunks would overstate root access. |
-
-See the [Converse tool contract](https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use-client-side.html) and [Boto3 request configuration](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html) for wire and timeout details.
+| Decision | Trade-off |
+| --- | --- |
+| RLM-01 · Validated local snapshot | Canonical schemas and defensive copies preserve text and offsets. Loading the snapshot uses more memory than streaming. |
+| RLM-02 · Exact pages and BM25 | Results are reproducible with chunk-ID tie breaking and a lazy index. Lexical search can miss different wording. |
+| RLM-03 · Typed, allowlisted tools | The same argument models define schemas and validate requests. Adding operations requires a registry change. |
+| RLM-04 · Whole-result byte handling | Rejecting oversize results preserves offsets and provenance. A smaller page may require another turn. |
+| RLM-05 · Separate access, scope and analysis | Acknowledged pagination measures access. An unspecified requirement stays unknown, and analysis is model-reported. |
+| RLM-06 · Native tool batches | Preserve assistant messages and result IDs in order. A recovery response consumes a turn, and each admitted operation consumes its own tool slot. |
+| RLM-07 · SDK credential and timeout handling | Boto3 resolves credentials and the application owns retries. Blocking calls can overrun the cooperative deadline. |
+| RLM-08 · Per-attempt telemetry | Report available input, output, cache and latency counters. A lost provider response can leave usage and delivery unknown. |
+| RLM-09 · One-chunk defaults | Small observations conserve context and can require more turns. Explicit chunk pages can request up to ten. |
+| RLM-10 · Sequential delegation with shared ceilings | The budget spans siblings, and document/section pairs are indivisible below the root. |
+| RLM-11 · Original excerpts and declared use | Children share validated excerpts. Parents can read more within their scope when the excerpt is insufficient. |
+| RLM-12 · Reserved finish capacity | Fixed shares protect siblings and can leave capacity unused. Unused child slots return to root investigation. |
+| RLM-13 · Protected finish and replay | Named tool choice is provider-dependent. Replaying valid history after truncation preserves context and ends investigation early. |
+| RLM-14 · Metadata-defined scope | Scheduling can cover a bounded slice. Unresolved and pending targets stay in the denominator. |
+| RLM-15 · Canonical coverage union | Union whole chunks by ID and character ranges by document/section. Parent excerpts carry narrower access. |
 
 ## Resource limits and verification
 
@@ -207,23 +232,6 @@ for limit in (10, 1):
           [ref.chunk_id for ref in capped.evidence])
 PY
 ```
-
-## Engineering achievements and recursive implications
-
-| Engineering challenge | Implemented approach and verification | Trade-off or remaining question |
-| --- | --- | --- |
-| Put the SEC corpus outside the model context while keeping evidence auditable | Read-only manifest and Parquet access preserves document, section, and chunk IDs, offsets, text, and original SEC URLs. The canonical integrity regression checks corpus inventory, offsets, and provenance. | Loading a local snapshot costs memory up front. Lexical search supports repeatable selection and can miss disclosures phrased differently. |
-| Separate research policy from provider behavior | The controller owns decisions and coverage, the dispatcher owns validation and tool execution, and the environment owns corpus access. Adapters translate tool messages and usage, while transports handle provider calls. Shared controller limits are provider-independent, and provider configuration comes from the environment. Scripted clients and stubbed transports verify both boundaries offline. | Each adapter still needs provider-specific tool-message handling and an explicit policy for failed or unacknowledged turns. |
-| Diagnose AWS access and bring up a real provider | Successful authentication narrowed the Sonnet 4.6 failure to authorization for that model. Updating the environment to the authorized Sonnet 4.5 inference profile in `us-east-1` used the existing Bedrock path. The successful live trace confirmed tool calling, observation delivery, and a cited finish. | The verified profile is account- and region-dependent. Credential retrieval and refresh stay with Boto3 and the course issuer. |
-| Keep coverage and findings grounded across sessions | Separate discovered, delivered, and declared-used evidence. Verify original quotations and retain incomplete coverage, conflict notes, and failures. Regression tests reject citations from oversized, failed, or undelivered child results. | Quote validation confirms that the words appear in evidence the model received. It does not establish that the quotation entails the claim. |
-
-The failed demo exposed a cost of accumulated context, and the subsequent live trace showed the overhead of repeating inputs. This informed three aspects of the recursive design:
-
-- **Context isolation and scoped access.** Each child starts with its task, goal, and authorized document/section pairs. It does not inherit the parent's transcript. Python checks every corpus operation, so the scope holds even if the model requests an out-of-scope lookup. Exact pairs make the search universe and coverage denominators reproducible. They also limit which evidence can support a finding. Fresh sessions avoid inherited history while still sending system instructions and schemas, so more sessions can increase aggregate token use.
-- **Shared budget.** A fresh session may produce several decisions. One decision can cause multiple provider attempts if the transport retries, and a decision can also execute a corpus tool or request a delegation. Admitted child invocations and assigned document/section pairs are counted separately. A global attempt ledger prevents per-child budgets from multiplying across the tree. Request counts can be checked before sending. Exact token usage is reported afterward, and synchronous deadlines rely on timeouts and late-result handling.
-- **Compact findings.** Children return validated excerpts, citation IDs, and coverage status rather than complete transcripts. Only acknowledged results qualify as evidence in the parent conversation. The parent still has to decide how to synthesize the findings, handle disagreements, and disclose gaps.
-
-These are engineering choices motivated by observed behavior. The scripted run has not established that recursion improves research quality or reduces token use against a non-recursive baseline.
 
 ## Recursive milestone verification
 
@@ -545,15 +553,13 @@ With reservations enabled, the configuration must leave at least one investigati
 
 ### Reading the report
 
-Exit `0` means the recursive experiment met its structural criteria. Exit `1` means the run produced a report and was incomplete. Invalid setup or arguments exit `2`. The report checks provider responses, separate singleton delegations for both years, validated child findings, acknowledged delivery, a finished synthesis declaring which findings it used, and citations from those used findings covering both years. A root that cites both filings directly still misses the delegation criterion. A validated excerpt can contribute even when the child reports incomplete analysis or partial coverage. The report preserves those statuses. An empty finding, failed child, or unacknowledged observation cannot satisfy that year's evidence requirement.
+The recursive demo exits `0` for a finished synthesis using acknowledged child findings from both years, `1` for incomplete execution, and `2` for invalid setup. Direct root citations cannot substitute for the required delegated findings in this demo. Partial analysis and coverage remain visible even when the execution criteria pass.
 
-The JSON shows authorized pairs, the invocation tree, budget stops, errors, per-invocation counts, citations, and coverage. Requested tool counts include the native finish request. Operation records separate requests, execution outcomes, and delivery. The report also retains bounded, sanitized tool IDs, names, and arguments for rejected responses when the tool blocks can be decoded. Each excerpt records whether the parent declared its finding used. `--trace` adds per-decision and per-attempt telemetry. The report omits private reasoning, raw provider payloads, authentication headers, and whole observation bodies.
-
-The report takes shared counts and measured token usage from the root's final budget snapshot. It separates investigation attempts, finish-only attempts, and unused child slots returned to the root. Per-invocation traces identify the change to finalization and its reason. Provider usage is aggregated once over the invocation tree, with missing-counter counts retained. Per-invocation wall times include their children, so adding them would double-count time. Summed provider latency and attempt wall time describe provider work separately from elapsed run time.
+The JSON records requested tools, executed operations, delivery, original citations, partition coverage, errors and shared usage. Add `--trace` for per-decision and per-attempt detail. Private reasoning and raw provider payloads stay outside the report. Use the root elapsed time for wall-clock comparisons. Per-invocation times include descendants, and summing them double-counts time.
 
 **Semantic review of the successful run.** The final answer inferred a shift toward geopolitical risks in FY2024 from two independently selected excerpts. An earlier FY2023 run retrieved `bd263969e91358073d0ea0a1`, which explicitly discusses geopolitical tensions involving Taiwan and China and their implications for supply continuity. The latest excerpts cannot establish that geopolitical risk was new or received greater emphasis in FY2024. The latest FY2023 quotation also does not independently support its finding's additional claim about demand estimation challenges. That child returned `finished` with a finding marked `analyzed`, while its invocation-level analysis status remained `incomplete`.
 
-Citation provenance identifies the original chunk and quotation validation checks its wording. Coverage describes the evidence accessed, and analysis status is model-reported. In this run, both partitions remained partial. The original NVIDIA demo still reports per-invocation coverage. The planned execution ledger is exercised separately above. Independent semantic verification would have to test whether the evidence supports each claim and comparison.
+Both NVIDIA partitions remained partial, and the demo reports per-invocation coverage.
 
 ### Offline verification of the live path
 
@@ -931,7 +937,44 @@ python -m pytest -q Code/tests/test_rlm_verification.py
 
 The offline fixture uses Apple's two recorded compound claims and reconstructs the Alphabet comparison from canonical FY2023–FY2024 excerpts. In two mocked attempts, the Apple fixture produced two partial results for component costs and hedge contract types, one supported assessment of limited hedge effectiveness, and one contradicted hedge guarantee. In three mocked attempts, the Alphabet fixture produced five supported assessments and one insufficient assessment of the historical conflict claim. Its comparative results distinguished more-specific accelerator wording from a different product-recall risk while leaving filing-wide novelty unresolved. Both fixtures kept research incomplete.
 
-Verification passed 399 RLM tests, including 31 semantic verification tests, and 53 related regressions. The suites reported the existing AnyIO deprecation warning. The live-capable CLI requires `--live --checkpoint FILE --limits-file FILE`, with optional `--kind comparisons` and `--save-checkpoint FILE`. This milestone made zero paid calls. Live verifier accuracy and reliability remain unmeasured.
+The verifier CLI requires `--live --checkpoint FILE --limits-file FILE` for provider requests and accepts `--kind comparisons` and `--save-checkpoint FILE`.
+
+#### Live semantic-verification results
+
+The saved Apple and Alphabet runs sent scripted research controls to the live verifier. A third run reviewed the actual two-company continuation checkpoint. All three used `rlm-verification-limits.json`. The six source and reviewed files loaded against the canonical corpus. The reviewed files preserved the original research runs, findings, comparisons, citations and coverage. The three JSON reports matched the reviewed records.
+
+| Saved report | Cases | Provider attempts | Reported and charged tokens | Seconds | Recorded verdicts |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `rlm-verification-aapl-live-report.json` | 4 findings | 2 | 4,286 | 6.26 | One unverified, one partial, one supported, one contradicted |
+| `rlm-verification-googl-live-report.json` | 3 findings and 3 comparisons | 3 | 6,484 | 9.93 | Five supported, one contradicted |
+| `rlm-verification-checkpoint-live-report.json` | 7 finding records | 4 | 9,487 | 15.42 | Six supported, one partial |
+| **Total** | **17 case records** | **9** | **20,257** | **31.62** | **16 valid structured assessments** |
+
+- **Apple.** The hedging review identified the contract-type evidence gap and supported limited hedge effectiveness. The positive limited-effectiveness control and negative full-offset guarantee received their expected verdicts. The strengthening-currency case remained `unverified` with `invalid_assessment`. The exact rejection reason is unavailable. The valid hedging assessment in the same batch survived.
+- **Alphabet.** The verifier assigned `contradicted` to the original conflict conclusion and classified the accelerator wording as `more_specific_wording`. It cited the FY2023 general supply-risk passage as support for the underlying risk. It distinguished product recalls from infrastructure supply risks and recorded earlier-year nonmention with filing-wide novelty unresolved. The supported verdict for that comparison applies to its conclusion that the available excerpts leave novelty uncertain.
+- **Actual checkpoint.** Alphabet child finding 4 received partial support. Its selected excerpts describe general systems vulnerabilities, while the earthquake-location and AI-specific infrastructure assertions require additional evidence. Amazon root finding 1 and child finding 1 have distinct finding IDs and the same subject digest. The seven case records represent six distinct verification subjects. Research remained incomplete after verification.
+
+The actual checkpoint used 21 research attempts, 150,616 reported tokens and 81.81 seconds. Adding verification brought the recorded sums to 25 attempts, 160,103 reported tokens and 97.23 seconds. Verification added approximately **6.3%** in reported tokens and **18.9%** in measured execution time relative to the recorded research run. These figures describe one checkpoint. The aggregate 16 of 17 measures structured-assessment completion and includes repeated subject matter.
+
+The verdicts are model assessments. For example, the actual Alphabet accelerator finding received support for a causal link between competitors claiming capacity first and difficulty negotiating terms. Its selected SEC sentence presents those as alternative conditions that could cause supply constraints. Control agreement and valid evidence references leave this kind of entailment error possible.
+
+## Issue #16 acceptance review
+
+The branch provides the bounded RLM-inspired strategy, runnable examples and audit records requested by the issue. The branch diff from its mainline base contains only RLM modules, examples, tests and this guide. [Issue #16](https://github.com/ibrahimhamza01/EvidenceRoute/issues/16)
+
+| Criterion | Acceptance evidence |
+| --- | --- |
+| Documented architecture and read-only canonical corpus | Implemented. Canonical integrity checks cover all 75 filings. The environment exposes metadata, original sections and chunks, and scoped search. |
+| Recursive investigation and aggregation across companies and years | Implemented. The offline depth-two demo exercises root, child and grandchild. Live Sonnet 4.5 runs demonstrate delegation, acknowledged results and multi-company, multi-year synthesis on bounded subsets. |
+| Intermediate provenance, final citations and inspectable coverage | Implemented and exercised offline and live. Findings carry stable IDs, exact excerpts and original SEC metadata. Coverage reports measure acknowledged access against the original plan. Lexical scans, access and semantic assessment have separate counters. |
+| Uncertainty, conflict and follow-up | Implemented. Root follow-up and explicit targeted continuation operate within scope and budget. Offline tests exercise failed-child retention and same-company historical delivery. The live continuation demonstrates cross-process resume of a pending company. Live verification exercises qualified comparative outcomes and produces evidence-gap recommendations. |
+| Bounded execution and observability | Implemented. Shared and local limits cover depth, calls, partitions, tokens, time and retries. Traces record run and invocation IDs, evidence, stops, usage, latency and incomplete scope. USD cost estimates remain unreported. They require applicable model rates and sufficient usage counters. |
+| Incomplete result handling | Implemented and exercised offline and live. Execution can finish while research remains incomplete. The full-corpus offline demo scheduled every group with scripted investigators. Live investigations covered subsets, and exhaustive novelty or absence across all 25 companies remains unestablished. |
+| Tests and reproducible Sonnet 4.5 demonstration | Mocked and scripted suites run without paid calls. The course setup and opt-in live commands reproduce the documented paths. The closeout uses saved live results. |
+
+Closeout passed 399 focused RLM tests, 53 retrieval, RAG provenance and canonical-integrity regressions, and 40 ingestion, benchmark and routing tests. The optional all-module sweep was stopped during local dense-model indexing. The offline question demo returned a cited answer with partial coverage, finished execution and incomplete research. Closeout made zero live provider calls.
+
+The supported natural-language scope, cooperative deadlines and selected-span granularity remain material limits for evaluation. Model verification can miss unsupported components or reject otherwise useful cases. Full-corpus semantic quality, repeatability, routing benefit and cost-effectiveness remain evaluation questions for the existing benchmark.
 
 ## Ongoing engineering record
 
