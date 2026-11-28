@@ -6,7 +6,9 @@ negative for terms in more than half the documents, which is common in small or
 filtered corpora and would reward documents for containing very common words.
 
 IDF and average document length are computed over the whole corpus. Filters only
-restrict which chunks are scored, so scores remain comparable across filters.
+restrict which chunks are scored, so scores remain comparable across filters. The
+chunks matching each metadata value are indexed once at construction, so a filtered
+search intersects small sets instead of checking every chunk.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from evidenceroute.retrieval.base import is_blank, rank_results, validate_top_k
 from evidenceroute.retrieval.corpus import ChunkCorpus, as_corpus
-from evidenceroute.retrieval.filters import ChunkFilter, matches
+from evidenceroute.retrieval.filters import ChunkFilter, filter_values
 from evidenceroute.retrieval.tokenization import tokenize
 from evidenceroute.schemas import Chunk, RetrievalResult
 
@@ -49,6 +51,13 @@ class BM25Retriever:
             self._doc_lengths.append(sum(counts.values()))
             for term in sorted(counts):
                 self._postings.setdefault(term, []).append((doc_index, counts[term]))
+        self._filter_index: dict[str, dict[object, frozenset[int]]] = {}
+        groups: dict[str, dict[object, set[int]]] = {}
+        for doc_index, chunk in enumerate(self.corpus):
+            for field, value in filter_values(chunk).items():
+                groups.setdefault(field, {}).setdefault(value, set()).add(doc_index)
+        for field, by_value in groups.items():
+            self._filter_index[field] = {v: frozenset(ids) for v, ids in by_value.items()}
         n_docs = len(self.corpus)
         self._avgdl = (sum(self._doc_lengths) / n_docs) if n_docs else 0.0
         self._idf = {
@@ -66,9 +75,9 @@ class BM25Retriever:
     def scores(self, query: str, filters: ChunkFilter | None = None) -> dict[int, float]:
         """Positive BM25 scores keyed by corpus position, for chunks passing ``filters``."""
         k1, b = self.config.k1, self.config.b
-        allowed = None
-        if filters is not None and not filters.is_empty():
-            allowed = {i for i, c in enumerate(self.corpus) if matches(filters, c)}
+        allowed = self.allowed_positions(filters)
+        if allowed is not None and not allowed:
+            return {}
         totals: dict[int, float] = {}
         for term in self.query_terms(query):
             idf = self._idf.get(term)
@@ -82,6 +91,19 @@ class BM25Retriever:
                     tf * (k1 + 1.0) / (tf + k1 * length_norm)
                 )
         return {i: s for i, s in totals.items() if s > 0.0}
+
+    def allowed_positions(self, filters: ChunkFilter | None) -> frozenset[int] | None:
+        """Corpus positions passing ``filters``; ``None`` means no constraint."""
+        if filters is None or filters.is_empty():
+            return None
+        allowed: frozenset[int] | None = None
+        for field, values in filters.conditions().items():
+            index = self._filter_index.get(field, {})
+            ids = frozenset().union(*(index.get(v, frozenset()) for v in values))
+            allowed = ids if allowed is None else allowed & ids
+            if not allowed:
+                return frozenset()
+        return allowed
 
     def search(self, query: str, top_k: int = 10,
                filters: ChunkFilter | None = None) -> list[RetrievalResult]:

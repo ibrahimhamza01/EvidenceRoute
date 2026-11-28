@@ -1,0 +1,111 @@
+{
+  "questions_path": "data/benchmark/questions.csv",
+  "seed": 42,
+  "n_train": 44,
+  "n_eval": 21,
+  "labels": [
+    "simple",
+    "multi_source",
+    "corpus_wide"
+  ],
+  "models": {
+    "logreg": {
+      "accuracy": 0.8571428571428571,
+      "macro_f1": 0.8592592592592592,
+      "per_class": {
+        "simple": {
+          "precision": 0.8888888888888888,
+          "recall": 0.8888888888888888,
+          "f1": 0.8888888888888888,
+          "support": 9
+        },
+        "multi_source": {
+          "precision": 0.75,
+          "recall": 0.8571428571428571,
+          "f1": 0.8,
+          "support": 7
+        },
+        "corpus_wide": {
+          "precision": 1.0,
+          "recall": 0.8,
+          "f1": 0.8888888888888888,
+          "support": 5
+        }
+      },
+      "confusion_matrix": [
+        [
+          8,
+          1,
+          0
+        ],
+        [
+          1,
+          6,
+          0
+        ],
+        [
+          0,
+          1,
+          4
+        ]
+      ],
+      "config": {
+        "tfidf": "TfidfVectorizer(ngram_range=(1, 2))",
+        "clf": "LogisticRegression(max_iter=1000, random_state=42)"
+      },
+      "latency": {
+        "train_seconds": 0.009,
+        "inference_ms_per_question": 0.0206
+      }
+    },
+    "naive_bayes": {
+      "accuracy": 0.7619047619047619,
+      "macro_f1": 0.7598039215686274,
+      "per_class": {
+        "simple": {
+          "precision": 0.875,
+          "recall": 0.7777777777777778,
+          "f1": 0.8235294117647058,
+          "support": 9
+        },
+        "multi_source": {
+          "precision": 0.6,
+          "recall": 0.8571428571428571,
+          "f1": 0.7058823529411765,
+          "support": 7
+        },
+        "corpus_wide": {
+          "precision": 1.0,
+          "recall": 0.6,
+          "f1": 0.75,
+          "support": 5
+        }
+      },
+      "confusion_matrix": [
+        [
+          7,
+          2,
+          0
+        ],
+        [
+          1,
+          6,
+          0
+        ],
+        [
+          0,
+          2,
+          3
+        ]
+      ],
+      "config": {
+        "tfidf": "TfidfVectorizer(ngram_range=(1, 2))",
+        "clf": "MultinomialNB()"
+      },
+      "latency": {
+        "train_seconds": 0.0016,
+        "inference_ms_per_question": 0.0195
+      }
+    }
+  }
+}

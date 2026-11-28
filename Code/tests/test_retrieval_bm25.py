@@ -113,3 +113,19 @@ def test_full_corpus_search_reaches_every_canonical_filing(bm25, full_corpus):
         results = bm25.search("revenue financial risk", top_k=3, filters=ChunkFilter(document_ids=document_id))
         assert results
         assert all(r.chunk.document_id == document_id for r in results)
+
+
+@pytest.mark.parametrize("filters", [
+    ChunkFilter(tickers="nvda"),
+    ChunkFilter(fiscal_years=[2022, 2024]),
+    ChunkFilter(section_ids="ITEM_1A"),
+    ChunkFilter(tickers=["AMD", "INTC"], fiscal_years=2023, section_ids=["item_1", "item_7"]),
+    ChunkFilter(tickers="NVDA", section_ids="item_1c", fiscal_years=2022),
+    ChunkFilter(tickers="NOPE"),
+])
+def test_precomputed_filters_match_per_chunk_filtering(bm25, full_corpus, filters):
+    expected = frozenset(i for i, c in enumerate(full_corpus) if filters.matches(c))
+    assert bm25.allowed_positions(filters) == expected
+    query = "risk competition revenue supply export"
+    unfiltered = bm25.scores(query)
+    assert bm25.scores(query, filters) == {i: s for i, s in unfiltered.items() if i in expected}

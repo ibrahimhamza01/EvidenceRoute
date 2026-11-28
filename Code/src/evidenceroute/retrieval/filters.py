@@ -71,15 +71,22 @@ class ChunkFilter(BaseModel):
         return {k: v for k, v in fields.items() if v is not None}
 
     def matches(self, chunk: Chunk) -> bool:
-        for field, allowed in self.conditions().items():
-            value = getattr(chunk, field)
-            if field == "ticker":
-                value = value.upper()
-            elif field == "section_id":
-                value = value.lower()
-            if value not in allowed:
-                return False
-        return True
+        values = filter_values(chunk)
+        return all(values[field] in allowed for field, allowed in self.conditions().items())
+
+
+def filter_values(chunk: Chunk) -> dict[str, Any]:
+    """A chunk's filterable metadata, normalized exactly as ``ChunkFilter`` values are.
+
+    Shared by ``ChunkFilter.matches`` and retrievers that precompute filter indexes,
+    so both always apply the same matching rules.
+    """
+    return {
+        "ticker": chunk.ticker.upper(),
+        "fiscal_year": chunk.fiscal_year,
+        "document_id": chunk.document_id,
+        "section_id": chunk.section_id.lower(),
+    }
 
 
 def matches(filters: ChunkFilter | None, chunk: Chunk) -> bool:
