@@ -59,21 +59,23 @@ evidence count, and citation count.
 
 ## Benchmarking
 
-The benchmark runner requires a reviewed CSV containing:
-- question_id
-- question
-- relevant_chunk_ids
+The runner uses the reviewed benchmark merged in Issue #18:
 
-Multiple relevant chunk IDs are separated by semicolons.
+- data/benchmark/questions.csv
+- data/benchmark/gold_evidence.csv
 
-Example command:
+Retrieval metrics reuse the shared evidence-group evaluation functions.
+Overlapping chunks within one evidence group count as alternative evidence.
 
-    python Code/scripts/benchmark_standard_rag.py --questions path/to/reviewed_questions.csv --top-k 5 --output rag_benchmark_results.json
+Run the development split:
 
-The runner reports Recall@K, MRR@K, and mean retrieval latency.
+    python Code/scripts/benchmark_standard_rag.py --split dev --top-k 5
 
-The repository does not currently ship validated, annotated full-corpus
-benchmark labels. Do not report benchmark scores without reviewed labels.
+The runner reports recall, precision, MRR, full evidence coverage,
+and retrieval latency.
+
+Only approved, answerable questions with complete verified evidence
+are included. Retrieval metrics do not establish answer correctness.
 
 ## Handoff to Agentic RAG
 

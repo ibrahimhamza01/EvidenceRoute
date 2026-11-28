@@ -1,96 +1,124 @@
-"""Tests for the Standard RAG benchmark runner."""
+"""Tests for the shared SEC benchmark integration."""
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from evidenceroute.schemas import Chunk, RetrievalResult
 
+SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "scripts/benchmark_standard_rag.py"
+)
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_standard_rag.py"
-spec = importlib.util.spec_from_file_location("rag_benchmark_runner", SCRIPT)
+spec = importlib.util.spec_from_file_location(
+    "rag_benchmark_runner", SCRIPT
+)
+
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 
 
-def make_result(chunk_id):
-    text = "Supply chain risks."
-
-    return RetrievalResult(
-        chunk=Chunk(
-            chunk_id=chunk_id,
-            document_id="test-doc",
-            company_name="NVIDIA",
-            ticker="NVDA",
-            fiscal_year=2024,
-            section_id="item-1a",
-            section_name="Risk Factors",
-            chunk_index=0,
-            text=text,
-            char_start=0,
-            char_end=len(text),
-            source_url="https://www.sec.gov/",
-        ),
-        score=1.0,
+def result(chunk_id):
+    return SimpleNamespace(
+        chunk=SimpleNamespace(chunk_id=chunk_id)
     )
 
 
-def test_benchmark_metrics():
+def test_overlapping_gold_chunks():
     retriever = Mock()
+
     retriever.search.return_value = [
-        make_result("wrong"),
-        make_result("correct"),
+        result("a2"),
+        result("b1"),
     ]
 
+    questions = [{
+        "question_id": "q1",
+        "question": "Compare two companies",
+        "scope": "multi_source",
+        "gold_groups": {
+            "g1": {"a1", "a2"},
+            "g2": {"b1"},
+        },
+    }]
+
     report = benchmark.evaluate(
-        retriever,
-        [{
-            "question_id": "q1",
-            "question": "What risks are reported?",
-            "relevant_ids": {"correct"},
-        }],
-        k=2,
+        retriever, questions, k=2
     )
 
-    assert report["questions_evaluated"] == 1
     assert report["mean_recall_at_k"] == 1.0
+    assert report["mean_precision_at_k"] == 1.0
+    assert report["mean_mrr_at_k"] == 1.0
+    assert report["full_coverage_rate"] == 1.0
+
+
+def test_partial_evidence_coverage():
+    retriever = Mock()
+
+    retriever.search.return_value = [
+        result("wrong"),
+        result("a1"),
+    ]
+
+    questions = [{
+        "question_id": "q2",
+        "question": "Compare disclosures",
+        "scope": "multi_source",
+        "gold_groups": {
+            "g1": {"a1", "a2"},
+            "g2": {"b1"},
+        },
+    }]
+
+    report = benchmark.evaluate(
+        retriever, questions, k=2
+    )
+
+    assert report["mean_recall_at_k"] == 0.5
     assert report["mean_mrr_at_k"] == 0.5
-    assert report["mean_latency_ms"] >= 0
+    assert report["full_coverage_rate"] == 0.0
 
 
-def test_load_questions(tmp_path):
-    path = tmp_path / "questions.csv"
-    path.write_text(
-        "question_id,question,relevant_chunk_ids\n"
-        "q1,What risks?,chunk-a;chunk-b\n"
+def test_load_shared_benchmark(tmp_path):
+    questions = tmp_path / "questions.csv"
+    gold = tmp_path / "gold.csv"
+
+    questions.write_text(
+        "question_id,question,scope,eval_split,"
+        "answerable,review_status,quote_verified,"
+        "gold_evidence_status\n"
+        "q1,Compare companies,multi_source,heldout,"
+        "true,approved,true,complete\n"
     )
 
-    questions = benchmark.load_questions(path)
-
-    assert len(questions) == 1
-    assert questions[0]["relevant_ids"] == {"chunk-a", "chunk-b"}
-
-
-def test_reject_unlabeled_questions(tmp_path):
-    path = tmp_path / "questions.csv"
-    path.write_text(
-        "question_id,question,relevant_chunk_ids\n"
-        "q1,What risks?,\n"
+    gold.write_text(
+        "question_id,evidence_group,chunk_ids,"
+        "relevance,mapping_status,quote_verified\n"
+        "q1,g1,a1;a2,supporting,mapped,true\n"
+        "q1,g2,b1,supporting,mapped,true\n"
+        "q1,g3,c1,related,mapped,true\n"
     )
 
+    rows = benchmark.load_questions(
+        questions, gold, "heldout"
+    )
+
+    assert len(rows) == 1
+
+    assert rows[0]["gold_groups"] == {
+        "g1": {"a1", "a2"},
+        "g2": {"b1"},
+    }
+
+
+def test_invalid_k():
     with pytest.raises(ValueError):
-        benchmark.load_questions(path)
+        benchmark.evaluate(Mock(), [], k=0)
 
 
-def test_reject_duplicate_questions(tmp_path):
-    path = tmp_path / "questions.csv"
-    path.write_text(
-        "question_id,question,relevant_chunk_ids\n"
-        "q1,Question one?,chunk-a\n"
-        "q1,Question two?,chunk-b\n"
-    )
-
-    with pytest.raises(ValueError, match="Duplicate"):
-        benchmark.load_questions(path)
+def test_empty_benchmark():
+    with pytest.raises(ValueError):
+        benchmark.evaluate(Mock(), [], k=5)
