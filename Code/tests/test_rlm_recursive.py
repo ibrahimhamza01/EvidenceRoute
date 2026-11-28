@@ -18,6 +18,7 @@ from evidenceroute.research.rlm.budget import BudgetExceeded, FinalizationPolicy
 from evidenceroute.research.rlm.claude import ClaudeConfig, ClaudeRootClient, ProviderTransportError
 from evidenceroute.research.rlm.controller import RootLimits, ScriptedModelClient
 from evidenceroute.research.rlm.coverage import SectionTarget
+from evidenceroute.research.rlm.discovery import CorpusScan
 from evidenceroute.research.rlm.planned_research import execute_research_plan
 from evidenceroute.research.rlm.planning import interpret_intent, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
@@ -518,6 +519,25 @@ def test_only_delivered_findings_unlock_citations(snapshot, mode):
         assert step.observation["result"]["coverage"][0]["status"] == "partial"
     assert trace.steps[1].error["code"] == "unseen_citation"
     assert trace.coverage.visible_chunks == () and trace.cited_chunk_ids == ()
+
+
+def test_bounded_generic_delivery_prioritizes_the_question(snapshot):
+    corpus, (_, new, _) = snapshot
+    pair = SectionTarget(new, RISK)
+    chunk = corpus.read_chunks(new, RISK).items[0]
+    unrelated = finding(chunk, claim="General context. " * 18)
+    relevant = finding(chunk, claim=QUOTE)
+    runner, _ = research(corpus, {
+        "root": [delegate(pair), finish()],
+        "child-1": [tool("get_chunk", chunk_id=chunk.chunk_id), finish(findings=[unrelated, relevant])],
+    }, local_limits=RootLimits(max_response_bytes=880),
+       discovery_scan=CorpusScan(("supply interruptions",), (2024,), (), 0, 0, 0.0, None))
+    trace = runner.run("How do supply interruptions affect operations?", partitions=(pair,))
+    observation = trace.steps[0].observation["result"]
+    assert observation["omitted_findings"] == 1
+    assert [item["claim"] for item in observation["findings"]] == [QUOTE]
+    assert trace.steps[0].delegation.delivered_finding_ids == ("child-1:finding-2",)
+    assert len(trace.steps[0].delegation.child.findings) == 2
 
 
 def test_section_text_and_unseen_quotes_cannot_grant_chunk_attribution(snapshot):

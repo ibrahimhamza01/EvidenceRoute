@@ -253,7 +253,9 @@ def _validate_coverage(
             selected = {fid: known[fid] for fid in inherited | (set(node.selected_local_finding_ids) & receipts)}
             for record in node.conclusions:
                 try:
-                    validate_conclusion(record, selected, inv.required_operands, inv.partitions)
+                    # Older ledgers retain investigator statements for inspection.
+                    # Publication applies the current assertion guard.
+                    validate_conclusion(record, selected, inv.required_operands, inv.partitions, check_assertions=False)
                 except ValueError as exc:
                     raise CheckpointError(f"Invalid checkpoint conclusion: {exc}") from exc
                 _require(all(item.source.chunk_id in node.cited_chunk_ids for binding in record.bindings

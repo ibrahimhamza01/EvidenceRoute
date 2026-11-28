@@ -166,7 +166,10 @@ def resolve_research_plan(intent: ResearchIntent, corpus: CorpusEnvironment) -> 
         by_company_year[filing.ticker, filing.fiscal_year].append(filing)
 
     years = sorted(set(intent.fiscal_years))
-    section_ids = sorted({section.lower() for section in intent.section_ids})
+    inferred_sections = intent.objective == "review" and "section_ids" in intent.inferred_fields
+    section_ids = list(dict.fromkeys(section.lower() for section in intent.section_ids))
+    if not inferred_sections:
+        section_ids.sort()
     selected = set()
     missing = []
     unresolved = set()
@@ -202,7 +205,9 @@ def resolve_research_plan(intent: ResearchIntent, corpus: CorpusEnvironment) -> 
             for section in section_ids:
                 if section in available:
                     targets.append(SectionTarget(document_id, section))
-                else:
+                elif (not inferred_sections or not available.intersection(section_ids)
+                      or any((operand.ticker, operand.filing_year, operand.section_id) == (ticker, year, section)
+                             for operand in intent.required_operands)):
                     missing.append(MissingRequirement(ticker, year, section, "missing_section",
                                                       document_ids=(document_id,)))
         groups.append(CompanyPartition(ticker, intent.question, tuple(targets)))

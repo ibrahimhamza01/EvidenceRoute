@@ -444,8 +444,8 @@ class RootController:
                 else:
                     notice = ""
                     if _recursive.generic_findings_ready():
-                        notice = ("Submitted findings cover every assigned document and section. "
-                                  "You may finish, or keep investigating within the remaining budget. ")
+                        notice = ("Every assigned section has a submitted finding. "
+                                  "Check whether any part of the question still needs evidence. ")
                 if allocation is not None and not finalization_reason:
                     if not unassigned:
                         offered_tools = [tool for tool in tools if (
@@ -666,17 +666,19 @@ class RootController:
                                                  "Use a short mechanism label (120 characters max). "
                                                  f"Use only these acknowledged aliases: {aliases}.")
                         continue
-                    schema_issues = [issue for issue in _recursive.conclusion_rejections if issue.category == "schema"]
-                    if (schema_issues and _recursive.generic_root and conclusion_correction is None
+                    repairable = [issue for issue in _recursive.conclusion_rejections
+                                  if issue.category == "schema" or issue.code == "unsupported_assertion"]
+                    if (repairable and _recursive.generic_root and conclusion_correction is None
                             and allocation is not None and allocation.finalization_left
                             and iteration < self._limits.max_iterations):
                         conclusion_correction = (citations, _recursive.selected_local_finding_ids,
                                                  _recursive.selected_inherited_findings, _recursive.used_finding_ids)
-                        detail = "; ".join(f"{issue.path} {issue.code}" for issue in schema_issues[:4])
+                        detail = "; ".join(f"{issue.path} {issue.code}" for issue in repairable[:4])
                         pending = self._feedback(
                             step, "conclusion_correction",
-                            f"Conclusion schema rejected ({detail}). "
+                            f"Conclusion rejected ({detail}). "
                             "Keep the same acknowledged bindings and cite_refs. "
+                            "Remove statements that the cited passages cannot support, or abstain. "
                             "Use at most 1200 characters for statement and 600 for qualification. "
                             "Do not investigate again.",
                         )
@@ -808,7 +810,12 @@ class RootController:
                 result = self._dispatcher.dispatch(action.name, action.arguments,
                                                    delivered_chunks=recursive.direct_ids if recursive else None,
                                                    delivered_spans=recursive.delivered_span_text
-                                                   if recursive and recursive.compact_comparative else None,
+                                                   if recursive and (recursive.compact_comparative or recursive.compact_generic_reads) else None,
+                                                   delivered_search_pages=recursive.delivered_search_pages
+                                                   if recursive and recursive.compact_generic_reads else None,
+                                                   compact_response_bytes=(batch_share if batch_share is not None
+                                                                           else self._limits.max_response_bytes)
+                                                   if recursive and recursive.compact_generic_reads else None,
                                                    adjacent_bytes=(batch_share if batch_share is not None else self._limits.max_response_bytes)
                                                    if recursive and recursive.capture_reserved else None)
         operation.tool_seconds = self._clock() - started

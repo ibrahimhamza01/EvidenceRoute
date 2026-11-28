@@ -1,5 +1,6 @@
 """Finding drafts from the model and findings resolved against SEC evidence."""
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Annotated, Literal
@@ -13,6 +14,65 @@ AnalysisStatus = Literal["analyzed", "incomplete", "conflicting"]
 CoverageStatus = Literal["complete", "partial", "missing"]
 MAX_FINDINGS = 8
 MAX_FINDINGS_PER_SUBMISSION = 4
+
+_NONDISCLOSURE = re.compile(
+    r"\b(?:does|did|do|is|are|was|were|has|have|had)(?:\s+not|n['’]t)\s+"
+    r"(?:\w+\s+){0,4}(?:disclos\w*|report\w*|provid\w*|contain\w*|mention\w*|includ\w*)\b"
+    r"|\b(?:never\s+(?:disclos\w*|report\w*|provid\w*)|"
+    r"no (?:mention|disclosure|data|information|evidence)\b|undisclosed|unreported|nowhere)\b"
+    r"|\bno (?:\w+ ){1,6}(?:was|were|is|are) (?:reported|disclosed|provided)\b"
+    r"|\b(?:filings?|reports?) (?:lacks?|omits?|fails? to (?:disclose|report|provide))\b"
+    r"|\babsent from\b"
+    r"|\b(?:only|solely)\s+(?:reports?|discloses?|provides?|includes?)\b",
+    re.I,
+)
+_PASSAGE_LIMIT = re.compile(
+    r"\b(?:reviewed|retrieved|examined|cited|available|supplied|delivered)\s+"
+    r"(?:\w+\s+){0,2}(?:passages?|excerpts?|chunks?|evidence)\b"
+    r"|\b(?:this|these|the cited) (?:passages?|excerpts?|tables?)\b", re.I,
+)
+_REPORTING_HISTORY = re.compile(
+    r"\b(?:ceased|stopped|discontinued|began|started|resumed|no longer)\s+"
+    r"(?:\w+\s+){0,3}(?:report|disclos|provid)\w*\b", re.I,
+)
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+_RELATIVE_PERIOD = re.compile(r"\b(?:past|last|previous|prior) (?:\w+ ){0,2}(?:years?|quarters?|months?)\b", re.I)
+_CAUSAL = re.compile(r"\b(?:because|due to|attribut\w+ to|as a result of|driven by|reflect(?:s|ed|ing)|resulted from)\b", re.I)
+
+
+def unsupported_assertion(text: str, quotes: Iterable[str], filing_years: Iterable[int] = ()) -> bool:
+    """Reject common scope and historical overreach before semantic review."""
+    passages = tuple(" ".join(quote.casefold().split()) for quote in quotes)
+    years = set(_YEAR.findall(" ".join(passages)))
+    source_years = {str(year) for year in filing_years}
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        normalized = " ".join(sentence.casefold().split()).rstrip(".")
+        if not normalized or any(normalized in quote for quote in passages):
+            continue
+        stated_years = set(_YEAR.findall(sentence))
+        history = _REPORTING_HISTORY.search(normalized)
+        if history and not any(history[0] in quote and stated_years <= set(_YEAR.findall(quote))
+                               for quote in passages):
+            return True
+        relative_periods = _RELATIVE_PERIOD.findall(normalized)
+        if any(not any(period in passage for passage in passages) for period in relative_periods):
+            return True
+        if _CAUSAL.search(sentence) and (stated_years or relative_periods) and (
+            stated_years - years - source_years or not any(_CAUSAL.search(quote) for quote in passages)
+        ):
+            return True
+        for match in _NONDISCLOSURE.finditer(sentence):
+            clause = re.split(r"[;,]|\b(?:but|however|while)\b", sentence[max(0, match.start() - 140):match.start()])[-1]
+            local = clause + sentence[match.start():].split(",", 1)[0]
+            if not _PASSAGE_LIMIT.search(local):
+                return True
+    return False
+
+
+def grounded_finding(finding: "Finding") -> bool:
+    return not any(unsupported_assertion(text, (item.quote for item in finding.evidence),
+                                         (item.source.fiscal_year for item in finding.evidence))
+                   for text in (finding.claim, finding.uncertainty, finding.conflict) if text)
 
 
 class EvidenceDraft(StrictInput):

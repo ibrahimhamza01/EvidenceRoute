@@ -68,12 +68,13 @@ PYTHONPATH=Code/src python Code/examples/demo_rlm_recursive.py
 
 ## Benchmark and router integration
 
-Use `evidenceroute.research.rlm.natural_language.research_question` as the question-to-answer entry point. Reuse a `CorpusEnvironment` across questions. Configure a `RecursiveResearch` runner with a fresh client factory, such as `lambda _: BedrockRootClient.from_env(disable_retries=True)`, and explicit `CorpusLimits`. The demo shows profile setup, interpretation headroom, and offline substitution of both clients. [Question demo](../examples/demo_rlm_question.py)
+Use `evidenceroute.research.rlm.natural_language.generate_rlm_answer` for the shared `ResearchResponse` defined in `schemas.py`. Use `research_question` when the caller also needs diagnostics. Reuse a `CorpusEnvironment` across questions. Configure a `RecursiveResearch` runner with a fresh client factory, such as `lambda _: BedrockRootClient.from_env(disable_retries=True)`, and explicit `CorpusLimits`. [Question demo](../examples/demo_rlm_question.py)
 
 ```python
 from evidenceroute.research.rlm.natural_language import research_question
 
 result = research_question(question, runner, limits=limits, max_groups=2)
+response = result.response
 research = result.research
 ```
 
@@ -84,7 +85,8 @@ For a fixed-scope experiment, resolve a caller-supplied `ResearchIntent` into a 
 | Integration field | Source |
 | --- | --- |
 | Question and run identity | Keep the harness's `question_id` and the original question. Attach `research.run_id` when a research result exists. |
-| Answer and original SEC citations | Use `research.answer` and `research.citations`. Each citation includes chunk, document and section IDs, ticker, fiscal year and SEC URL. Use finding evidence for exact quotes and span IDs. |
+| Answer and original SEC citations | Use `response.answer` and `response.citations`. The response uses `strategy="rlm"` and resolves answer citations to canonical `Chunk` records. Generic conclusions cite their bound chunks. Exact excerpts, span IDs, and the wider citation inventory remain in `research`. |
+| Verification status | The question API returns `not_checked`. Provenance checks confirm source identity and delivery. Independent semantic review runs under its own allowance and has its own report. |
 | Scope, coverage and uncertainty | Keep `research.coverage.required_target_count`, per-target access, missing requirements and `research.groups` with pending reasons. Read `Finding.uncertainty`, `Finding.conflict`, analysis status and comparison outcomes. Retained findings and discovered chunks may extend beyond the answer's citations. |
 | Completion and errors | Keep `execution_status`, `research_status`, `stop_reason` and errors. Execution is `finished` when at least one batch ran and no required group remains pending. Research may still be `incomplete`. `unverified` records that the pipeline found no tracked incompleteness and leaves semantic certainty unresolved. |
 | Usage and latency | Use `result.usage` for interpretation plus research, or `research.usage` for research alone. Record reported tokens, estimates, missing-counter counts, provider attempts and `elapsed_seconds`. The overall timer starts after the corpus is loaded. |
@@ -1382,6 +1384,25 @@ Offline checks are `test_rlm_discovery.py`, `test_rlm_synthesis.py`, and `test_r
 The second live run answered both parts and then withheld the conclusion as `synthesis.conclusions[0] string_too_long`. Schema diagnostics now name the field, such as `statement` or `qualification`. A conclusion statement may be 1200 characters and a qualification 600, and those limits are in the schema and the finish instruction. One schema rejection can use the remaining reserved finalization attempt; provenance failures still withhold the conclusion and keep the atomic findings. Reading text from an assigned document and section does not close retrieval. Once submitted findings cover every assigned document-section pair, the investigator may finish or keep reading within budget.
 
 The q029 AMD gaming-revenue question failed both interpretation attempts at `requirements.inferred_fields[0]` with `literal_error`. Section scope is only `section_selection`: `explicit`, `risk_factors_default`, or `inferred`. `inferred_fields` accepts only `company_selection`, `fiscal_years`, `objective`, `topic`, and `comprehensive`. A redundant section token in that list is dropped before validation, so an otherwise valid plan is kept. Companies, years, sections, objectives, and required operands stay strictly checked. A remaining literal error names the permitted values in the correction feedback.
+
+## Final stabilization and integration
+
+The following results come from the saved Claude Sonnet 4.5 runs on the full-v1 corpus. Each row is one live trial with investigator assessments and no independent semantic review.
+
+| Saved report | Attempts / reported tokens | Observed result |
+| --- | ---: | --- |
+| `rlm-generalization-q045-v2-live.json` (`19d7475`) | 8 / 41,752 | Cisco Item 1 findings described how Splunk fits into security and observability. Item 7 reported approximately $1.4 billion in total FY2024 revenue from Splunk. The root exceeded the conclusion length cap and the report retained the four findings. |
+| `rlm-generalization-q029-v2-live.json` (`f6cd934`) | 8 / 46,511 | AMD's FY2023 and FY2024 MD&A supported a drop from $6.2 billion to $2.6 billion, about 58%. The FY2023 report explained its own 9% decline and the FY2024 report explained its 58% decline. Both pointed to lower semi-custom product sales or revenue. A search result overflowed the tool batch, and an invalid finding reference required recovery. |
+| `rlm-generalization-q042-live.json` (`f6cd934`) | 13 / 76,506 | Both children searched Item 1. The root received NVIDIA's fabless strategy and Intel's selective use of outside foundries. The NVIDIA finding that named TSMC and Samsung stayed in the child ledger. The root's qualification about Intel's four years of investment lacked that period in its bound excerpts. |
+| `rlm-generalization-q024-live.json` (`f6cd934`) | 8 / 34,551 | The cited table recorded iPhone revenue. The investigator inferred filing-wide nondisclosure and a change in reporting practice in FY2019 from that evidence. The terminal conclusion also failed the two-binding minimum. |
+
+For generic research, bounded child delivery now ranks whole findings by question terms and discovery phrases, with early representation for separate required sources. Inferred scope can include several plausible sections. A required filing can be bound through its authorized candidate sections. If the highest-priority sections fit the partition allowance and still cover each resolved filing, lower-priority inferred alternatives can be left out and recorded in the scope notes. Explicitly named sections remain required.
+
+A single binding can support a direct answer. An abstention can identify a gap in the reviewed evidence with optional citations. An answer that makes a cross-source assertion still requires distinct acknowledged findings for all required operands and any literal reporting-period anchors. The host rejects common ungrounded disclosure-absence and historical assertions in generic findings and conclusions. Investigators must tie a historical explanation to the change and source that states it.
+
+Generic search pages fit the observation allowance and return a continuation offset. Repeated acknowledged pages and spans use compact receipts. A page or span that has yet to be delivered remains eligible for retrieval. The host keeps the same investigation ceilings and leaves unresolved parts open while tool slots remain. The specialized corpus-wide comparative path retains its capture, continuation, and verification workflow.
+
+The closeout used scripted regression checks and separately reloaded the four saved checkpoints against the canonical corpus. The older live reports remain historical observations. Lexical relevance can miss paraphrases, inferred breadth depends on interpretation and available partitions, and evidence spread across separate roots can remain unresolved. The assertion checks catch common wording and scope errors. They cannot determine entailment for every paraphrase or establish filing-wide absence. Live answer quality, token savings, and latency after these changes remain unmeasured.
 
 ## Ongoing engineering record
 

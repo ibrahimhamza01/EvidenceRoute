@@ -17,7 +17,7 @@ from evidenceroute.research.rlm.comparison import (
     CompactAssessment, CompactComparisonDraft, Comparison, _has_ai_context, render_comparisons,
     ranked_cross_year_pairs, resolve_comparison, resolve_reference_comparison,
 )
-from evidenceroute.research.rlm.discovery import CandidatePageRequest, CorpusScan
+from evidenceroute.research.rlm.discovery import CandidatePageRequest, CorpusScan, _section_query_terms
 from evidenceroute.research.rlm.controller import (
     ExecutionTrace, RootController, RootLimits, RootModelClient, ToolTrace, _FinishAction, _ReferenceSynthesis,
 )
@@ -26,15 +26,16 @@ from evidenceroute.research.rlm.environment import CorpusEnvironment
 from evidenceroute.research.rlm.findings import (
     MAX_FINDINGS, MAX_FINDINGS_PER_SUBMISSION, AnalysisStatus, EvidenceDraft, Finding, FindingDraft, FindingEvidence,
     FindingValidationError, FindingValidationIssue, PartitionCoverage, SpanEvidenceDraft, SpanFindingDraft,
-    CaptureFindings, SubmitFindings, finding_schema_issues, partition_status, render_findings,
+    CaptureFindings, SubmitFindings, finding_schema_issues, partition_status, render_findings, unsupported_assertion,
 )
 from evidenceroute.research.rlm.synthesis import Conclusion, SourceOperand, render_conclusion, resolve_conclusions
 from evidenceroute.research.rlm.scoped import ScopedCorpus
 from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.research.rlm.tools import (
     READ_PRIOR_FINDINGS, SUBMIT_FINDINGS, DispatchResult, EvidenceRef, Identifier, StrictInput, error_observation, observation_json,
-    validation_message,
+    search_page_key, validation_message,
 )
+from evidenceroute.retrieval.tokenization import tokenize
 
 
 _CROSS_YEAR_CLAIM = re.compile(
@@ -203,10 +204,15 @@ class RecursiveResearch:
                        "Copy ticker, filing_year, and section_id from that finding. Do not send finding_id as ref. "
                        "Leave period_text null unless that exact text is in the bound quote. "
                        "Preserve the requested metric, unit, period, and qualifiers. A related measure is not a substitute. "
-                       "Keep statement to 1200 characters and qualification to 600. "
-                       "Use cite_refs alone for descriptive findings or when a relationship lacks support.")
+                       "Say only what the bound passages support, including any stated cause or reporting history. "
+                       "Keep the answer to a few short sentences. Statement max 1200 characters, qualification max 600. "
+                       "For a direct answer, one supporting binding is enough when no operands are required. "
+                       "With insufficient_evidence, describe the gap in the reviewed passages and omit unsupported claims. "
+                       "Bindings may be empty when no passage is useful.")
             if invocation.required_operands:
                 prompt += "\nEach conclusion requires these source operands: " + observation_json(invocation.required_operands)
+                if any(operand.section_id is None for operand in invocation.required_operands):
+                    prompt += " A null section accepts any authorized section in that filing. In bindings, name the actual section."
         if invocation.goal is not None:
             prompt += f"\nAnalysis goal: {invocation.goal}"
         if invocation.depth > 0 and self.child_guidance:
@@ -225,8 +231,8 @@ class RecursiveResearch:
                 "\nQuestion-ranked candidates, at most three per section: " + observation_json(shortlist)
                 + "\nRead the best candidate for each unresolved part before extra hits from a part you already support. "
                 "One get_spans call can take four span IDs from one chunk. "
-                "Keep the requested metric, unit, period, and qualifiers; a related measure is not a substitute. "
-                "Search for different wording when the list is insufficient. No lexical miss proves absence."
+                "Use search only for unresolved parts or alternative wording. Reuse delivered spans and findings. "
+                "If a filing section has no useful candidates, try another authorized section. No lexical miss proves absence."
             )
         if self.comparison_scan is not None and not session.delegation_first:
             shortlist = self.comparison_scan.shortlist(partitions or (), mechanism_hint=session.compact_comparative)
@@ -298,6 +304,7 @@ class RecursiveSession:
         self.unassigned_groups = set(root_groups or ()) if self.delegation_first else set()
         self.direct_ids: set[str] = set()
         self.direct_spans: dict[str, set[str]] = {}
+        self.delivered_search_pages: set[tuple] = set()
         self.delivered_span_text: dict[tuple[str, str, str], tuple[str, str]] = {}
         self.delivered_findings: dict[str, Finding] = {}
         authorized = set(invocation.partitions or ())
@@ -330,6 +337,10 @@ class RecursiveSession:
         self.comparisons: tuple[Comparison, ...] = ()
         self.used_finding_ids: tuple[str, ...] = ()
         self.analysis_status: AnalysisStatus = "incomplete"
+
+    @property
+    def compact_generic_reads(self) -> bool:
+        return self.runner.discovery_scan is not None and self.runner.comparison_scan is None
 
     def capture_locators(self) -> dict[int, list[str]]:
         locators: dict[int, list[str]] = {}
@@ -692,6 +703,7 @@ class RecursiveSession:
         summaries: list[dict] = []
         record = {key: result[key] for key in ("child_invocation_id", "status", "analysis_status", "stop_reason", "budget_stop")}
         retained = child.transferable_findings
+        ordered = retained if self.runner.comparison_scan is not None else self._rank_child_findings(retained)
 
         def encode() -> str:
             return observation_json({"ok": True, "result": {**record,
@@ -719,7 +731,7 @@ class RecursiveSession:
                     break
             else:
                 findings.clear()
-        for finding in retained:
+        for finding in ordered:
             if finding in findings:
                 continue
             findings.append(finding)
@@ -747,6 +759,37 @@ class RecursiveSession:
                 content = candidate
         return content, tuple(findings), tuple(indices)
 
+    def _rank_child_findings(self, findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
+        question = self.invocation.question.split("\nObjective:", 1)[0]
+        phrases = self.runner.discovery_scan.terms if self.runner.discovery_scan else ()
+
+        def rank(finding: Finding) -> tuple:
+            source = finding.evidence[0].source
+            terms = set(_section_query_terms(question, source.section_id, "", (source.ticker, finding.company_name)))
+            claim = set(tokenize(finding.claim))
+            passages = [" " + " ".join(tokenize(item.quote, remove_stopwords=False)) + " " for item in finding.evidence]
+            query_hits = max(len(terms.intersection(passage.split())) for passage in passages)
+            phrase_hits = [len(phrase.split()) for phrase in phrases
+                           if any(f" {phrase} " in passage for passage in passages)]
+            return (query_hits, len(terms & claim), max(phrase_hits, default=0), len(phrase_hits),
+                    finding.analysis_status == "analyzed")
+
+        # Offer the strongest finding for each required source before its
+        # supporting detail. Inferred alternate sections share a filing slot.
+        ranked = sorted(findings, key=rank, reverse=True)
+        covered = set()
+        primary, detail = [], []
+        for finding in ranked:
+            source = finding.evidence[0].source
+            operands = {operand for operand in self.invocation.required_operands
+                        if (operand.ticker, operand.filing_year) == (source.ticker, source.fiscal_year)
+                        and operand.section_id in (None, source.section_id)
+                        and (not operand.period_text or any(operand.period_text in item.quote for item in finding.evidence))}
+            keys = operands or {SectionTarget(source.document_id, source.section_id)}
+            (primary if keys - covered else detail).append(finding)
+            covered.update(keys)
+        return (*primary, *detail)
+
     def record_delivery(self, step: ToolTrace) -> None:
         if not (step.observation or {}).get("ok"):
             return
@@ -760,11 +803,13 @@ class RecursiveSession:
                 self.acknowledged_references.update((ref, self.submitted_findings[ref])
                                                     for ref in step.acknowledged_finding_refs)
                 return
+            if step.tool_name == "search_chunks" and self.compact_generic_reads:
+                self.delivered_search_pages.add(search_page_key(step.validated_arguments))
             if step.tool_name != "get_spans":
                 self.direct_ids.update(ref.chunk_id for ref in step.evidence)
             for chunk_id, spans in (step.observation or {}).get("span_ids", {}).items():
                 self.direct_spans.setdefault(chunk_id, set()).update(spans)
-                if self.compact_comparative and spans:
+                if (self.compact_comparative or self.compact_generic_reads) and spans:
                     chunk = self.runner.corpus.get_chunk(chunk_id)
                     offsets = passage_spans(chunk.text)
                     for span in spans:
@@ -973,6 +1018,15 @@ class RecursiveSession:
                                              "Each finding must cite evidence from one document and section.")
             evidence.append(resolved)
         source = evidence[0].source
+        if self.runner.comparison_scan is None:
+            for field in ("claim", "uncertainty", "conflict"):
+                value = getattr(draft, field)
+                if value and unsupported_assertion(value, (item.quote for item in evidence), (source.fiscal_year,)):
+                    raise FindingValidationError(
+                        f"{path}.{field}", "grounding", "unsupported_assertion",
+                        "Use a passage-supported claim or describe a gap in the reviewed excerpts. "
+                        "A search miss cannot establish filing-wide absence or a change in reporting practice.",
+                    )
         if self.compact_comparative:
             other_years = set(self.runner.comparison_scan.years) - {source.fiscal_year}
             if _CROSS_YEAR_CLAIM.search(draft.claim) or any(

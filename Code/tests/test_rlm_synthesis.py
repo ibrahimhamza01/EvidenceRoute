@@ -13,10 +13,11 @@ from evidenceroute.research.rlm.budget import FinalizationPolicy, SharedLimits
 from evidenceroute.research.rlm.checkpoint import CheckpointError, continue_research, create_checkpoint, load_checkpoint, save_checkpoint
 from evidenceroute.research.rlm.controller import ScriptedModelClient, finish_input_schema
 from evidenceroute.research.rlm.corpus_research import CorpusLimits, execute_corpus_research
+from evidenceroute.research.rlm.coverage import CoverageReport, ResearchScope
 from evidenceroute.research.rlm.planning import ResearchIntent, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.spans import passage_spans
-from evidenceroute.research.rlm.synthesis import SourceOperand, resolve_conclusions, validate_conclusion
+from evidenceroute.research.rlm.synthesis import ABSTENTION, SourceOperand, resolve_conclusions, validate_conclusion
 from evidenceroute.research.rlm.tools import EvidenceRef
 from evidenceroute.research.rlm.verification import (
     BedrockSemanticVerifier, VerificationLimits, record_verification, verification_report, verify_checkpoint,
@@ -97,9 +98,12 @@ def run(corpus, *, companies=("AAPL", "AMZN"), years=(2024,), sections=("item_1a
                 bindings[0]["section_id"] = "item_7"
             if mode == "missing":
                 bindings.pop()
-            proposal = dict(statement=STATEMENT if len({b["ticker"] for b in bindings}) == 2 else "Scripted cross-source relationship.",
-                            bindings=list(reversed(bindings)), disposition="answered",
+            statement = STATEMENT if len({b["ticker"] for b in bindings}) == 2 else "Scripted cross-source relationship."
+            proposal = dict(statement=statement, bindings=list(reversed(bindings)), disposition="answered",
                             qualification="The passages describe exposures rather than realized losses.")
+            if mode == "abstain":
+                proposal.update(statement=STATEMENT, bindings=bindings[:1], disposition="insufficient_evidence")
+                refs = refs[:1]
             if mode != "unfinished":
                 actions.append(dict(type="synthesis", synthesis=dict(
                     conclusions=[proposal], cite_refs=[] if mode == "undelivered" else refs, analysis_status="analyzed")))
@@ -262,6 +266,38 @@ def test_comparison_split_between_roots(corpus):
     assert all(not n.conclusions for n in result.coverage.invocations)
     assert "separate roots remain unresolved" in result.answer and result.answer_disposition == "insufficient_evidence"
     assert len(result.answer_citations) == 2
+
+
+def test_abstention_can_cite_reviewed_evidence_without_a_cross_source_conclusion(corpus):
+    result, _, _ = run(corpus)
+    root = result.coverage.invocations[0]
+    left = root.conclusions[0].bindings[0]
+    evidence = next(f for f in result.acknowledged_child_findings if f.finding_id == left.finding_id)
+    known = {left.finding_id: evidence}
+    record = root.conclusions[0].model_copy(update={
+        "statement": "The reviewed passages do not disclose the requested operating metric.",
+        "qualification": None,
+        "disposition": "insufficient_evidence",
+        "bindings": (left,),
+    })
+    validate_conclusion(record, known, root.invocation.required_operands, root.invocation.partitions)
+    for statement in ("The company does not disclose this metric in its filing.",
+                      "The company stopped reporting the metric in FY2019."):
+        with pytest.raises(ValueError, match="unsupported_assertion"):
+            validate_conclusion(record.model_copy(update={"statement": statement}), known, (), root.invocation.partitions)
+    with pytest.raises(ValueError, match="missing_operand"):
+        validate_conclusion(record.model_copy(update={"disposition": "answered"}), known,
+                            root.invocation.required_operands, root.invocation.partitions)
+    raw = {"statement": "The company stopped reporting the metric in FY2019.",
+           "disposition": "insufficient_evidence", "bindings": []}
+    records, issues = resolve_conclusions([raw], {}, root.invocation.required_operands,
+                                          root.invocation.partitions, (), CoverageReport(ResearchScope(), (), (), ()))
+    assert not issues and records[0].statement == ABSTENTION
+
+    abstention, _, _ = run(corpus, mode="abstain")
+    assert abstention.answer_disposition == "insufficient_evidence"
+    assert ABSTENTION in abstention.response.answer and STATEMENT not in abstention.response.answer
+    assert [chunk.ticker for chunk in abstention.response.citations] == ["AAPL"]
 
 
 @pytest.mark.parametrize("compact, comparative", [(False, True), (True, True), (False, False)])

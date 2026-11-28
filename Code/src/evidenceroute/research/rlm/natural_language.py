@@ -18,7 +18,7 @@ from evidenceroute.research.rlm.interpretation import (
 )
 from evidenceroute.research.rlm.planning import ResearchPlan, resolve_research_plan
 from evidenceroute.research.rlm.recursive import RecursiveResearch
-from evidenceroute.research.rlm.tools import observation_json
+from evidenceroute.schemas import ResearchResponse
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,64 @@ class QuestionResearchResult:
     plan: ResearchPlan | None
     research: CorpusResearchResult | None
     usage: CorpusUsage
+
+    @property
+    def response(self) -> ResearchResponse:
+        if self.research is not None and self.research.response is not None:
+            return self.research.response
+        outcome = self.interpretation.outcome
+        answer = outcome.explanation or (
+            "Unable to interpret the research question." if outcome.status == "failed"
+            else "The research run could not start within its available budget."
+        )
+        return ResearchResponse(question=self.question, answer=answer, strategy="rlm", citations=[],
+                                verification_status="not_checked")
+
+
+def _fit_inferred_sections(plan: ResearchPlan, runner: RecursiveResearch, limits: CorpusLimits,
+                           max_groups: int) -> ResearchPlan:
+    """Drop lower-priority section alternatives when needed to keep each filing in scope."""
+    intent = plan.intent
+    if intent.objective != "review" or "section_ids" not in intent.inferred_fields or len(intent.section_ids) < 2:
+        return plan
+    cap = min(limits.max_partitions, runner.shared_limits.max_partitions)
+    together = bool(intent.required_operands) and len(plan.groups) <= max_groups
+    section_ids = set(intent.section_ids)
+    required = {operand.section_id for operand in intent.required_operands}
+    original_documents = {pair.document_id for pair in plan.resolved_targets}
+
+    def fits() -> bool:
+        sizes = [sum(pair.section_id in section_ids for pair in group.targets) for group in plan.groups]
+        return (sum(sizes) if together else max(sizes, default=0)) <= cap
+
+    for section in reversed(intent.section_ids):
+        if fits():
+            break
+        if section not in required and {
+            pair.document_id for pair in plan.resolved_targets if pair.section_id in section_ids - {section}
+        } == original_documents:
+            section_ids.remove(section)
+    omitted = [section for section in intent.section_ids if section not in section_ids]
+    if not omitted or not section_ids:
+        return plan
+    bounded = intent.model_copy(update={
+        "section_ids": tuple(section for section in intent.section_ids if section in section_ids),
+        "scope_notes": f"{intent.scope_notes} Alternate sections outside the partition allowance: {', '.join(omitted)}.",
+    })
+    return resolve_research_plan(bounded, runner.corpus)
+
+
+def generate_rlm_answer(
+    question: str, runner: RecursiveResearch, *, limits: CorpusLimits,
+    interpretation_limits: InterpretationLimits | None = None,
+    interpreter_factory: Callable[[], BedrockIntentInterpreter] | None = None,
+    max_groups: int = 2, detailed_trace: bool = False,
+) -> ResearchResponse:
+    """Return the shared answer contract. Use research_question for run diagnostics."""
+    return research_question(
+        question, runner, limits=limits, interpretation_limits=interpretation_limits,
+        interpreter_factory=interpreter_factory, max_groups=max_groups, detailed_trace=detailed_trace,
+    ).response
 
 
 def research_question(
@@ -80,9 +138,9 @@ def research_question(
         if outcome.intent is not None:
             try:
                 resolved = resolve_research_plan(outcome.intent, runner.corpus)
+                plan = _fit_inferred_sections(resolved, runner, limits, max_groups)
             except Exception:
                 raise ClaudeModelError("plan_resolution_failed") from None
-            plan = resolved
         if clock() >= budget.deadline:
             raise BudgetExceeded("deadline")
     except (BudgetExceeded, ClaudeModelError) as exc:
@@ -110,9 +168,9 @@ def research_question(
         if plan.intent.objective != "year_over_year":
             child_extra += (
                 " Preserve the requested metric, unit, period, and qualifiers. "
-                "Do not substitute a related measure, component, balance, or segment figure. "
-                "Before finishing, examine each unresolved part of the question. "
-                "Unread chunks are not a reason to skip a part while tool slots remain."
+                "For each historical explanation, cite passages connecting the stated reason to that exact change "
+                "in the report that gives it. Describe an evidence gap only within the reviewed passages. "
+                "Investigate unresolved parts while tool slots remain."
             )
         scoped_runner.child_guidance = "\n".join(filter(None, (runner.child_guidance, child_extra)))
         root_guidance = (
@@ -128,9 +186,8 @@ def research_question(
             )
         if plan.intent.required_operands:
             root_guidance += (
-                " Compare these required source operands and bind each one. A missing operand is insufficient "
-                "evidence and does not establish filing-wide absence. Required source operands "
-                + observation_json(plan.intent.required_operands) + "."
+                " Required source operands must all support a cross-source answer. If a source is missing, "
+                "report the gap in the reviewed passages."
             )
         remaining = limits.model_copy(update={
             "max_provider_attempts": limits.max_provider_attempts - budget.provider_attempts,

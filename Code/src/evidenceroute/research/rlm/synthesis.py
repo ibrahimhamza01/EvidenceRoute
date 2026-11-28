@@ -6,18 +6,19 @@ from typing import Annotated, Literal
 from pydantic import ConfigDict, Field, ValidationError
 
 from evidenceroute.research.rlm.coverage import CoverageReport, SectionTarget
-from evidenceroute.research.rlm.findings import Finding, FindingValidationIssue, finding_schema_issues
+from evidenceroute.research.rlm.findings import Finding, FindingValidationIssue, finding_schema_issues, unsupported_assertion
 from evidenceroute.research.rlm.tools import FiscalYear, Identifier, StrictInput
 
 AnswerDisposition = Literal["answered", "partial", "insufficient_evidence"]
 Note = Annotated[str, Field(min_length=1, max_length=400)]
+ABSTENTION = "The reviewed evidence is insufficient to answer the question."
 
 
 class SourceOperand(StrictInput):
     model_config = ConfigDict(frozen=True)
     ticker: Identifier
     filing_year: FiscalYear
-    section_id: Identifier
+    section_id: Identifier | None = Field(description="Null allows any authorized section in this filing.")
     period_text: Note | None = Field(
         default=None,
         description="Leave null unless the question names this period and the bound finding contains that exact text.",
@@ -25,6 +26,7 @@ class SourceOperand(StrictInput):
 
 
 class DraftBinding(SourceOperand):
+    section_id: Identifier
     ref: str = Field(
         pattern=r"^(s[1-8]|d[1-9][0-9]{0,8})$",
         description="Acknowledged alias dN or sN from the delivered finding. Do not send finding_id.",
@@ -32,6 +34,7 @@ class DraftBinding(SourceOperand):
 
 
 class BoundOperand(SourceOperand):
+    section_id: Identifier
     finding_id: Identifier
 
 
@@ -39,7 +42,7 @@ class Assessment(StrictInput):
     model_config = ConfigDict(frozen=True)
     statement: str = Field(
         min_length=1, max_length=1200,
-        description="The requested answer in at most 1200 characters. Do not restate every finding.",
+        description="Answer directly in a few short sentences, at most 1200 characters. Avoid repeating findings.",
     )
     disposition: AnswerDisposition = Field(description="Investigator assessment of the requested answer within this root's scope.")
     qualification: str | None = Field(
@@ -50,24 +53,28 @@ class Assessment(StrictInput):
 
 class ConclusionDraft(Assessment):
     bindings: list[DraftBinding] = Field(
-        min_length=2, max_length=8,
-        description="Bind each required source to a different acknowledged finding. Omit conclusions when cite_refs is enough.",
+        max_length=8,
+        description="Bind each required source to a different acknowledged finding. Use one binding for a single-source "
+                    "answer. With insufficient_evidence, cite any useful reviewed passages or leave bindings empty.",
     )
 
 
 class Conclusion(Assessment):
     semantic_status: Literal["unverified"] = "unverified"
-    bindings: tuple[BoundOperand, ...] = Field(min_length=2, max_length=8)
+    bindings: tuple[BoundOperand, ...] = Field(max_length=8)
 
 
 def validate_conclusion(record: Conclusion, available: Mapping[str, Finding], required: Sequence[SourceOperand],
-                        scope: Sequence[SectionTarget] | None) -> None:
+                        scope: Sequence[SectionTarget] | None, *, check_assertions: bool = True) -> None:
     """Check source identity and literal period anchors. Meaning remains unverified."""
-    operands = set()
+    matches: dict[SourceOperand, set[str]] = {}
+    evidence = []
     for binding in record.bindings:
         finding = available.get(binding.finding_id)
         if finding is None:
             raise ValueError("unknown_finding")
+        if not finding.evidence:
+            raise ValueError("unacknowledged_evidence")
         operand = SourceOperand(**binding.model_dump(exclude={"finding_id"}))
         for item in finding.evidence:
             source = item.source
@@ -77,14 +84,37 @@ def validate_conclusion(record: Conclusion, available: Mapping[str, Finding], re
                 raise ValueError("wrong_source")
         if operand.period_text and not any(operand.period_text in item.quote for item in finding.evidence):
             raise ValueError("missing_period_text")
-        operands.add(operand)
-        if operand.period_text:
-            operands.add(operand.model_copy(update={"period_text": None}))
-    if len({binding.finding_id for binding in record.bindings}) < 2 or not set(required).issubset(operands):
-        raise ValueError("missing_operand")
+        evidence.extend(finding.evidence)
+        for section in {operand.section_id, None}:
+            for period in {operand.period_text, None}:
+                key = operand.model_copy(update={"section_id": section, "period_text": period})
+                matches.setdefault(key, set()).add(binding.finding_id)
+    if record.disposition != "insufficient_evidence":
+        if not record.bindings:
+            raise ValueError("missing_operand")
+        # Each required operand must be independently attributable, even when
+        # reporting-period anchors or alternate sections overlap.
+        assigned: dict[str, SourceOperand] = {}
+
+        def assign(operand: SourceOperand, seen: set[str]) -> bool:
+            for fid in sorted(matches.get(operand, set()) - seen):
+                seen.add(fid)
+                if fid not in assigned or assign(assigned[fid], seen):
+                    assigned[fid] = operand
+                    return True
+            return False
+
+        if not all(assign(operand, set()) for operand in required):
+            raise ValueError("missing_operand")
+    if check_assertions and record.bindings and any(
+        unsupported_assertion(text, (item.quote for item in evidence), (item.source.fiscal_year for item in evidence))
+        for text in (record.statement, record.qualification) if text
+    ):
+        raise ValueError("unsupported_assertion")
 
 
-_CONCLUSION_CODES = frozenset({"unknown_finding", "wrong_source", "missing_period_text", "missing_operand"})
+_CONCLUSION_CODES = frozenset({"unknown_finding", "wrong_source", "missing_period_text", "missing_operand",
+                               "unacknowledged_evidence", "unsupported_assertion"})
 
 
 def resolve_conclusions(proposals: object, references: Mapping[str, Finding], required: Sequence[SourceOperand],
@@ -129,6 +159,8 @@ def resolve_conclusions(proposals: object, references: Mapping[str, Finding], re
                 code = "invalid_conclusion"
             reject(FindingValidationIssue(path, "provenance" if code in _CONCLUSION_CODES else "validation", code))
             continue
+        if record.disposition == "insufficient_evidence":
+            record = record.model_copy(update={"statement": ABSTENTION, "qualification": None})
         ids = {b.finding_id for b in bindings}
         chunks = {item.source.chunk_id for fid in ids for item in known[fid].evidence}
         if not chunks <= visible:
@@ -144,6 +176,8 @@ def resolve_conclusions(proposals: object, references: Mapping[str, Finding], re
 
 
 def render_conclusion(record: Conclusion, known: Mapping[str, Finding]) -> str:
+    if record.disposition == "insufficient_evidence":
+        return f"[insufficient_evidence, unverified] {ABSTENTION}"
     findings = [known[b.finding_id] for b in record.bindings]
     notes = dict.fromkeys(note for finding in findings for note in (finding.uncertainty, finding.conflict) if note)
     if record.qualification:

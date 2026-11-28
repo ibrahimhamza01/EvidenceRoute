@@ -19,6 +19,7 @@ from evidenceroute.research.rlm.environment import (
     SectionWindow,
 )
 from evidenceroute.retrieval import ChunkFilter
+from evidenceroute.retrieval.tokenization import tokenize
 from evidenceroute.research.rlm.spans import passage_spans
 from evidenceroute.schemas import Chunk, RetrievalResult
 
@@ -139,6 +140,14 @@ class _Search(_ChunkPage):
     filters: _Filters | None = None
 
 
+def search_page_key(arguments: dict) -> tuple:
+    """Identify a lexical search page within the current corpus view."""
+    filters = arguments["filters"] or {}
+    return (tuple(sorted(set(tokenize(arguments["query"], remove_stopwords=False)))),
+            tuple(sorted((key, tuple(sorted(set(values)))) for key, values in filters.items() if values)),
+            arguments["offset"], arguments["limit"])
+
+
 _TOOLS: dict[str, tuple[str, type[StrictInput]]] = {
     "list_companies": ("List companies and available fiscal years.", _Companies),
     "list_filings": ("List filings, optionally filtered by ticker and fiscal year.", _Filings),
@@ -241,7 +250,8 @@ class CorpusToolDispatcher:
 
     def dispatch(self, name: str, arguments: dict, *, delivered_chunks: set[str] | None = None,
                  delivered_spans: dict[tuple[str, str, str], tuple[str, str]] | None = None,
-                 adjacent_bytes: int | None = None) -> DispatchResult:
+                 adjacent_bytes: int | None = None, delivered_search_pages: set[tuple] | None = None,
+                 compact_response_bytes: int | None = None) -> DispatchResult:
         if not isinstance(name, str):
             return self._error("unknown_tool", "Tool is outside the SEC corpus allowlist.")
         args_schema = _Spans if self._include_spans and name == "get_spans" else _TOOLS.get(name, (None, None))[1]
@@ -257,10 +267,14 @@ class CorpusToolDispatcher:
             filters = ChunkFilter.model_validate(validated["filters"])
             validated["filters"] = filters.model_dump(mode="json", exclude_none=True)
             call_args["filters"] = filters
+        if name == "search_chunks" and delivered_search_pages and search_page_key(validated) in delivered_search_pages:
+            return DispatchResult(validated, observation_json({"ok": True, "result": {
+                "already_delivered": True,
+            }}))
         try:
             # Only names in the fixed registry reach attribute lookup.
             if name == "get_spans":
-                return self._get_spans(validated, delivered_spans, adjacent_bytes)
+                return self._get_spans(validated, delivered_spans, adjacent_bytes, compact_response_bytes)
             if name == "get_chunk" and self._include_spans and validated["chunk_id"] in (delivered_chunks or ()):
                 return DispatchResult(validated, observation_json({"ok": True, "result": {
                     "chunk_id": validated["chunk_id"], "already_delivered": True,
@@ -277,14 +291,28 @@ class CorpusToolDispatcher:
                                       "total": result.total, "next_offset": result.next_offset}
                     evidence = ()
                 else:
-                    if name == "read_chunks" and delivered_chunks:
+                    compact_search = name == "search_chunks" and compact_response_bytes is not None
+                    if (name == "read_chunks" and delivered_chunks) or compact_search:
                         body["result"] = {"items": [
-                            {"chunk_id": chunk.chunk_id, "already_delivered": True} if chunk.chunk_id in delivered_chunks else chunk
+                            {"chunk_id": chunk.chunk_id, "already_delivered": True}
+                            if chunk.chunk_id in (delivered_chunks or ()) else chunk
                             for chunk in chunks
                         ], "total": result.total, "next_offset": result.next_offset}
-                        chunks = tuple(chunk for chunk in chunks if chunk.chunk_id not in delivered_chunks)
-                        evidence = tuple(ref for ref in evidence if ref.chunk_id not in delivered_chunks)
+                        chunks = tuple(chunk for chunk in chunks if chunk.chunk_id not in (delivered_chunks or ()))
+                        evidence = tuple(ref for ref in evidence if ref.chunk_id not in (delivered_chunks or ()))
                     body["span_ids"] = {chunk.chunk_id: list(passage_spans(chunk.text)) for chunk in chunks}
+                if name == "search_chunks" and compact_response_bytes is not None:
+                    cap = min(self._max_bytes, compact_response_bytes)
+                    page = body["result"]
+                    items = page["items"]
+                    while len(items) > 1 and len(observation_json(body).encode("utf-8")) > cap:
+                        omitted = items.pop()
+                        if isinstance(omitted, Chunk):
+                            body["span_ids"].pop(omitted.chunk_id)
+                        page["next_offset"] = validated["offset"] + len(items)
+                    if len(observation_json(body).encode("utf-8")) > cap:
+                        return self._error("response_too_large", "Request this search page on its own or use targeted spans.", validated)
+                    evidence = tuple(ref for ref in evidence if ref.chunk_id in body.get("span_ids", {}))
             content = observation_json(body)
             response_bytes = len(content.encode("utf-8"))
             if response_bytes > self._max_bytes:
@@ -305,7 +333,7 @@ class CorpusToolDispatcher:
 
     def _get_spans(
         self, arguments: dict, delivered: dict[tuple[str, str, str], tuple[str, str]] | None,
-        adjacent_bytes: int | None,
+        adjacent_bytes: int | None, span_response_bytes: int | None,
     ) -> DispatchResult:
         chunk = self._corpus.get_chunk(arguments["chunk_id"])
         spans = passage_spans(chunk.text)
@@ -315,6 +343,7 @@ class CorpusToolDispatcher:
         ref = EvidenceRef.from_chunk(chunk)
         excerpts = {}
         repeated = {}
+        omitted = []
         for key in dict.fromkeys(selected):
             exact = chunk.text[slice(*spans[key])]
             previous = (delivered or {}).get((chunk.document_id, chunk.section_id, exact))
@@ -326,10 +355,19 @@ class CorpusToolDispatcher:
             result = {"source": ref, "spans": excerpts} if excerpts else {"chunk_id": chunk.chunk_id}
             if repeated:
                 result["already_delivered"] = repeated
+            if omitted:
+                result["omitted_span_ids"] = list(reversed(omitted))
             return observation_json({"ok": True, "result": result,
                                      "span_ids": {chunk.chunk_id: list(excerpts)} if excerpts else {}})
 
         content = encode()
+        if span_response_bytes is not None:
+            cap = min(self._max_bytes, span_response_bytes)
+            while len(content.encode("utf-8")) > cap and len(excerpts) > 1:
+                omitted.append(excerpts.popitem()[0])
+                content = encode()
+            if len(content.encode("utf-8")) > cap:
+                return self._error("response_too_large", "Read fewer spans or request this chunk on its own.", arguments)
         if adjacent_bytes is not None and len(selected) <= 2:
             ordered = list(spans)
             for key in selected:

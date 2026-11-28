@@ -42,8 +42,11 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   underscore-separated IDs for unavailable named sections. If the question concerns risk factors and names no
   section, use section_selection "risk_factors_default" with section_ids []. The application supplies Item 1A
   and records the inference. Use section_selection "inferred" when the question names no section and the inventory
-  identifies the relevant processed section or sections, such as financial statements or MD&A. Put only those
-  inventory IDs in section_ids and explain the choice in scope_notes. Do not infer an ID absent from the inventory
+  identifies relevant processed sections. For a disclosure that could appear in more than one place, include
+  the primary section and credible alternatives in priority order. Consider Business and Risk Factors for
+  operations and dependencies, and MD&A and Financial Statements for financial measures. Choose the smallest
+  set that covers plausible locations or distinct parts of the question. Put only those inventory IDs in
+  section_ids and explain the choice in scope_notes. Do not infer an ID absent from the inventory
   and do not replace a named unavailable section with a different available one. Section inference is only
   section_selection. inferred_fields accepts only company_selection, fiscal_years, objective, topic, and
   comprehensive. Leave section_ids out of inferred_fields. Ask for clarification when the appropriate section is
@@ -64,7 +67,9 @@ The separate corpus inventory contains tickers, recorded names, available fiscal
   unsupported and state that limit. Do not submit a shorter operand list. Use ambiguous when an essential
   requirement is missing or unclear. For ambiguous or unsupported, return a short public explanation.
 - For generic_synthesis, required_operands names each source a conclusion must bind: canonical ticker, filing year,
-  and section. Supply two to eight operands. Add an operand only when the question requires that source, not for
+  and section. If several inferred sections are alternative disclosure locations, give one operand per required
+  filing and use its most likely section ID. The host can bind that operand to another authorized section in
+  that filing. Supply two to eight operands. Add an operand only when the question requires that source, not for
   every filing merely in scope. Keep an operand whose company, year, or section is unavailable. Every operand must
   use a requested company, filing year, and section. Leave period_text null. Do not invent a reporting-period anchor
   before evidence is retrieved. A single section that already states figures for several periods is a review of that
@@ -468,7 +473,7 @@ def _exceeds_operand_capacity(requirements: _Requirements, inventory: dict) -> b
         return True
     if len(set(requirements.fiscal_years)) > 8:
         return True
-    return (requirements.section_selection != "risk_factors_default"
+    return (requirements.section_selection == "explicit"
             and len({section.lower() for section in requirements.section_ids}) > 8)
 
 
@@ -495,9 +500,16 @@ def _bound_operands(
         if operand.filing_year not in years or section not in sections:
             raise _inconsistent("requirements.required_operands", "operand_outside_scope")
         bound.append(SourceOperand(
-            ticker=ticker, filing_year=operand.filing_year, section_id=section, period_text=operand.period_text,
+            ticker=ticker, filing_year=operand.filing_year,
+            section_id=None if requirements.section_selection == "inferred" and len(sections) > 1 else section,
+            period_text=operand.period_text,
         ))
-    return tuple(bound)
+    result = tuple(dict.fromkeys(bound))
+    if len(result) < 2:
+        raise _inconsistent("requirements.required_operands", "operands_required")
+    if requirements.section_selection == "explicit" and {item.section_id for item in result} != sections:
+        raise _inconsistent("requirements.required_operands", "operand_outside_scope")
+    return result
 
 
 def _preserve_scope(requirements: _Requirements, previous: dict, inventory: dict, mode: str) -> None:

@@ -861,6 +861,45 @@ def test_descriptive_research_infers_a_processed_section(corpus):
     assert "AI infrastructure" not in prompts[1].prompts[0]
 
 
+def test_single_source_response_uses_the_shared_contract(corpus):
+    question = "What does Apple's FY2024 MD&A disclose?"
+    statement = "Apple describes its financial results in MD&A."
+    result = _run(
+        corpus, MockTransport([_interpretation(_structured(section_selection="explicit", section_ids=["item_7"]))]),
+        research_factory=_scripted_factory(corpus, [], statement=statement), question=question,
+    )
+    response = result.response
+    assert response.question == question and response.strategy == "rlm"
+    assert response.verification_status == "not_checked"
+    published, = result.research.published_conclusions
+    assert len(published.conclusion.bindings) == 1
+    ref, = published.citations
+    assert response.citations == [corpus.get_chunk(ref.chunk_id)]
+    assert response.answer.startswith(statement) and f"[chunk:{ref.chunk_id}]" in response.answer
+    assert "Scripted disclosure" not in response.answer
+    assert result.research.diagnostics
+
+
+@pytest.mark.parametrize("cap", [2, 4])
+def test_inferred_sections_are_alternatives_within_the_partition_allowance(corpus, cap):
+    data = _comparison(
+        companies=["AAPL"], fiscal_years=[2023, 2024], section_selection="inferred",
+        section_ids=["item_7", "item_8"], topic="Net sales", phrases=["net sales"],
+        required_operands=[_operand("AAPL", year, "item_8") for year in (2023, 2024)],
+    )
+    result = _run(
+        corpus, MockTransport([_interpretation(data)]), max_partitions=cap,
+        shared_limits=SHARED.model_copy(update={"max_partitions": cap}),
+        research_factory=_scripted_factory(corpus, [], statement="Both filings discuss net sales."),
+        question="How did Apple discuss net sales in its FY2023 and FY2024 filings?",
+    )
+    assert result.plan.intent.section_ids == (("item_7",) if cap == 2 else ("item_7", "item_8"))
+    assert result.interpretation.outcome.intent.section_ids == ("item_7", "item_8")
+    assert {op.section_id for op in result.plan.intent.required_operands} == {None}
+    assert result.research.answer_disposition == "answered"
+    assert result.usage.partition_assignments == cap
+
+
 def test_non_ai_cross_year_comparison_uses_the_generic_executor(corpus):
     question = "Compare Apple's foreign-exchange risk in FY2023 and FY2024."
     data = _comparison(

@@ -15,7 +15,7 @@ from evidenceroute.research.rlm.environment import Page
 from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan, interpret_intent, resolve_research_plan
 from evidenceroute.research.rlm.scoped import ScopedCorpus
 from evidenceroute.research.rlm.spans import passage_spans
-from evidenceroute.research.rlm.tools import CorpusToolDispatcher
+from evidenceroute.research.rlm.tools import CorpusToolDispatcher, search_page_key
 
 
 class SectionFixture:
@@ -161,3 +161,28 @@ def test_canonical_targets_and_exact_span_provenance(monkeypatch, capsys):
     start, end = passage_spans(chunk.text)[span]
     assert json.loads(response.content)["result"]["spans"][span] == chunk.text[start:end]
     assert response.evidence[0].source_url == chunk.source_url
+
+    args = {"query": "risk", "limit": 10}
+    search = dispatcher.dispatch("search_chunks", args, compact_response_bytes=700)
+    page = json.loads(search.content)["result"]
+    assert 0 < len(page["items"]) < args["limit"]
+    assert page["next_offset"] == len(page["items"])
+    assert not search.evidence
+    delivered = {search_page_key(search.arguments)}
+    duplicate = dispatcher.dispatch("search_chunks", {**args, "query": "Risk!"}, delivered_search_pages=delivered)
+    assert json.loads(duplicate.content)["result"]["already_delivered"]
+    followup = dispatcher.dispatch("search_chunks", {**args, "offset": page["next_offset"]},
+                                  delivered_search_pages=delivered, compact_response_bytes=700)
+    assert json.loads(followup.content)["result"]["items"]
+
+    full_dispatcher = CorpusToolDispatcher(
+        ScopedCorpus(corpus, (pair,)), include_spans=True, candidate_search=False, max_response_bytes=6000,
+    )
+    full_page = full_dispatcher.dispatch("search_chunks", args, compact_response_bytes=3000)
+    full_result = json.loads(full_page.content)["result"]
+    assert 0 < len(full_page.evidence) == len(full_result["items"]) < args["limit"]
+    assert full_result["next_offset"] == len(full_result["items"])
+    assert all(item["text"] for item in full_result["items"])
+    repeated = full_dispatcher.dispatch("search_chunks", args, compact_response_bytes=3000,
+                                       delivered_chunks={ref.chunk_id for ref in full_page.evidence})
+    assert json.loads(repeated.content)["result"]["items"][0]["already_delivered"]

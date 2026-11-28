@@ -18,10 +18,13 @@ from evidenceroute.research.rlm.findings import Finding, FindingEvidence
 from evidenceroute.research.rlm.planned_research import GroupOutcome, admit_company_groups, execute_research_plan
 from evidenceroute.research.rlm.planning import CompanyPartition, ResearchPlan
 from evidenceroute.research.rlm.synthesis import AnswerDisposition
-from evidenceroute.research.rlm.publication import PublicationState, PublishedConclusion, publish_research_findings
+from evidenceroute.research.rlm.publication import (
+    PublicationState, PublishedConclusion, publish_research_findings, research_response,
+)
 from evidenceroute.research.rlm.recursive import RecursiveResearch
 from evidenceroute.research.rlm.research_coverage import ResearchCoverage, aggregate_research_trees
 from evidenceroute.research.rlm.tools import EvidenceRef
+from evidenceroute.schemas import ResearchResponse
 
 
 class CorpusLimits(BaseModel):
@@ -110,6 +113,7 @@ class CorpusResearchResult:
 
     answer_disposition: AnswerDisposition | None = None
     published_conclusions: tuple[PublishedConclusion, ...] = ()
+    response: ResearchResponse | None = None
 
     @property
     def group_counts(self) -> dict[str, int]:
@@ -445,15 +449,17 @@ def execute_corpus_research(
         assessment = "Batch-root comparisons.\n" + render_comparisons(root_comparisons)
         if child_comparisons:
             assessment += "\n\nAcknowledged child comparisons.\n" + render_comparisons(child_comparisons)
-        answer += "\n\n" + render_comparative_scope(
+        response_answer = render_comparative_scope(
             root_comparisons, assessment, requested=plan.requested_companies,
             admitted={group.ticker for group in groups if group.outcome and group.outcome.admitted}, incomplete=incomplete,
         )
+        answer += "\n\n" + response_answer
         sources = {item.source.chunk_id: item.source for item in evidence}
         cited_ids = dict.fromkeys(chunk_id for item in (*root_comparisons, *child_comparisons)
                                   for chunk_id in item.assessed_chunk_ids)
         answer_citations = tuple(sources[chunk_id] for chunk_id in cited_ids)
         publication_state: PublicationState = "comparison_evidence" if answer_citations else "insufficient_evidence"
+        response_citations = answer_citations
     else:
         publication = publish_research_findings(
             coverage.invocations, incomplete=incomplete, compact_comparative=compact_comparative,
@@ -464,9 +470,13 @@ def execute_corpus_research(
         publication_state = publication.publication_state
         disposition = publication.answer_disposition
         published = publication.published_conclusions
+        response_answer = publication.response_answer if not comparative else publication.answer
+        response_citations = publication.response_citations if not comparative else answer_citations
+    response = research_response(plan.intent.question, response_answer, response_citations, runner.corpus)
     return CorpusResearchResult(plan, limits, run_id, groups, tuple(batches), coverage, scan, usage,
                                 root_findings, selected, child_findings, retained, root_comparisons, child_comparisons, evidence,
                                 tuple(citations[key] for key in sorted(citations)), tuple(sorted(assessed)), tuple(errors),
                                 tuple(diagnostics), stop,
                                 "finished" if finished else "incomplete", "incomplete" if incomplete else "unverified",
-                                answer, compact_comparative, answer_citations, publication_state, disposition, published)
+                                answer, compact_comparative, answer_citations, publication_state, disposition, published,
+                                response)
