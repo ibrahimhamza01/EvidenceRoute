@@ -11,7 +11,7 @@ def test_default_configuration():
 
     assert config.retrieval_method == "bm25"
     assert config.top_k == 5
-    assert config.llm_provider == "gemini"
+    assert config.llm_provider == "claude"
     assert config.corpus_path.name == "chunks.parquet"
     assert config.build_filters() is None
 

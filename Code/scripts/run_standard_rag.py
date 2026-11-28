@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 
 from evidenceroute.research.config import StandardRAGConfig
-from evidenceroute.research.llm_client import GeminiClient, LLMResult
+from evidenceroute.research.llm_client import LLMResult
+from evidenceroute.research.claude_client import ClaudeClient
 from evidenceroute.research.pipeline import run_standard_rag
 from evidenceroute.retrieval import load_chunks
 from evidenceroute.research.retriever import (
@@ -67,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--year", type=int, action="append")
     parser.add_argument(
         "--provider",
-        choices=["mock", "gemini"],
+        choices=["mock", "claude"],
         default="mock",
     )
     args = parser.parse_args(argv)
@@ -96,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     llm = (
         MockCitingLLM()
         if args.provider == "mock"
-        else GeminiClient()
+        else ClaudeClient()
     )
 
     collected_metrics = []

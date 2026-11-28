@@ -12,3 +12,5 @@ boto3
 pyarrow==25.0.0
 
 google-genai>=1,<2
+
+anthropic>=2.14,<3
