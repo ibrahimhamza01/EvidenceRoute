@@ -29,6 +29,28 @@ class StandardRAGConfig(BaseModel):
 
     llm_provider: Literal["mock", "claude"] = "claude"
 
+    max_llm_calls: int = Field(default=8, ge=1, strict=True)
+
+    max_total_tokens: int = Field(
+        default=32000, ge=1, strict=True
+    )
+
+    max_execution_seconds: float = Field(
+        default=180.0, gt=0, allow_inf_nan=False
+    )
+
+    llm_timeout_seconds: float = Field(
+        default=60.0, gt=0, allow_inf_nan=False
+    )
+
+    max_output_tokens: int = Field(
+        default=2048, ge=1, strict=True
+    )
+
+    llm_max_retries: int = Field(
+        default=1, ge=0, le=3, strict=True
+    )
+
     tickers: list[str] | None = None
 
     fiscal_years: list[int] | None = None

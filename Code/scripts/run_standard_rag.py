@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 
 from evidenceroute.research.config import StandardRAGConfig
+from evidenceroute.research.budget import (
+    ExecutionLimits,
+    ExecutionBudget,
+    BudgetedLLMClient,
+)
 from evidenceroute.research.llm_client import LLMResult
 from evidenceroute.research.claude_client import ClaudeClient
 from evidenceroute.research.pipeline import run_standard_rag
@@ -71,6 +76,13 @@ def main(argv: list[str] | None = None) -> int:
         choices=["mock", "claude"],
         default="mock",
     )
+    parser.add_argument("--max-llm-calls", type=int, default=8)
+    parser.add_argument("--max-total-tokens", type=int, default=32000)
+    parser.add_argument("--max-execution-seconds", type=float, default=180.0)
+    parser.add_argument("--llm-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--max-output-tokens", type=int, default=2048)
+    parser.add_argument("--llm-max-retries", type=int, default=1)
+
     args = parser.parse_args(argv)
 
     config = StandardRAGConfig(
@@ -81,6 +93,12 @@ def main(argv: list[str] | None = None) -> int:
         rebuild_index=args.rebuild_index,
         top_k=args.top_k,
         llm_provider=args.provider,
+        max_llm_calls=args.max_llm_calls,
+        max_total_tokens=args.max_total_tokens,
+        max_execution_seconds=args.max_execution_seconds,
+        llm_timeout_seconds=args.llm_timeout_seconds,
+        max_output_tokens=args.max_output_tokens,
+        llm_max_retries=args.llm_max_retries,
         tickers=args.ticker,
         fiscal_years=args.year,
     )
@@ -97,8 +115,22 @@ def main(argv: list[str] | None = None) -> int:
     llm = (
         MockCitingLLM()
         if args.provider == "mock"
-        else ClaudeClient()
+        else ClaudeClient(
+            timeout_seconds=config.llm_timeout_seconds,
+            max_tokens=config.max_output_tokens,
+            max_retries=config.llm_max_retries,
+        )
     )
+
+    budget = ExecutionBudget(
+        ExecutionLimits(
+            max_llm_calls=config.max_llm_calls,
+            max_total_tokens=config.max_total_tokens,
+            max_seconds=config.max_execution_seconds,
+        )
+    )
+
+    llm = BudgetedLLMClient(llm, budget)
 
     collected_metrics = []
 
@@ -113,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(json.dumps({
         "response": response.model_dump(mode="json"),
+        "budget": budget.snapshot(),
         "metrics": (
             vars(collected_metrics[0])
             if collected_metrics else None

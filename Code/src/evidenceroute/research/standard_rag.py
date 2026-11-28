@@ -7,6 +7,7 @@ from evidenceroute.schemas import (
     ResearchResponse,
     RetrievalResult,
 )
+from evidenceroute.research.budget import BudgetExceededError
 from evidenceroute.research.prompts import build_rag_prompt
 from evidenceroute.research.citations import validate_citations
 from evidenceroute.research.llm_client import (
@@ -19,6 +20,12 @@ ABSTENTION_MESSAGE = (
     "Insufficient evidence in the supplied SEC filings "
     "to answer this question."
 )
+
+BUDGET_ERROR_MESSAGE = (
+    "Unable to complete research because the execution "
+    "budget has been exhausted."
+)
+
 
 SERVICE_ERROR_MESSAGE = (
     "Unable to generate an answer because the language "
@@ -46,6 +53,8 @@ def generate_rag_answer(
     question: str,
     evidence: Sequence[RetrievalResult],
     llm_client: LLMClient,
+    *,
+    llm_result_callback=None,
 ) -> ResearchResponse:
     """Generate an evidence-grounded research response."""
 
@@ -62,11 +71,19 @@ def generate_rag_answer(
 
     try:
         result = llm_client.generate(prompt)
+    except BudgetExceededError:
+        return _fallback_response(
+            question,
+            BUDGET_ERROR_MESSAGE,
+        )
     except (LLMClientError, TimeoutError):
         return _fallback_response(
             question,
             SERVICE_ERROR_MESSAGE,
         )
+
+    if llm_result_callback is not None:
+        llm_result_callback(result)
 
     answer = result.text.strip()
 
