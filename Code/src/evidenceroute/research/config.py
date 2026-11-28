@@ -15,7 +15,15 @@ class StandardRAGConfig(BaseModel):
 
     corpus_path: Path = Path("data/processed/full-v1/chunks.parquet")
 
-    retrieval_method: Literal["bm25"] = "bm25"
+    retrieval_method: Literal[
+        "bm25", "hybrid", "hybrid-rerank"
+    ] = "bm25"
+
+    embedder_name: str = "BAAI/bge-small-en-v1.5"
+
+    index_dir: Path = Path("data/indexes/full-v1")
+
+    rebuild_index: bool = False
 
     top_k: int = Field(default=5, ge=1, strict=True)
 

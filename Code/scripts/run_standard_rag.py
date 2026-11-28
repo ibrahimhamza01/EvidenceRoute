@@ -9,7 +9,11 @@ from pathlib import Path
 from evidenceroute.research.config import StandardRAGConfig
 from evidenceroute.research.llm_client import GeminiClient, LLMResult
 from evidenceroute.research.pipeline import run_standard_rag
-from evidenceroute.retrieval import BM25Retriever, load_chunks
+from evidenceroute.retrieval import load_chunks
+from evidenceroute.research.retriever import (
+    build_research_retriever,
+    RETRIEVAL_METHODS,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +51,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--question", required=True)
     parser.add_argument("--chunks", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--retrieval", choices=RETRIEVAL_METHODS,
+        default="bm25",
+    )
+    parser.add_argument(
+        "--embedder", default="BAAI/bge-small-en-v1.5",
+    )
+    parser.add_argument(
+        "--index-dir", type=Path,
+        default=ROOT / "data/indexes/full-v1",
+    )
+    parser.add_argument("--rebuild-index", action="store_true")
     parser.add_argument("--ticker", action="append")
     parser.add_argument("--year", type=int, action="append")
     parser.add_argument(
@@ -58,6 +74,10 @@ def main(argv: list[str] | None = None) -> int:
 
     config = StandardRAGConfig(
         corpus_path=args.chunks,
+        retrieval_method=args.retrieval,
+        embedder_name=args.embedder,
+        index_dir=args.index_dir,
+        rebuild_index=args.rebuild_index,
         top_k=args.top_k,
         llm_provider=args.provider,
         tickers=args.ticker,
@@ -65,7 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     corpus = load_chunks(config.corpus_path)
-    retriever = BM25Retriever(corpus)
+    retriever = build_research_retriever(
+        corpus,
+        config.retrieval_method,
+        embedder_name=config.embedder_name,
+        index_dir=config.index_dir,
+        rebuild=config.rebuild_index,
+    )
 
     llm = (
         MockCitingLLM()

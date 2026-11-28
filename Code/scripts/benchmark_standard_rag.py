@@ -14,7 +14,11 @@ from evidenceroute.evaluation.metrics import (
     reciprocal_rank,
     full_coverage_at_k,
 )
-from evidenceroute.retrieval import BM25Retriever, load_chunks
+from evidenceroute.retrieval import load_chunks
+from evidenceroute.research.retriever import (
+    build_research_retriever,
+    RETRIEVAL_METHODS,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -154,6 +158,18 @@ def main(argv=None):
     )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
+        "--retrieval", choices=RETRIEVAL_METHODS,
+        default="bm25",
+    )
+    parser.add_argument(
+        "--embedder", default="BAAI/bge-small-en-v1.5",
+    )
+    parser.add_argument(
+        "--index-dir", type=Path,
+        default=ROOT / "data/indexes/full-v1",
+    )
+    parser.add_argument("--rebuild-index", action="store_true")
+    parser.add_argument(
         "--output", type=Path,
         default=Path("/tmp/rag_benchmark_results.json")
     )
@@ -181,12 +197,23 @@ def main(argv=None):
             f"{sorted(missing)[:5]}"
         )
 
+    retriever = build_research_retriever(
+        corpus,
+        args.retrieval,
+        embedder_name=args.embedder,
+        index_dir=args.index_dir,
+        rebuild=args.rebuild_index,
+    )
+
     report = evaluate(
-        BM25Retriever(corpus), questions, args.top_k
+        retriever, questions, args.top_k
     )
 
     report["corpus_chunks"] = len(corpus)
-    report["retriever"] = "bm25"
+    report["retriever"] = args.retrieval
+    report["embedder"] = (
+        args.embedder if args.retrieval != "bm25" else None
+    )
     report["split"] = args.split
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
