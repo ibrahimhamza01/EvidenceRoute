@@ -1,0 +1,318 @@
+{
+  "mode": "historical recorded results",
+  "corpus_identity": "sha256:86478c32613c870a510d70cd60966ed2635166a2bf9c64afbfa246be48a855a7",
+  "questions": {
+    "q024": {
+      "git_head": "f6cd9349c166895159d9891b1a31d1911cbfe19e",
+      "artifacts": [
+        "rlm-generalization-q024-live.json",
+        "rlm-generalization-q024-checkpoint.json"
+      ],
+      "interpretation_status": "ready",
+      "answer_disposition": "insufficient_evidence",
+      "usage": {
+        "provider_attempts": 8,
+        "reported_tokens": 34551,
+        "attempts_with_missing_usage": 0,
+        "estimated_tokens": 42777,
+        "attempts_with_missing_estimate": 0,
+        "corpus_attempts": 5,
+        "delegated_invocations": 1,
+        "partition_assignments": 1,
+        "lexical_pages_read": 5,
+        "lexical_metadata_reads": 1,
+        "lexical_chunks_scanned": 46,
+        "elapsed_seconds": 23.738204919001873,
+        "finding_submission_attempts": 0,
+        "accepted_submissions": 0,
+        "rejected_submission_records": 0,
+        "unused_capture_reservations": 0
+      }
+    },
+    "q029": {
+      "git_head": "9ded5307c24c9dca2cc1ebc430d4e3dd161d291b",
+      "artifacts": [
+        "rlm-generalization-q029-live.json"
+      ],
+      "interpretation_status": "failed",
+      "answer_disposition": null,
+      "usage": {
+        "provider_attempts": 2,
+        "reported_tokens": 9048,
+        "attempts_with_missing_usage": 0,
+        "estimated_tokens": 10769,
+        "attempts_with_missing_estimate": 0,
+        "corpus_attempts": 0,
+        "delegated_invocations": 0,
+        "partition_assignments": 0,
+        "lexical_pages_read": 0,
+        "lexical_metadata_reads": 0,
+        "lexical_chunks_scanned": 0,
+        "elapsed_seconds": 10.297739630997967,
+        "finding_submission_attempts": 0,
+        "accepted_submissions": 0,
+        "rejected_submission_records": 0,
+        "unused_capture_reservations": 0
+      }
+    },
+    "q029-v2": {
+      "git_head": "f6cd9349c166895159d9891b1a31d1911cbfe19e",
+      "artifacts": [
+        "rlm-generalization-q029-v2-live.json",
+        "rlm-generalization-q029-v2-checkpoint.json"
+      ],
+      "interpretation_status": "ready",
+      "answer_disposition": "answered",
+      "usage": {
+        "provider_attempts": 8,
+        "reported_tokens": 46511,
+        "attempts_with_missing_usage": 0,
+        "estimated_tokens": 53956,
+        "attempts_with_missing_estimate": 0,
+        "corpus_attempts": 8,
+        "delegated_invocations": 1,
+        "partition_assignments": 2,
+        "lexical_pages_read": 6,
+        "lexical_metadata_reads": 2,
+        "lexical_chunks_scanned": 52,
+        "elapsed_seconds": 35.13583193500017,
+        "finding_submission_attempts": 0,
+        "accepted_submissions": 0,
+        "rejected_submission_records": 0,
+        "unused_capture_reservations": 0
+      }
+    },
+    "q042": {
+      "git_head": "f6cd9349c166895159d9891b1a31d1911cbfe19e",
+      "artifacts": [
+        "rlm-generalization-q042-live.json",
+        "rlm-generalization-q042-checkpoint.json"
+      ],
+      "interpretation_status": "ready",
+      "answer_disposition": "answered",
+      "usage": {
+        "provider_attempts": 13,
+        "reported_tokens": 76506,
+        "attempts_with_missing_usage": 0,
+        "estimated_tokens": 90213,
+        "attempts_with_missing_estimate": 0,
+        "corpus_attempts": 13,
+        "delegated_invocations": 2,
+        "partition_assignments": 2,
+        "lexical_pages_read": 8,
+        "lexical_metadata_reads": 2,
+        "lexical_chunks_scanned": 76,
+        "elapsed_seconds": 45.75015820399858,
+        "finding_submission_attempts": 0,
+        "accepted_submissions": 0,
+        "rejected_submission_records": 0,
+        "unused_capture_reservations": 0
+      }
+    },
+    "q045": {
+      "git_head": "818e5ca27f375b101d9a0f86cc63b88d082e8d61",
+      "artifacts": [
+        "rlm-generalization-q045-live.json",
+        "rlm-generalization-q045-checkpoint.json"
+      ],
+      "interpretation_status": "ready",
+      "answer_disposition": "insufficient_evidence",
+      "usage": {
+        "provider_attempts": 6,
+        "reported_tokens": 28610,
+        "attempts_with_missing_usage": 0,
+        "estimated_tokens": 32738,
+        "attempts_with_missing_estimate": 0,
+        "corpus_attempts": 6,
+        "delegated_invocations": 1,
+        "partition_assignments": 2,
+        "lexical_pages_read": 10,
+        "lexical_metadata_reads": 2,
+        "lexical_chunks_scanned": 97,
+        "elapsed_seconds": 25.11266341800001,
+        "finding_submission_attempts": 0,
+        "accepted_submissions": 0,
+        "rejected_submission_records": 0,
+        "unused_capture_reservations": 0
+      }
+    },
+    "q045-v2": {
+      "git_head": "19d7475ac660effe10a54a71dfaf07efdd763f5c",
+      "artifacts": [
+        "rlm-generalization-q045-v2-live.json",
+        "rlm-generalization-q045-v2-checkpoint.json"
+      ],
+      "interpretation_status": "ready",
+      "answer_disposition": "insufficient_evidence",
+      "usage": {
+        "provider_attempts": 8,
+        "reported_tokens": 41752,
+        "attempts_with_missing_usage": 0,
+        "estimated_tokens": 48605,
+        "attempts_with_missing_estimate": 0,
+        "corpus_attempts": 6,
+        "delegated_invocations": 1,
+        "partition_assignments": 2,
+        "lexical_pages_read": 10,
+        "lexical_metadata_reads": 2,
+        "lexical_chunks_scanned": 97,
+        "elapsed_seconds": 23.855646411000635,
+        "finding_submission_attempts": 1,
+        "accepted_submissions": 4,
+        "rejected_submission_records": 0,
+        "unused_capture_reservations": 0
+      }
+    }
+  },
+  "full_corpus": {
+    "audited_git_head": "44d9eba50e4c6111aaed63cac908576b2d783133",
+    "stages": [
+      {
+        "stage": "initial",
+        "artifacts": [
+          "rlm-final-corpus-initial-live.json",
+          "rlm-final-corpus-live-checkpoint.json"
+        ],
+        "usage": {
+          "provider_attempts": 39,
+          "reported_tokens": 222632,
+          "attempts_with_missing_usage": 0,
+          "estimated_tokens": 263866,
+          "attempts_with_missing_estimate": 0,
+          "corpus_attempts": 54,
+          "delegated_invocations": 6,
+          "partition_assignments": 12,
+          "lexical_pages_read": 328,
+          "lexical_metadata_reads": 50,
+          "lexical_chunks_scanned": 3038,
+          "elapsed_seconds": 124.30087645000094,
+          "finding_submission_attempts": 6,
+          "accepted_submissions": 11,
+          "rejected_submission_records": 1,
+          "unused_capture_reservations": 0
+        }
+      },
+      {
+        "stage": "continuation",
+        "artifacts": [
+          "rlm-final-corpus-continued-live.json",
+          "rlm-final-corpus-continued-checkpoint.json"
+        ],
+        "usage": {
+          "provider_attempts": 141,
+          "reported_tokens": 794092,
+          "attempts_with_missing_usage": 0,
+          "estimated_tokens": 941207,
+          "attempts_with_missing_estimate": 0,
+          "corpus_attempts": 180,
+          "delegated_invocations": 20,
+          "partition_assignments": 40,
+          "lexical_pages_read": 0,
+          "lexical_metadata_reads": 0,
+          "lexical_chunks_scanned": 0,
+          "elapsed_seconds": 401.8348706750003,
+          "finding_submission_attempts": 20,
+          "accepted_submissions": 33,
+          "rejected_submission_records": 1,
+          "unused_capture_reservations": 0
+        }
+      },
+      {
+        "stage": "review-1",
+        "artifacts": [
+          "rlm-final-corpus-reviewed-live.json",
+          "rlm-final-corpus-reviewed-checkpoint.json"
+        ],
+        "usage": {
+          "provider_attempts": 16,
+          "reported_tokens": 40636,
+          "charged_tokens": 40636,
+          "estimated_tokens": 48729,
+          "attempts_with_missing_usage": 0,
+          "attempts_with_missing_estimate": 0,
+          "elapsed_seconds": 68.5973437900011
+        }
+      },
+      {
+        "stage": "review-2",
+        "artifacts": [
+          "rlm-final-review-pass2.json",
+          "rlm-final-review-pass2-checkpoint.json"
+        ],
+        "usage": {
+          "provider_attempts": 16,
+          "reported_tokens": 37217,
+          "charged_tokens": 37217,
+          "estimated_tokens": 46542,
+          "attempts_with_missing_usage": 0,
+          "attempts_with_missing_estimate": 0,
+          "elapsed_seconds": 48.11057649600116
+        }
+      },
+      {
+        "stage": "review-3",
+        "artifacts": [
+          "rlm-final-review-pass3.json",
+          "rlm-final-review-pass3-checkpoint.json"
+        ],
+        "usage": {
+          "provider_attempts": 10,
+          "reported_tokens": 24001,
+          "charged_tokens": 24001,
+          "estimated_tokens": 29331,
+          "attempts_with_missing_usage": 0,
+          "attempts_with_missing_estimate": 0,
+          "elapsed_seconds": 34.86589536000065
+        }
+      }
+    ],
+    "companies": 25,
+    "targets": 50,
+    "findings": 44,
+    "historical_comparisons": 33,
+    "execution_status": "finished",
+    "research_status": "incomplete",
+    "verified_answer_chunks_after_renderer_update": 31,
+    "verified_conclusion_chunks_after_renderer_update": 21,
+    "published_relationships": 10,
+    "outstanding_comparisons": 1
+  },
+  "external_artifacts_sha256": {
+    "rlm-acceptance-corpus-live.json": "f257b218568b1586996bc93c3e6ba652c41f32a48e291cbd4b82a4f7fe230f1d",
+    "rlm-amd-live-checkpoint.json": "ecf94767f2156d2ddb15084121a333fc99cefd4b0098217ca9fdc7ecc9435777",
+    "rlm-amd-live.json": "5dc812b49c9d6360daace82be6ba35916fd17201ed585eff0c2f20f3155c951a",
+    "rlm-amd-quality-live-checkpoint.json": "d0a67635da09386306a9851a10745a5ac6555ee4e48f463ee23c4f29ecb24189",
+    "rlm-amd-quality-live.json": "ea305a190f92ac6f8c8c481ce7548a2795193e90c661cf4601cc381537228808",
+    "rlm-amd-recovered-live-checkpoint.json": "ae97798c5dd7b061aeb52ad3dd74d1d7297fc89c2d7b797170b9d46dd4063d42",
+    "rlm-amd-recovered-live.json": "41b52ce635993006d4223c8a10a47897761fc311d90d61db9a34baf65badcec3",
+    "rlm-amzn-googl-quality-live-checkpoint.json": "922824ce07fbdc188ed500dbcdb3511384f7c8b62883051f499c0f30e5037a02",
+    "rlm-amzn-googl-quality-live.json": "c61b917327af2a961a3ee183e43a8b39ba4a5be2b515a64606c47d807ef14c2a",
+    "rlm-amzn-googl-recovered-live-checkpoint.json": "260f4223ddc37b7081e17f1e2480adaaad46cf2b93400b81b66c1d4e6fd929e7",
+    "rlm-amzn-googl-recovered-live.json": "4f30f5942a2385f003e7ba049d0d4d8c425fa526e6cdf8979c111bd3b0773ea7",
+    "rlm-final-corpus-continued-checkpoint.json": "ab8d8f0c05d05dbb845405168b14b7aea127a8930dfacafbcb94784dfe01803f",
+    "rlm-final-corpus-continued-live.json": "f3bfa70f7dff35b03d847b0b116039430611c31991786084ac9ecc388290c3e4",
+    "rlm-final-corpus-evaluation.json": "40520e9265af5ad32f4efa1d31fea778d1f83d7ee9fcecd7b7b3975c3c35f47d",
+    "rlm-final-corpus-initial-live.json": "312fc2196b4d5f047ce2b60af6062c5ae7839b9763ce7fb91a1bd1cc5a1ea2aa",
+    "rlm-final-corpus-live-checkpoint.json": "0504268e36b1025262abe70a4f0e27f0af909c807090502aab5eb1ba4a240817",
+    "rlm-final-corpus-reviewed-checkpoint.json": "3e62548de9fbe68bc723f1e175d0a50b2eaf0b64299603411d624a14a5247c8d",
+    "rlm-final-corpus-reviewed-live.json": "44e539bc7bb806222a32777e321d29e07a51de39c934c70376be1f075fa70ac5",
+    "rlm-final-evaluation.json": "7a255c8ff644e46b559c6b9a849e25f2ff4f60c9916cce2e55ef44160a7d2743",
+    "rlm-final-review-pass2-checkpoint.json": "464fcf0608e2fef85c6e7dfe694aa5728c4d349cf82075a1e4811361ea4a709a",
+    "rlm-final-review-pass2.json": "3a184d8ef780e1aa42991281d5ec7bce86bd51bd1b3659492c73478b6c70a6d1",
+    "rlm-final-review-pass3-checkpoint.json": "694de9344019b0a8f2edf2bf606aa84605444ada4e0168b51da9b8d50936b61b",
+    "rlm-final-review-pass3.json": "fc7e328fa4a7f6ef0474e7e1b10e2e91db5880fc2ae899209c7647ad24fb8157",
+    "rlm-generalization-q024-checkpoint.json": "82d95e3a851d61a614fb7f9a3c71e55db224e3041711d947df2330cd6b6edffc",
+    "rlm-generalization-q024-live.json": "65230ad5e5458a68c03e62150683d7e5f562014a30ebf28a95cf9a271b939643",
+    "rlm-generalization-q029-live.json": "e3ea5850a14bd1e66d21e60210add8c41f5f066749541a427d6c3d4890b230a2",
+    "rlm-generalization-q029-v2-checkpoint.json": "16bedd05047cf028075374ed4f3246d7afa33171a08096602cbbdf4fd7e61c1a",
+    "rlm-generalization-q029-v2-live.json": "e22a6c0ef404e113e55d7d8b8b78f64b9bc38cf995d7f2e6cf5463188d21e2ac",
+    "rlm-generalization-q042-checkpoint.json": "d59d07c9493275d8a9d5428ab94e3c6403b4ee28c006267c2ab0f9a53189c599",
+    "rlm-generalization-q042-live.json": "d026bb240c88373b68a2228aed2c34cd7c684e2564e49928c8dbf4b802a1c04e",
+    "rlm-generalization-q045-checkpoint.json": "35ad7df8cb1ccd0487271ac8274d56695e2b7631a899d4993277be01144482e6",
+    "rlm-generalization-q045-live.json": "4c38cafee46c2fe7bd61bf276a9029a1e5d249935430800e6b5b85e38dbee47c",
+    "rlm-generalization-q045-v2-checkpoint.json": "5bbfd1f9d4f8f34c23c2ae8de1631fd73759694a9c7a9a586a63347fc2a2afe8",
+    "rlm-generalization-q045-v2-live.json": "a85c1908fd7738b31426d2e911a8f56ae1dee0b68688e1936e4cfe773e470800",
+    "rlm-live-continued-checkpoint.json": "444850836704de775477da71b98fc19694652934a3f280bb9d76abd76d991f7a",
+    "rlm-live-initial-checkpoint.json": "307a5ce14004f95915b0b411dcd437be92f6e2fd9af62c2152a0d50ea2c4169a"
+  }
+}

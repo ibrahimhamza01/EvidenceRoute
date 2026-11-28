@@ -221,3 +221,6 @@ __marimo__/
 
 .DS_Store
 .Rhistory
+
+# Local RLM experiment output
+/.rlm-runs/

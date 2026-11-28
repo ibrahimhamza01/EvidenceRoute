@@ -66,6 +66,85 @@ Run the scripted example with local canonical files. It delegates FY2023 and FY2
 PYTHONPATH=Code/src python Code/examples/demo_rlm_recursive.py
 ```
 
+## Reproducing the RLM experiments
+
+Use [the experiment runner](../examples/run_rlm_experiment.py) with [the settings catalog](../examples/rlm_experiments.json). The catalog preserves the recorded question text, model, region, source revision, budgets and retry settings for all six saved question runs. It also preserves the full-corpus profile, intent, discovery phrases and per-pass limits. Commands in the engineering history below show their original filenames and context.
+
+From a fresh checkout, install Python 3.10 or newer and the project requirements. Install the canonical `data/processed/full-v1/{sections,chunks}.parquet` files using the processed S3 download or acquisition and processing instructions. The filing manifest and company registry are tracked. The runner checks the corpus identity against the saved configuration before opening an AWS session. Offline use requires Git, Python dependencies and the local corpus. It uses no AWS credentials. [Corpus setup and expected hashes](../README.md#download-process-and-validate)
+
+```bash
+python -m pip install -r Code/requirements.txt
+runner=Code/examples/run_rlm_experiment.py
+artifacts=/absolute/path/to/saved-rlm-artifacts
+out=.rlm-runs/acceptance
+
+python "$runner" run q045-v2
+python "$runner" run q029-v2
+python "$runner" run q042
+python "$runner" run q024
+python "$runner" run corpus-initial
+python "$runner" run corpus-continue --checkpoint "$artifacts/rlm-final-corpus-live-checkpoint.json"
+python "$runner" run corpus-verify --checkpoint "$artifacts/rlm-final-corpus-continued-checkpoint.json"
+```
+
+These are offline preflights. They validate the selected limits and corpus, check any input checkpoint, and print the effective configuration with zero provider attempts. `q045` and `q029` select the earlier trials. The later recordings use `q045-v2` and `q029-v2`. Use `python "$runner" limits rlm-quality-verification-limits` to print a standalone JSON limits file for the existing demos.
+
+### New execution at a selected revision
+
+Provide an authorized AWS profile or role with Bedrock Converse access to `us.anthropic.claude-sonnet-4-5-20250929-v1:0` in `us-east-1`. The runner pins provider settings and inherits the SDK credential chain. Keep credentials outside the workspace. Each live command authorizes one pass and requires a new output directory. The default checkout is the runner's repository. Results from that checkout exercise its current implementation with the archived configuration.
+
+```bash
+python "$runner" run q045-v2 --live --output-dir "$out/q045-v2"
+python "$runner" run q029-v2 --live --output-dir "$out/q029-v2"
+python "$runner" run q042 --live --output-dir "$out/q042"
+python "$runner" run q024 --live --output-dir "$out/q024"
+
+python "$runner" run corpus-initial --live --output-dir "$out/initial"
+python "$runner" run corpus-continue --live --checkpoint "$out/initial/checkpoint.json" --output-dir "$out/continued"
+python "$runner" run corpus-verify --live --checkpoint "$out/continued/checkpoint.json" --output-dir "$out/review-1"
+python "$runner" run corpus-verify --live --checkpoint "$out/review-1/checkpoint.json" --output-dir "$out/review-2"
+python "$runner" run corpus-verify --live --checkpoint "$out/review-2/checkpoint.json" --output-dir "$out/review-3"
+```
+
+An incomplete research pass can exit 1 after saving a usable checkpoint. Inspect it before authorizing continuation. Each verification command reviews outstanding cases with a fresh recorded allowance. Review counts and the number of passes needed can vary. Question presets have no verification phase. Each pass writes `configuration.json`, `report.json`, and `run-summary.json`. It writes `checkpoint.json` when a checkpoint can be formed. The configuration records the actual Git HEAD, the recorded reference revision, tracked runtime changes, corpus identity, provider and SDK retry settings, budget limits and verification policy. The summary reports wall time, incremental usage and cumulative usage where available. Native reports retain per-attempt telemetry where the original demo records it. Use ignored `.rlm-runs/` or a directory outside the checkout. Existing output directories and input checkpoints are protected from overwrite.
+
+For a rerun of the original code, use a separate checkout at the revision in the catalog. For example, this selects the audited full-corpus revision. Add `--source-root "$old"` to each authorized command to execute that revision.
+
+```bash
+old=/absolute/path/to/rlm-historical-worktree
+git worktree add --detach "$old" 44d9eba50e4c6111aaed63cac908576b2d783133
+mkdir -p "$old/data/processed"
+ln -s "$PWD/data/processed/full-v1" "$old/data/processed/full-v1"
+python "$runner" run corpus-initial --source-root "$old"
+```
+
+Use the same procedure with the question preset's `git_head` for a historical question rerun. The saved question configs record model, region and retries. The runner uses the documented 20-second timeout, 1,024-token normal cap and provider-default sampling for settings absent from those files. The full-corpus reference revision comes from the historical audit. Individual legacy verification reports lack a revision and deployed-model attestation. A live rerun generates a new result. Provider-side model changes, sampling, latency and historical dependency versions can prevent bit-for-bit reproduction.
+
+### Recorded results and offline checkpoint replay
+
+[The compact historical results and artifact checksums](../examples/rlm_history/results.json) identify the external inputs by original filename and SHA-256. Obtain those reports and checkpoints from whoever retained the historical runs and keep them outside tracked source. The files can be placed together in `$artifacts`. A fresh checkout contains the catalog and summaries. The full reports, checkpoints and SEC Parquet files are distributed separately. Raw provider traffic was outside the captured artifacts. Offline replay reconstructs output from the saved ledger with the selected local code and uses zero provider calls.
+
+```bash
+export PYTHONPATH=Code/src:Code/examples
+history=Code/examples/rlm_history
+set -o pipefail
+python "$history/evaluate.py" "$artifacts/rlm-final-review-pass3-checkpoint.json" |
+  diff -u "$artifacts/rlm-final-evaluation.json" -
+python "$history/publication_replay.py" "$artifacts"
+python "$history/positive_controls.py" "$artifacts/rlm-amzn-googl-quality-live.json"
+python "$history/recovery_replay.py" "$artifacts"
+python "$history/amd_delivery_replay.py" "$artifacts"
+python "$history/milestone_measurements.py" "$artifacts/rlm-acceptance-corpus-live.json"
+```
+
+Use `python "$runner" replay "$artifacts/rlm-generalization-q045-v2-checkpoint.json"` to project a single saved question checkpoint. The replay records zero current attempts separately from the checkpoint's recorded usage. The original q029 trial failed interpretation and produced a report without a checkpoint.
+
+The final evaluator reads the final reviewed checkpoint. Publication replay also reads the continued full-corpus checkpoint and report, the saved final review report and the two descriptive checkpoints named in the artifact catalog. Recovery replay uses the AMD and Amazon–Alphabet quality reports and checkpoints with a scripted verifier. The AMD delivery replay reconstructs missing search arguments to test request shape. For its original controller and schema sizes, use `PYTHONPATH="$earlier/Code/src:$earlier/Code/examples"` with a worktree at `71c6733` and the same corpus. Local timing in the measurement utility will vary. The original acceptance audit compares legacy answer text and therefore uses the historical renderer.
+
+```bash
+PYTHONPATH="$old/Code/src" python "$history/acceptance_audit.py" "$artifacts"
+```
+
 ## Benchmark and router integration
 
 Use `evidenceroute.research.rlm.natural_language.generate_rlm_answer` for the shared `ResearchResponse` defined in `schemas.py`. Use `research_question` when the caller also needs diagnostics. Reuse a `CorpusEnvironment` across questions. Configure a `RecursiveResearch` runner with a fresh client factory, such as `lambda _: BedrockRootClient.from_env(disable_retries=True)`, and explicit `CorpusLimits`. [Question demo](../examples/demo_rlm_question.py)
@@ -1076,7 +1155,7 @@ Read `assignment_evidence` for execution state, retained finding counts and year
 
 ### Next live validation
 
-The prepared JSON files are generated by `python rlm-quality-limits.py` in this workspace. Their explicit caps are below. All research files also set 3,038 scan chunks, 328 scan pages, and a 10-second scan allowance. The continuation has capacity for all 25 groups even if the whole first pass fails. Completed groups remain outside its default selection.
+The [settings catalog](../examples/rlm_experiments.json) preserves these JSON limits. Export one with `python Code/examples/run_rlm_experiment.py limits NAME`, using the filename below without `.json` as `NAME`. All research files also set 3,038 scan chunks, 328 scan pages, and a 10-second scan allowance. The continuation has capacity for all 25 groups even if the whole first pass fails. Completed groups remain outside its default selection.
 
 | Limits file | Batches | Attempts | Reported tokens | Corpus calls | Delegations / partitions | Seconds |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1113,7 +1192,7 @@ python Code/examples/demo_rlm_verification.py --live --outstanding \
   --save-checkpoint rlm-full-quality-live-checkpoint.json > rlm-full-quality-reviewed-live.json
 ```
 
-The first full-corpus pass can exit 1 after saving partial progress. Each additional verification pass requires a new invocation with the explicit limits file. For the Amazon–Alphabet run, compare Amazon's paired semiconductor supplier excerpts (`b79aa2561327a953e141e2aa` and `4d1474550060251037c5f981`) and Alphabet's paired third-party equipment disclosures (`15787429383b3e9839f69716` and `62bad042e2e9d8334c2e6267`). Amazon states substantially the same AI supply dependency in both years. Alphabet states the deployment dependency in both years and names more cost drivers in FY2024. `python rlm-quality-positive-control.py rlm-amzn-googl-quality-live.json` audits candidate ranking, acknowledged text and retained evidence for those controls. The controls do not establish novelty.
+The first full-corpus pass can exit 1 after saving partial progress. Each additional verification pass requires a new invocation with the explicit limits file. For the Amazon–Alphabet run, compare Amazon's paired semiconductor supplier excerpts (`b79aa2561327a953e141e2aa` and `4d1474550060251037c5f981`) and Alphabet's paired third-party equipment disclosures (`15787429383b3e9839f69716` and `62bad042e2e9d8334c2e6267`). Amazon states substantially the same AI supply dependency in both years. Alphabet states the deployment dependency in both years and names more cost drivers in FY2024. The positive-control replay above audits candidate ranking, acknowledged text and retained evidence for these passages. Novelty remains unresolved.
 
 Native offline regressions replayed the six AMD excerpts and exercised abstention, both-year capture, a missing earlier-year mechanism, and failed finalization after capture. The Amazon–Alphabet fixture retained four year-specific findings and independently reviewed six cases across two authorized stub passes. The second pass reused the first pass's two settled comparisons. The quality workflow retained the 25-company and 50-target denominator across restart. A separate failure simulation left 20 companies eligible after the first six attempts. Continuation investigated all 20 under the new allowance, reusing the initial scan and preserving the failed child's accepted findings. No paid requests were made. At this stage only the offline profile had been measured. The final experiment below records the subsequent live results.
 
@@ -1223,12 +1302,7 @@ The local evaluator intersects configured control chunk IDs with direct-span or 
 
 The **separate earlier recoveries** gave AMD a supported shared water/power dependency with a more specific FY2024 potential revenue consequence. Alphabet's recovery supported the FY2023 component. Both FY2024 components were contradicted, with the same recorded gap, “e2 states 'may depend' not 'depends'”. The raw relationship was more specific wording, but the report withheld a verified relationship. These recoveries contribute zero to the full-corpus totals.
 
-For offline reproduction with the saved root artifacts, run the following from the repository root. It uses the canonical loader, merged coverage and report functions. The earlier `rlm-final-corpus-evaluation.json` describes the first review stage.
-
-```bash
-set -o pipefail
-PYTHONPATH=Code/src python rlm-stabilization-evaluate.py rlm-final-review-pass3-checkpoint.json | diff -u rlm-final-evaluation.json -
-```
+The [offline evaluation command](#recorded-results-and-offline-checkpoint-replay) reconstructs these results with the canonical loader, merged coverage and report functions. The earlier `rlm-final-corpus-evaluation.json` describes the first review stage.
 
 ### Answer and integration decision
 
@@ -1249,7 +1323,7 @@ Corpus research publishes atomic investigator findings with company ticker, fisc
 
 `checkpoint.publication` reconstructs the same atomic evidence view across saved runs and continuations. Historical findings without reconstructible selections stay in the ledger and the answer flags the gap. Compact comparative research retains its structured comparisons and leaves filing-wide novelty unresolved. The verified renderer and its citation fields remain independent of this view.
 
-Offline, `PYTHONPATH=Code/src PYTHONDONTWRITEBYTECODE=1 python rlm-publication-replay.py` replayed the saved artifacts without provider calls. The continued full-corpus output previously listed risk labels with zero printed citation IDs. The new view renders 36 selected findings with 30 aligned chunks. The earlier descriptive checkpoints render 3 findings with 2 chunks and 7 findings with 6 chunks. The final verified report still has 44 retained findings, 33 historical comparisons, 31 answer chunks, 21 conclusion chunks, 10 published relationships, one outstanding comparison, incomplete research status and unresolved novelty for all 25 companies. Saved judgments and usage matched.
+The [offline publication replay](#recorded-results-and-offline-checkpoint-replay) rendered 36 selected findings with 30 aligned chunks from the continued full-corpus checkpoint. The earlier descriptive checkpoints render 3 findings with 2 chunks and 7 findings with 6 chunks. The final verified report still has 44 retained findings, 33 historical comparisons, 31 answer chunks, 21 conclusion chunks, 10 published relationships, one outstanding comparison, incomplete research status and unresolved novelty for all 25 companies. Saved judgments and usage matched.
 
 The six focused research, natural-language, checkpoint, verification and comparison test modules passed 210 tests offline. Regression cases cover discovery parity, terminal and partial selections, missing historical selection records, empty and ineligible findings, conflicting claims, canonical evidence and citation order.
 
@@ -1363,7 +1437,7 @@ PYTHONPATH=Code/src PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
   Code/tests/test_rlm_checkpoint.py
 ```
 
-That focused set passed **177** tests. `test_rlm_comparison.py` and `test_rlm_recursive.py` passed **152** more. `rlm-publication-replay.py` and `rlm-stabilization-evaluate.py rlm-final-review-pass3-checkpoint.json` reproduced the saved historical publication: 44 findings, 33 comparisons, 31 answer chunks, 21 conclusion chunks, 10 relationships, one outstanding comparison, incomplete research, 25 unresolved novelty conclusions, and unchanged judgments and usage. `git diff --check` reported no whitespace errors.
+That focused set passed **177** tests. `test_rlm_comparison.py` and `test_rlm_recursive.py` passed **152** more. The [offline checkpoint tools](#recorded-results-and-offline-checkpoint-replay) reproduced the saved historical publication with 44 findings, 33 comparisons, 31 answer chunks, 21 conclusion chunks, 10 relationships, one outstanding comparison, incomplete research, 25 unresolved novelty conclusions, and unchanged judgments and usage. `git diff --check` reported no whitespace errors.
 
 ### Before and after
 
